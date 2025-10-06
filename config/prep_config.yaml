@@ -1,0 +1,163 @@
+# 时序数据准备与交叉验证配置文件
+# Time Series Data Preparation and Cross-Validation Configuration
+
+# 数据分段配置 (Data Segmentation)
+segmentation:
+  gap_threshold_seconds: 300  # 大间隔阈值(秒)，超过此值将数据切分为不同段
+  min_segment_length: 100     # 最小段长度(数据点)，短于此长度的段将被丢弃
+  fill_small_gaps: true       # 是否填充小间隔
+  small_gap_threshold: 30     # 小间隔阈值(秒)，小于此值的间隔将被填充
+  fill_method: "forward"      # 填充方法: "forward", "backward", "interpolate"
+
+# 窗口化配置 (Windowing)
+windowing:
+  window_lengths: [256]             # 窗口长度选项(数据点) - 进一步减少
+  step_sizes: [128]                 # 步长选项(数据点) - 增加步长减少重叠
+  default_window_length: 256        # 默认窗口长度
+  default_step_size: 128            # 默认步长
+  max_filled_ratio: 0.3             # 窗口内填充数据的最大比例
+  overlap_within_set: true          # 同一集合内是否允许窗口重叠
+  overlap_across_sets: false        # 跨集合是否允许窗口重叠
+  max_windows_per_segment: 500      # 每个段的最大窗口数 - 提高上限以覆盖更长时间
+
+# 标签与事件定义 (Labels and Events)
+labels:
+  event_definitions:
+    - event_type: "power_on"
+      feature_column: "power"
+      threshold: 100.0
+      direction: "up"
+      min_duration: 5
+      max_gap: 3
+    - event_type: "power_off"
+      feature_column: "power"
+      threshold: 50.0
+      direction: "down"
+      min_duration: 5
+      max_gap: 3
+    - event_type: "state_change"
+      feature_column: "switch_state"
+      threshold: 0.5
+      direction: "both"
+      min_duration: 1
+      max_gap: 1
+  
+  label_config:
+    horizon: 3                    # 预测视野(步数)
+    label_type: "binary"          # 标签类型: "binary", "multiclass", "regression"
+    aggregation: "any"            # 聚合方法: "any", "count", "max", "mean"
+    causality_check: true         # 是否使用因果窗口(不使用未来信息)
+  
+  imbalance_handling:
+    strategy: "mixed"             # 采样策略: "oversample", "undersample", "mixed"
+    target_ratio: 0.3             # 目标事件比例
+    
+  sampling_strategy: "mixed"      # 采样策略
+  event_detection_threshold: 0.1  # 事件检测阈值
+
+# Walk-forward交叉验证配置 (Walk-forward Cross-Validation)
+cross_validation:
+  n_folds: 3                    # 交叉验证折数
+  purge_gap_minutes: 10         # 净化间隔(分钟)
+  val_span_days: 3.0            # 验证集时间跨度(天)
+  test_span_days: 3.0           # 测试集时间跨度(天)
+  min_train_days: 7.0           # 最小训练集天数(天)
+  segment_isolation: false      # 关闭段级隔离，数据太少
+  holdout_test: true            # 是否保留测试集
+  time_based_split: true        # 是否基于时间分割
+
+# 不平衡标签处理 (Imbalanced Label Handling)
+imbalance_handling:
+  sampling_strategy: "mixed"    # 采样策略: "oversample", "undersample", "mixed"
+  segment_sampling_weight: 2.0  # 事件密集段的采样权重
+  window_sampling_ratio: 0.3    # 事件窗口的采样比例
+  loss_weighting: true          # 是否使用损失加权
+  focal_loss_gamma: 2.0         # Focal Loss的gamma参数
+  class_weight_auto: true       # 是否自动计算类别权重
+
+# 特征工程配置 (Feature Engineering)
+feature_engineering:
+  normalization:
+    enabled: true               # 是否启用归一化
+    method: "robust"            # 归一化方法: "standard", "minmax", "robust"
+    per_device: true            # 是否按设备归一化
+    per_segment: false          # 是否按段归一化
+  
+  time_features:
+    hour_of_day: true           # 小时特征
+    day_of_week: true           # 星期特征
+    is_weekend: true            # 是否周末
+    is_holiday: false           # 是否节假日(需要节假日数据)
+  
+  statistical_features:
+    rolling_mean: [5, 10, 20]   # 滚动均值窗口
+    rolling_std: [5, 10, 20]    # 滚动标准差窗口
+    rolling_min_max: [10, 20]   # 滚动最值窗口
+    change_rate: true           # 变化率特征
+    energy_integral: true       # 能量积分特征
+    harmonic_ratios: true       # 谐波比值特征（仅使用2/3相信号计算）
+  
+  derived_features:
+    power_ratios: true          # 功率比值特征
+    frequency_domain: false     # 频域特征(计算密集，先关闭)
+    cross_correlations: false   # 交叉相关特征(计算密集，先关闭)
+    interaction_terms: false    # 交互项特征(可能导致特征爆炸)
+    polynomial_features: false  # 多项式特征
+    
+  feature_selection:
+    enabled: true               # 是否启用特征选择
+    method: "mutual_info"       # 特征选择方法: "mutual_info", "f_score", "chi2"
+    k_best: 30                  # 选择前k个特征(减少特征数量)
+    variance_threshold: 0.01    # 方差阈值
+
+# 评估配置 (Evaluation)
+evaluation:
+  metrics:
+    - "pr_auc"          # PR-AUC
+    - "f1"              # F1分数
+    - "f0.5"            # F0.5分数
+    - "f2"              # F2分数
+    - "recall_at_k"     # Recall@K
+    - "precision"       # 精确率
+    - "recall"          # 召回率
+  
+  threshold_tuning: true        # 是否进行阈值调优
+  probability_calibration: true # 是否进行概率校准
+  event_level_evaluation: true  # 是否进行事件级评估
+  per_device_evaluation: true   # 是否按设备评估
+  
+  visualization:
+    enabled: true               # 是否启用可视化
+    plots:
+      - "confusion_matrix"      # 混淆矩阵
+      - "roc_curve"            # ROC曲线
+      - "pr_curve"             # PR曲线
+      - "calibration_curve"    # 校准曲线
+      - "prediction_timeline"  # 预测时间线
+    save_format: "png"          # 图片保存格式
+    dpi: 300                    # 图片分辨率
+
+# 数据存储配置 (Data Storage)
+data_storage:
+  output_directory: "Data/prepared"     # 输出目录
+  segments_meta_file: "segments_meta.csv"  # 段元数据文件
+  format: "pickle"                      # 存储格式: "csv", "parquet", "pickle"
+  compression: "snappy"                 # 压缩方式
+  version_control: true                 # 是否版本控制
+
+# 随机性控制 (Randomness Control)
+random:
+  seed: 42                      # 随机种子
+  deterministic: true           # 是否确定性运行
+
+# 计算资源配置 (Computational Resources)
+compute:
+  n_jobs: -1                    # 并行作业数(-1表示使用所有CPU)
+  chunk_size: 10000             # 数据块大小
+  memory_limit_gb: 8            # 内存限制(GB)
+
+# 日志配置 (Logging)
+logging:
+  level: "INFO"                 # 日志级别
+  file: "logs/data_prep.log"    # 日志文件
+  console: true                 # 是否输出到控制台
