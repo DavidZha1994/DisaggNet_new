@@ -1,0 +1,81 @@
+# DisaggNet 稳定优化配置
+# 继承基础配置，针对稳定性和性能进行优化
+
+defaults:
+  - base
+
+experiment:
+  name: "optimized_stable"
+
+logging:
+  version: "stable"
+
+# 优化的数据设置
+data:
+  batch_size: 512
+  num_workers: 8
+
+# 优化的模型设置
+model:
+  num_layers: 8
+  dropout: 0.2
+  calibration:
+    enable: true
+
+# 优化的训练设置
+training:
+  max_epochs: 100
+  optimizer:
+    lr: 0.0005
+  scheduler:
+    warmup_steps: 1000
+    T_max: 200
+    consistency_schedule:
+      start_epoch: 5
+      end_epoch: 40
+      min_weight: 0.0
+      max_weight: 0.6
+  device_weights:
+    enable: false
+  classification:
+    focal:
+      enable: true
+      gamma: 2.0
+      alpha: 1.0
+
+evaluation:
+  threshold_method: "optimal"
+
+imbalance_handling:
+  sampling_strategy: "mixed"
+
+walk_forward:
+  n_folds: 3
+  purge_gap_minutes: 10
+  val_span_days: 3.0
+  test_span_days: 3.0
+  min_train_days: 7.0
+  segment_isolation: false
+  holdout_test: true
+  time_based_split: true
+
+windowing:
+  window_lengths: [256]
+  step_sizes: [128]
+  default_window_length: 256
+  default_step_size: 128
+  max_filled_ratio: 0.3
+  overlap_within_set: true
+  overlap_across_sets: false
+  max_windows_per_segment: 500
+
+conformal_prediction:
+  enable: true
+  alpha: 0.1
+  regression_method: "quantile"
+  classification_method: "logits"
+
+reproducibility:
+  seed: 42
+  deterministic: true
+  benchmark: false

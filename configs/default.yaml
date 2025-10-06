@@ -1,0 +1,72 @@
+# DisaggNet 默认配置
+# 继承基础配置，适用于快速实验和开发
+
+defaults:
+  - base
+
+experiment:
+  name: "baseline"
+
+logging:
+  version: "v1"
+
+# 损失设置（与 MultiTaskLoss 对齐）
+loss:
+  weights:
+    regression: 1.0
+    classification: 1.0
+    consistency_schedule:
+      start_epoch: 1
+      end_epoch: 20
+      min_weight: 0.0
+      max_weight: 0.5
+  device_weights:
+    enable: false
+  classification:
+    focal:
+      enable: true
+      gamma: 2.0
+      alpha: 1.0
+
+# 评估与策略
+evaluation:
+  threshold_method: "optimal"
+
+# 不平衡处理（数据模块读取）
+imbalance_handling:
+  sampling_strategy: "mixed"
+
+# Walk-Forward 交叉验证（与 walk_forward.py 对齐）
+walk_forward:
+  n_folds: 3
+  purge_gap_minutes: 10
+  val_span_days: 3.0
+  test_span_days: 3.0
+  min_train_days: 7.0
+  segment_isolation: false
+  holdout_test: true
+  time_based_split: true
+
+# 窗口化与数据准备（与 prep_config 对齐的简化版本）
+windowing:
+  window_lengths: [256]
+  step_sizes: [128]
+  default_window_length: 256
+  default_step_size: 128
+  max_filled_ratio: 0.3
+  overlap_within_set: true
+  overlap_across_sets: false
+  max_windows_per_segment: 500
+
+# 置信区间（可选）
+conformal_prediction:
+  enable: false
+  alpha: 0.1
+  regression_method: "quantile"
+  classification_method: "logits"
+
+# 复现实验（main.py 使用）
+reproducibility:
+  seed: 42
+  deterministic: true
+  benchmark: false

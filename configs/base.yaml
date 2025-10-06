@@ -1,0 +1,96 @@
+# DisaggNet 基础配置模板
+# 所有其他配置文件都应该继承这个基础配置
+
+project_name: "DisaggNet"
+
+# 通用随机种子
+seed: 42
+
+# 路径与日志
+paths:
+  output_dir: "outputs"
+  data_dir: "Data"
+  processed_h5: "Data/processed.h5"
+
+logging:
+  save_dir: "logs/tensorboard"
+
+# 数据设置
+data:
+  batch_size: 256
+  num_workers: 4
+  pin_memory: true
+  device_names: ["fridge", "microwave", "kettle"]
+
+# 模型设置
+model:
+  d_model: 256
+  n_heads: 8
+  num_layers: 6
+  dropout: 0.1
+  calibration:
+    enable: false
+  heads:
+    classification:
+      init_p: [0.1, 0.1, 0.1]
+
+# 训练设置
+training:
+  max_epochs: 50
+  precision: "16-mixed"
+  optimizer:
+    name: "adamw"
+    lr: 0.001
+    weight_decay: 0.01
+  scheduler:
+    name: "cosine"
+    warmup_steps: 500
+    T_max: 100
+
+# 损失函数设置
+loss:
+  weights:
+    regression: 1.0
+    classification: 1.0
+    consistency: 0.1
+  device_weights:
+    fridge: 1.0
+    microwave: 1.0
+    kettle: 1.0
+  focal_loss:
+    alpha: 0.25
+    gamma: 2.0
+
+# 评估设置
+evaluation:
+  metrics: ["accuracy", "precision", "recall", "f1", "mae", "rmse"]
+  threshold_search: true
+
+# 不平衡处理
+imbalance_handling:
+  use_weighted_sampling: true
+  pos_weight_auto: true
+
+# Walk-Forward 交叉验证
+walk_forward:
+  n_folds: 5
+  test_size: 0.2
+  purge_gap: 3600
+
+# 窗口设置
+windowing:
+  window_size: 1024
+  stride: 512
+  overlap: 0.5
+
+# 共形预测
+conformal_prediction:
+  enabled: false
+  alpha: 0.1
+  regression_method: "quantile"
+  classification_method: "adaptive"
+
+# 可重现性
+reproducibility:
+  deterministic: true
+  benchmark: false

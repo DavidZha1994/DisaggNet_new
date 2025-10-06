@@ -63,7 +63,7 @@ python validate_prepared_data.py
 python main.py --mode train
 
 # 使用稳定性优化配置
-python main.py --mode train --config configs/ultra_stable.yaml
+python main.py --mode train --config configs/optimized_stable.yaml
 
 # 超参数优化
 python main.py --mode hpo --trials 100
@@ -126,11 +126,9 @@ python main.py --mode batch_infer --input_dir data/test_batch/
 
 项目提供多种预配置的配置文件：
 
-- `configs/default.yaml` - 默认配置
-- `configs/ultra_stable.yaml` - 超稳定训练配置
-- `configs/optimized_stable.yaml` - 优化稳定配置
-- `configs/fp16_fallback.yaml` - 混合精度训练配置
-- `configs/conformal_prediction.yaml` - 共形预测配置
+- `configs/base.yaml` - 基础配置模板（其他配置继承）
+- `configs/default.yaml` - 默认训练配置
+- `configs/optimized_stable.yaml` - 优化稳定训练配置
 
 ### 主要配置项
 
@@ -169,11 +167,9 @@ DisaggNet_new/
 ├── main.py                            # 统一入口文件
 ├── requirements.txt                   # 依赖列表
 ├── configs/                           # 配置文件目录
-│   ├── default.yaml
-│   ├── ultra_stable.yaml
-│   ├── optimized_stable.yaml
-│   ├── fp16_fallback.yaml
-│   └── conformal_prediction.yaml
+│   ├── base.yaml                      # 基础配置模板
+│   ├── default.yaml                   # 默认训练配置
+│   └── optimized_stable.yaml          # 优化稳定训练配置
 ├── src/                              # 源代码目录
 │   ├── data/                         # 数据处理模块
 │   │   ├── hipe_loader.py           # 工业级数据加载器
@@ -474,7 +470,7 @@ python main.py --mode stability_check --config configs/optimized_stable.yaml
 - 梯度裁剪和学习率优化
 - FP32精度配置
 
-**ultra_stable.yaml**
+**optimized_stable.yaml**
 极度保守的稳定配置，适用于严重不稳定的情况：
 - 极小学习率（1e-5）
 - 严格梯度裁剪（0.1）
@@ -573,24 +569,28 @@ src/utils/
 ├── conformal_evaluation.py      # 评估和可视化工具
 └── online_conformal_monitor.py  # 在线监控系统
 
-config/
-└── conformal_config.yaml        # 配置文件
+### 测试
 
-tests/
-├── test_conformal_simple.py     # 基础功能测试
-└── test_conformal_integration.py # 完整集成测试
-```
+目前项目中暂未包含测试文件，建议在后续开发中添加：
+- 单元测试
+- 集成测试  
+- 性能测试
 
 ### 快速开始
 
-#### 基础测试
+#### 数据准备
 ```bash
-python test_conformal_simple.py
+# 运行数据准备流程
+python run_data_preparation.py --config config/prep_config.yaml --data Data/processed_data.csv
 ```
 
-#### 完整集成测试
+#### 模型训练
 ```bash
-python test_conformal_integration.py
+# 基础训练
+python main.py train --config-name=default
+
+# 使用优化稳定配置训练
+python main.py train --config-name=optimized_stable
 ```
 
 #### 配置文件
@@ -699,7 +699,7 @@ for prediction, target in zip(predictions, targets):
    - 启用梯度累积
 
 2. **训练不稳定**
-   - 使用`ultra_stable.yaml`配置
+   - 使用`optimized_stable.yaml`配置
    - 降低学习率
    - 增加梯度裁剪
 
