@@ -41,7 +41,8 @@ from src.train import main as train_main
 from src.eval import main as eval_main
 from src.infer import main as infer_main
 from src.walk_forward import run_walk_forward_validation as walk_forward_main
-from src.hpo.optuna_runner import run_optimization as optuna_main
+# 延迟导入 HPO 组件，避免在未使用时因可选依赖报错
+optuna_main = None
 
 # 设置日志
 logging.basicConfig(
@@ -108,11 +109,28 @@ class UnifiedTrainingSystem:
         try:
             config = self.setup_environment(config_name)
             
-            # 更新配置参数
+            # 更新配置参数（支持嵌套项覆盖）
             for key, value in kwargs.items():
-                if hasattr(config, key):
-                    setattr(config, key, value)
-                    logger.info(f"更新配置参数: {key} = {value}")
+                try:
+                    if key == 'epochs':
+                        config.training.max_epochs = int(value)
+                        # 保证最小轮数不超过最大轮数
+                        if hasattr(config.training, 'min_epochs'):
+                            config.training.min_epochs = min(int(getattr(config.training, 'min_epochs', 1)), int(value))
+                        logger.info(f"更新配置参数: training.max_epochs = {value}")
+                    elif key == 'batch_size':
+                        config.data.batch_size = int(value)
+                        logger.info(f"更新配置参数: data.batch_size = {value}")
+                    elif key == 'lr':
+                        config.training.optimizer.lr = float(value)
+                        logger.info(f"更新配置参数: training.optimizer.lr = {value}")
+                    else:
+                        # 顶层兜底
+                        if hasattr(config, key):
+                            setattr(config, key, value)
+                            logger.info(f"更新配置参数: {key} = {value}")
+                except Exception as e:
+                    logger.warning(f"更新配置参数失败 {key}={value}: {e}")
             
             # 调用训练函数
             train_main(config)
@@ -356,6 +374,8 @@ def main():
             
         elif args.command == "hpo":
             # 超参数优化
+            # 仅在需要时导入 optuna 相关代码
+            from src.hpo.optuna_runner import run_optimization as optuna_main
             kwargs = {k.replace('-', '_'): v for k, v in vars(args).items() 
                      if v is not None and k not in ['command', 'config', 'n_trials']}
             training_system.optimize_hyperparameters(

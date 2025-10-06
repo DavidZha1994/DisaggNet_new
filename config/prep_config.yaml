@@ -99,10 +99,11 @@ feature_engineering:
   
   derived_features:
     power_ratios: true          # 功率比值特征
-    frequency_domain: false     # 频域特征(计算密集，先关闭)
     cross_correlations: false   # 交叉相关特征(计算密集，先关闭)
     interaction_terms: false    # 交互项特征(可能导致特征爆炸)
     polynomial_features: false  # 多项式特征
+  
+  frequency_domain: true      # 频域特征(已启用)
     
   feature_selection:
     enabled: true               # 是否启用特征选择

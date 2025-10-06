@@ -434,6 +434,7 @@ class DataPreparationPipeline:
             train_meta = [metadata[i] for i in train_indices]
             train_features_list = []
             train_raw_list = []
+            train_freq_list = []
             for window, meta in zip(train_windows, train_meta):
                 wf = self._extract_window_features(window, feature_columns)
                 tf = self._extract_time_and_energy_features(window, meta, feature_columns)
@@ -446,6 +447,9 @@ class DataPreparationPipeline:
                     except Exception:
                         # 兜底：仅保留功率列
                         train_raw_list.append(window[:, :1])
+                # 频域摘要（对优选通道执行 RFFT 并提取能量/质心/带宽等）
+                freq_summary = self._extract_frequency_summary(window, feature_columns)
+                train_freq_list.append(freq_summary)
             train_features = np.array(train_features_list)
             train_features = np.where(np.isfinite(train_features), train_features, global_col_median)
             train_features = train_features[:, global_valid_cols_mask]
@@ -453,12 +457,15 @@ class DataPreparationPipeline:
             # 拟合缩放器（按折）
             self.feature_engineer.fit_normalization(train_features)
             train_features_scaled = self.feature_engineer.apply_normalization(train_features)
+            # 组装频域摘要数组
+            train_freq = np.array(train_freq_list) if train_freq_list else np.empty((0,))
 
             # 验证集
             val_windows = windows[val_indices]
             val_meta = [metadata[i] for i in val_indices]
             val_features_list = []
             val_raw_list = []
+            val_freq_list = []
             for window, meta in zip(val_windows, val_meta):
                 wf = self._extract_window_features(window, feature_columns)
                 tf = self._extract_time_and_energy_features(window, meta, feature_columns)
@@ -470,10 +477,15 @@ class DataPreparationPipeline:
                         val_raw_list.append(np.stack([window[:, idx] for idx in raw_channel_indices], axis=-1))
                     except Exception:
                         val_raw_list.append(window[:, :1])
+                # 频域摘要
+                freq_summary = self._extract_frequency_summary(window, feature_columns)
+                val_freq_list.append(freq_summary)
             val_features = np.array(val_features_list)
             val_features = np.where(np.isfinite(val_features), val_features, global_col_median)
             val_features = val_features[:, global_valid_cols_mask]
             val_features_scaled = self.feature_engineer.apply_normalization(val_features)
+            # 组装频域摘要数组
+            val_freq = np.array(val_freq_list) if val_freq_list else np.empty((0,))
 
             # 组装原始序列数组
             train_raw = np.array(train_raw_list) if train_raw_list else np.empty((0, 0, 0))
@@ -485,6 +497,8 @@ class DataPreparationPipeline:
                 'val_features': val_features_scaled,
                 'train_raw': train_raw,
                 'val_raw': val_raw,
+                'train_freq': train_freq,
+                'val_freq': val_freq,
                 'train_indices': train_indices,
                 'val_indices': val_indices,
                 'scaler': self.feature_engineer.scaler,
@@ -497,6 +511,50 @@ class DataPreparationPipeline:
             'folds': processed_folds,
             'feature_names': unified_feature_names if processed_folds else []
         }
+
+    def _extract_frequency_summary(self, window: np.ndarray, feature_columns: List[str]) -> np.ndarray:
+        """
+        从窗口优选信号提取频域摘要特征。
+
+        返回: [total_energy, low_freq_energy, high_freq_energy, spectral_centroid, bandwidth]
+        """
+        # 优先选择功率或电压/电流通道
+        candidates = ['P_kW', 'V2_V', 'I2_A', 'Q_kvar']
+        sig_idx = None
+        for cname in candidates:
+            if cname in feature_columns:
+                idx = feature_columns.index(cname)
+                if idx < window.shape[1]:
+                    sig_idx = idx
+                    break
+        if sig_idx is None:
+            # 兜底：使用第0列
+            sig_idx = 0 if window.shape[1] > 0 else None
+        if sig_idx is None:
+            return np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+        x = window[:, sig_idx].astype(np.float32)
+        if x.size < 8:
+            return np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+        spec = np.fft.rfft(x)
+        mag = np.abs(spec).astype(np.float32)
+        total = float(np.sum(mag))
+        if total <= 1e-8:
+            return np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+        n = mag.shape[0]
+        low_band = max(1, n // 4)
+        high_band_start = n // 2
+        low_energy = float(np.sum(mag[:low_band]))
+        high_energy = float(np.sum(mag[high_band_start:]))
+
+        freqs = np.linspace(0.0, 1.0, n, dtype=np.float32)
+        centroid = float(np.sum(freqs * mag) / total)
+        var = float(np.sum(((freqs - centroid) ** 2) * mag) / total)
+        bandwidth = float(np.sqrt(max(var, 0.0)))
+
+        return np.array([total, low_energy, high_energy, centroid, bandwidth], dtype=np.float32)
     
     def _extract_window_features(self, window: np.ndarray, feature_columns: List[str]) -> np.ndarray:
         """
@@ -1030,6 +1088,12 @@ class DataPreparationPipeline:
                 np.save(os.path.join(fold_dir, 'train_raw.npy'), fold_data['train_raw'])
             if 'val_raw' in fold_data and fold_data['val_raw'] is not None and fold_data['val_raw'].size > 0:
                 np.save(os.path.join(fold_dir, 'val_raw.npy'), fold_data['val_raw'])
+
+            # 保存频域摘要帧（可选）
+            if 'train_freq' in fold_data and fold_data['train_freq'] is not None and np.size(fold_data['train_freq']) > 0:
+                np.save(os.path.join(fold_dir, 'train_freq.npy'), fold_data['train_freq'])
+            if 'val_freq' in fold_data and fold_data['val_freq'] is not None and np.size(fold_data['val_freq']) > 0:
+                np.save(os.path.join(fold_dir, 'val_freq.npy'), fold_data['val_freq'])
             
             # 保存索引
             np.save(os.path.join(fold_dir, 'train_indices.npy'), fold_data['train_indices'])

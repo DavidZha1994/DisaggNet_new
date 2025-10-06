@@ -84,7 +84,8 @@ class WalkForwardValidator:
             'walk_forward': OmegaConf.to_container(self.wf_config),
             'data_paths': {
                 'data_dir': str(self.config.paths.data_dir),
-                'processed_h5': str(self.config.paths.processed_h5)
+                # 使用 prepared 目录而非 H5 文件，避免对 H5 的依赖
+                'prepared_dir': str(Path(self.config.paths.data_dir) / 'prepared')
             },
             'windowing': OmegaConf.to_container(self.config.windowing)
         }

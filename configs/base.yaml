@@ -13,7 +13,7 @@ reproducibility:
 paths:
   output_dir: "outputs"
   data_dir: "Data"
-  processed_h5: "Data/processed.h5"
+  prepared_dir: "Data/prepared"
 
 logging:
   save_dir: "logs/tensorboard"
@@ -23,7 +23,8 @@ data:
   batch_size: 256
   num_workers: 4
   pin_memory: true
-  device_names: ["fridge", "microwave", "kettle"]
+  device_names: ["device_1"]
+  window_size: 256
 
 # 模型设置
 model:
@@ -33,41 +34,99 @@ model:
   dropout: 0.1
   calibration:
     enable: false
+  # 细化的编码与融合配置，供 FusionTransformer 使用
+  time_encoder:
+    d_model: 256
+    n_heads: 8
+    num_layers: 6
+    dropout: 0.1
+    input_conv_embed: false
+    causal_mask: true
+  freq_encoder:
+    enable: false
+    proj_dim: 128
+    conv1d_kernel: 3
+    small_transformer_layers: 0
+    dropout: 0.1
+  fusion:
+    type: "none"   # 可设为 "cross_attention" 以启用时频融合
+    gated: true
+  aux_encoder:
+    enable: false
+    hidden: 128
+    dropout: 0.1
   heads:
+    regression:
+      hidden: 96
     classification:
-      init_p: [0.1, 0.1, 0.1]
+      init_p: [0.1]
 
 # 训练设置
 training:
   max_epochs: 50
   precision: "16-mixed"
+  log_every_n_steps: 10
+  min_epochs: 1
+  gradient_clip_val: 0.5
+  accumulate_grad_batches: 1
+  check_val_every_n_epoch: 1
+  accelerator: "auto"
+  devices: 1
+  monitor_device_stats: false
   optimizer:
     name: "adamw"
     lr: 0.001
     weight_decay: 0.01
+    betas: [0.9, 0.999]
   scheduler:
     name: "cosine"
     warmup_steps: 500
     T_max: 100
+    eta_min: 1e-6
+  checkpoint:
+    dirpath: "outputs/checkpoints"
+    filename: "epoch{epoch:02d}-score{val_score:.3f}"
+    monitor: "val_score"
+    mode: "max"
+    save_top_k: 1
+  early_stopping:
+    enable: true
+    monitor: "val_score"
+    patience: 5
+    mode: "max"
+debug:
+  track_grad_norm: 0
+  strict_validation: false
 
 # 损失函数设置
 loss:
   weights:
     regression: 1.0
     classification: 1.0
-    consistency: 0.1
+    consistency_schedule:
+      type: "linear"
+      initial: 0.0
+      final: 0.5
+      warmup_epochs: 20
   device_weights:
-    fridge: 1.0
-    microwave: 1.0
-    kettle: 1.0
-  focal_loss:
-    alpha: 0.25
-    gamma: 2.0
+    enable: false
+  regression:
+    type: "mse"
+    huber_delta: 1.0
+    quantiles: [0.1, 0.5, 0.9]
+  classification:
+    type: "bce"
+    pos_weight:
+      enable: false
+    focal_alpha: 1.0
+    focal_gamma: 2.0
+  priors:
+    enable: false
 
 # 评估设置
 evaluation:
-  metrics: ["accuracy", "precision", "recall", "f1", "mae", "rmse"]
-  threshold_search: true
+  threshold_method: "optimal"
+  test_after_training: false
 
 # 不平衡处理
 imbalance_handling:

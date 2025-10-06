@@ -75,6 +75,12 @@ class WindowGenerator:
         # 转换为numpy数组以提高性能
         data_array = df.select(feature_columns).to_numpy()
         ts_array = df.select("ts_utc").to_numpy().flatten()
+        # 估计该段的基准采样步长（秒）
+        base_step = None
+        if len(ts_array) > 1:
+            diffs = np.diff(ts_array)
+            # 使用中位数作为稳健估计
+            base_step = float(np.median(diffs)) if np.all(np.isfinite(diffs)) else None
         
         # 确保mask_filled不包含None值
         if "mask_filled" in df.columns:
@@ -103,6 +109,20 @@ class WindowGenerator:
             if filled_ratio > self.max_filled_ratio:
                 logger.debug(f"跳过低质量窗口: filled_ratio={filled_ratio:.3f}")
                 continue
+
+            # 丢弃包含 NaN/Inf 的窗口（不连续/缺测）
+            if not np.isfinite(window_data).all():
+                logger.debug("跳过不连续窗口: 存在 NaN/Inf")
+                continue
+
+            # 基于时间戳的连续性检测：若时间步长出现明显异常则丢弃
+            if base_step is not None and end_idx - start_idx > 1:
+                dt = np.diff(ts_array[start_idx:end_idx])
+                # 容差：允许±50%，超过则视为不连续
+                tol = 0.5 * base_step
+                if np.any(np.abs(dt - base_step) > tol):
+                    logger.debug("跳过不连续窗口: 时间戳步长异常")
+                    continue
             
             # 检测窗口内事件（简化处理）
             has_events, event_count = self._detect_window_events(window_data, feature_columns)

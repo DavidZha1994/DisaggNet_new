@@ -16,21 +16,35 @@ loss:
     regression: 1.0
     classification: 1.0
     consistency_schedule:
-      start_epoch: 1
-      end_epoch: 20
-      min_weight: 0.0
-      max_weight: 0.5
+      type: "linear"
+      initial: 0.0
+      final: 0.5
+      warmup_epochs: 20
   device_weights:
     enable: false
+  regression:
+    type: "mse"
+    huber_delta: 1.0
+    quantiles: [0.1, 0.5, 0.9]
   classification:
-    focal:
-      enable: true
-      gamma: 2.0
-      alpha: 1.0
+    type: "bce"
+    pos_weight:
+      enable: false
+    focal_alpha: 1.0
+    focal_gamma: 2.0
+  priors:
+    enable: false
 
 # 评估与策略
 evaluation:
   threshold_method: "optimal"
+
+# 启用频域编码与交叉注意力融合（使用 Data/prepared 的freq_features）
+model:
+  freq_encoder:
+    enable: true
+  fusion:
+    type: "cross_attention"
 
 # 不平衡处理（数据模块读取）
 imbalance_handling:

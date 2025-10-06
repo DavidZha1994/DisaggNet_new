@@ -14,6 +14,7 @@ logging:
 data:
   batch_size: 512
   num_workers: 8
+  device_names: ["device"]
 
 # 优化的模型设置
 model:
@@ -21,6 +22,9 @@ model:
   dropout: 0.2
   calibration:
     enable: true
+  heads:
+    classification:
+      init_p: [0.1]
 
 # 优化的训练设置
 training:
@@ -37,17 +41,24 @@ loss:
     regression: 1.0
     classification: 1.0
     consistency_schedule:
-      start_epoch: 5
-      end_epoch: 40
-      min_weight: 0.0
-      max_weight: 0.6
+      type: "linear"
+      initial: 0.0
+      final: 0.6
+      warmup_epochs: 40
   device_weights:
     enable: false
+  regression:
+    type: "mse"
+    huber_delta: 1.0
+    quantiles: [0.1, 0.5, 0.9]
   classification:
-    focal:
-      enable: true
-      gamma: 2.0
-      alpha: 1.0
+    type: "bce"
+    pos_weight:
+      enable: false
+    focal_alpha: 1.0
+    focal_gamma: 2.0
+  priors:
+    enable: false
 
 # 评估设置
 evaluation:

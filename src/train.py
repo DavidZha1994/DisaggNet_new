@@ -154,12 +154,13 @@ class NILMLightningModule(pl.LightningModule):
             optimize_thresholds=(stage == 'val')
         )
         
-        # 记录主要指标
+        # 记录主要指标（统一为层级式标签，按 epoch 写入）
         main_metrics = ['mae', 'nde', 'sae', 'teca', 'f1', 'mcc', 'pr_auc', 'roc_auc', 'score']
         for metric_name in main_metrics:
             if metric_name in metrics:
-                self.log(f'{stage}_{metric_name}', metrics[metric_name],
-                        on_epoch=True, prog_bar=(metric_name in ['score', 'f1']), sync_dist=True)
+                self.log(f'{stage}/{metric_name}', metrics[metric_name],
+                        on_epoch=True, on_step=False,
+                        prog_bar=(metric_name in ['score', 'f1']), sync_dist=True)
         
         # 一致性指标
         consistency_metrics = {
@@ -169,7 +170,8 @@ class NILMLightningModule(pl.LightningModule):
         }
         
         for metric_name, metric_value in consistency_metrics.items():
-            self.log(f'{stage}_{metric_name}', metric_value, on_epoch=True, sync_dist=True)
+            # 统一使用层级式标签，按 epoch 记录，减少乱序
+            self.log(f'{stage}/{metric_name}', metric_value, on_epoch=True, sync_dist=True)
         
         return metrics
     
@@ -188,8 +190,8 @@ class NILMLightningModule(pl.LightningModule):
         # 检测损失中的NaN/Inf
         self._validate_losses(losses, 'train', batch_idx)
         
-        # 记录学习率
-        self.log('lr', self.trainer.optimizers[0].param_groups[0]['lr'], on_step=True, on_epoch=False)
+        # 记录学习率（按 epoch），避免与 step 级曲线混写造成乱序
+        self.log('train/lr', self.trainer.optimizers[0].param_groups[0]['lr'], on_step=False, on_epoch=True)
         
         # 每隔一定步数计算训练指标
         if batch_idx % self.config.training.log_every_n_steps == 0:
@@ -199,7 +201,8 @@ class NILMLightningModule(pl.LightningModule):
                 # 记录梯度范数 - 增强梯度监控
                 if self.config.debug.track_grad_norm > 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=float('inf'))
-                    self.log('grad_norm', grad_norm, on_step=True, on_epoch=False)
+                    # 统一使用 epoch 级记录
+                    self.log('train/grad_norm', grad_norm, on_step=False, on_epoch=True)
                     
                     # 检查梯度异常
                     if torch.isnan(grad_norm) or torch.isinf(grad_norm):
@@ -220,6 +223,10 @@ class NILMLightningModule(pl.LightningModule):
         self._validate_losses(losses, 'val', batch_idx)
         metrics = self._compute_metrics(batch, predictions, 'val')
         
+        # 显式按 epoch 记录验证损失与分数，保证每个 epoch 有序写入
+        self.log('val/loss', losses['total'], on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val/score', metrics['score'], on_step=False, on_epoch=True, prog_bar=True)
+
         return {
             'val_loss': losses['total'],
             'val_score': metrics['score'],
@@ -239,6 +246,10 @@ class NILMLightningModule(pl.LightningModule):
         self._validate_losses(losses, 'test', batch_idx)
         metrics = self._compute_metrics(batch, predictions, 'test')
         
+        # 显式按 epoch 记录测试损失与分数（若启用测试），保证写入一致性
+        self.log('test/loss', losses['total'], on_step=False, on_epoch=True)
+        self.log('test/score', metrics['score'], on_step=False, on_epoch=True)
+
         return {
             'test_loss': losses['total'],
             'test_score': metrics['score'],
@@ -248,17 +259,29 @@ class NILMLightningModule(pl.LightningModule):
     
     def on_validation_epoch_end(self) -> None:
         """验证轮次结束"""
-        # 获取当前验证分数
-        current_score = self.trainer.callback_metrics.get('val_score', 0.0)
+        # 获取当前验证分数（兼容旧键名）
+        current_score = self.trainer.callback_metrics.get('val/score', None)
+        if current_score is None:
+            current_score = self.trainer.callback_metrics.get('val_score', 0.0)
+        # 将 Tensor 转为 float，避免后续配置或日志处理中出现 OmegaConf 类型不支持
+        try:
+            if hasattr(current_score, 'item'):
+                current_score = float(current_score.item())
+            else:
+                current_score = float(current_score)
+        except Exception:
+            current_score = 0.0
         
         # 更新最佳分数和阈值
-        if current_score > self.best_val_score:
-            self.best_val_score = current_score
+        if current_score > float(self.best_val_score):
+            self.best_val_score = float(current_score)
             self.best_thresholds = self.metrics.thresholds.copy()
+            # 记录最佳验证分数（层级命名）
+            self.log('val/best_score', self.best_val_score, on_epoch=True)
             
             # 记录最佳阈值
             for device_name, threshold in self.best_thresholds.items():
-                self.log(f'best_threshold_{device_name}', threshold, on_epoch=True)
+                self.log(f'best_threshold/{device_name}', threshold, on_epoch=True)
 
             # 持久化保存最佳阈值
             try:
@@ -308,7 +331,8 @@ class NILMLightningModule(pl.LightningModule):
                         # 记录回归评估指标
                         for device_name, metrics in eval_results.items():
                             for metric_name, value in metrics.items():
-                                self.log(f'conformal_regression_{device_name}_{metric_name}', value, on_epoch=True)
+                                # 归入验证命名空间，并使用层级式标签
+                                self.log(f'val/conformal/regression/{device_name}/{metric_name}', value, on_epoch=True)
                         
                         # 评估分类校准
                         classification_results = self.conformal_evaluator.evaluate_classification(
@@ -320,10 +344,10 @@ class NILMLightningModule(pl.LightningModule):
                         # 记录分类评估指标
                         for device_name, metrics in classification_results.items():
                             for metric_name, value in metrics.items():
-                                self.log(f'conformal_classification_{device_name}_{metric_name}', value, on_epoch=True)
+                                self.log(f'val/conformal/classification/{device_name}/{metric_name}', value, on_epoch=True)
                     
-                    # 记录标定信息
-                    self.log('conformal_calibrated', 1.0, on_epoch=True)
+                    # 记录标定信息（归入验证命名空间）
+                    self.log('val/conformal/calibrated', 1.0, on_epoch=True)
                     print(f"Conformal prediction calibrated at epoch {self.current_epoch}")
                     
                     # 生成评估报告（每10个epoch一次）
@@ -338,8 +362,8 @@ class NILMLightningModule(pl.LightningModule):
                         )
                         print(f"Conformal evaluation report saved to {report_path}")
         
-        # 记录最佳验证分数
-        self.log('best_val_score', self.best_val_score, on_epoch=True)
+        # 记录最佳验证分数（归入验证命名空间）
+        self.log('val/best_score', self.best_val_score, on_epoch=True)
         
         # 记录模型参数统计
         for name, param in self.named_parameters():
@@ -400,7 +424,7 @@ class NILMLightningModule(pl.LightningModule):
                 'optimizer': optimizer,
                 'lr_scheduler': {
                     'scheduler': scheduler,
-                    'monitor': 'val_score',
+                    'monitor': 'val/score',
                     'interval': 'epoch',
                     'frequency': 1
                 }
@@ -474,10 +498,15 @@ class NILMLightningModule(pl.LightningModule):
         callbacks = []
         
         # 模型检查点
+        # 兼容新的层级式指标命名：将旧的 'val_score' 映射为 'val/score'
+        ckpt_monitor = getattr(self.config.training.checkpoint, 'monitor', 'val/score')
+        if ckpt_monitor == 'val_score':
+            ckpt_monitor = 'val/score'
+        # 使用安全的文件名（不依赖指标占位，避免层级名导致格式错误）
         checkpoint_callback = ModelCheckpoint(
             dirpath=self.config.training.checkpoint.dirpath,
-            filename=self.config.training.checkpoint.filename,
-            monitor=self.config.training.checkpoint.monitor,
+            filename='epoch{epoch:02d}',
+            monitor=ckpt_monitor,
             mode=self.config.training.checkpoint.mode,
             save_top_k=self.config.training.checkpoint.save_top_k,
             save_last=True,
@@ -487,8 +516,11 @@ class NILMLightningModule(pl.LightningModule):
         
         # 早停
         if self.config.training.early_stopping.enable:
+            es_monitor = getattr(self.config.training.early_stopping, 'monitor', 'val/score')
+            if es_monitor == 'val_score':
+                es_monitor = 'val/score'
             early_stopping = EarlyStopping(
-                monitor=self.config.training.early_stopping.monitor,
+                monitor=es_monitor,
                 patience=self.config.training.early_stopping.patience,
                 mode=self.config.training.early_stopping.mode,
                 verbose=True
@@ -514,21 +546,48 @@ class NILMLightningModule(pl.LightningModule):
 def create_trainer(config: DictConfig, logger: Optional[pl.loggers.Logger] = None) -> pl.Trainer:
     """创建训练器"""
     
-    # 设备配置
-    if config.training.accelerator == 'auto':
-        accelerator = 'gpu' if torch.cuda.is_available() else 'cpu'
+    # 设备配置（自动检测：macOS->MPS，Linux/Windows->CUDA，否则CPU）
+    if getattr(config.training, 'accelerator', 'auto') == 'auto':
+        is_mac = (sys.platform == 'darwin')
+        mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+        if is_mac and mps_available:
+            accelerator = 'mps'
+            devices = 1
+        elif torch.cuda.is_available():
+            accelerator = 'gpu'
+            # 使用全部可用 GPU 以最大化吞吐（如 5090 等现代卡）
+            devices = getattr(config.training, 'devices', 'auto')
+            if devices in (None, 0):
+                devices = 'auto'
+        else:
+            accelerator = 'cpu'
+            devices = 1
     else:
         accelerator = config.training.accelerator
-    
-    devices = config.training.devices if accelerator == 'gpu' else 1
+        devices = getattr(config.training, 'devices', 1)
     
     # 策略配置
     strategy = 'auto'
-    if accelerator == 'gpu' and devices > 1:
+    # 当使用多 GPU 时启用 DDP 以最佳性能
+    try:
+        multi_gpu = (accelerator == 'gpu') and (
+            (isinstance(devices, int) and devices > 1) or devices == 'auto'
+        ) and torch.cuda.device_count() > 1
+    except Exception:
+        multi_gpu = False
+    if multi_gpu:
         strategy = DDPStrategy(find_unused_parameters=False)
     
-    # 精度配置 - 支持混合精度训练
-    precision = config.training.precision if hasattr(config.training, 'precision') else '16-mixed'
+    # 精度配置 - 自动选择（GPU优先BF16，其次FP16；MPS使用FP16混合）
+    if hasattr(config.training, 'precision'):
+        precision = config.training.precision
+    else:
+        if accelerator == 'gpu':
+            precision = 'bf16-mixed' if torch.cuda.is_bf16_supported() else '16-mixed'
+        elif accelerator == 'mps':
+            precision = '16-mixed'
+        else:
+            precision = '32'
     
     # 创建训练器
     trainer = pl.Trainer(
@@ -558,10 +617,15 @@ def create_trainer(config: DictConfig, logger: Optional[pl.loggers.Logger] = Non
 
 def setup_logging(config: DictConfig, experiment_name: str) -> TensorBoardLogger:
     """设置日志记录"""
+    # 使用自动版本递增，避免复用同一版本目录导致多次运行混写
+    version = getattr(config.logging, 'version', None)
+    if isinstance(version, str) and version.strip().lower() in {'stable', 'default', ''}:
+        version = None
+
     logger = TensorBoardLogger(
         save_dir=config.logging.save_dir,
         name=experiment_name,
-        version=config.logging.version,
+        version=version,
         default_hp_metric=False
     )
     
@@ -615,7 +679,14 @@ def main(config: DictConfig) -> None:
         print("已设置float32矩阵乘法精度为'medium'以优化GPU性能")
     
     # 设置随机种子
-    pl.seed_everything(config.seed, workers=True)
+    # 兼容新的复现性配置：优先使用 reproducibility.seed，其次回退到顶层 seed
+    if hasattr(config, 'reproducibility') and hasattr(config.reproducibility, 'seed'):
+        _seed = config.reproducibility.seed
+    elif hasattr(config, 'seed'):
+        _seed = config.seed
+    else:
+        _seed = 42
+    pl.seed_everything(_seed, workers=True)
     
     # 创建输出目录
     output_dir = Path(config.paths.output_dir)
