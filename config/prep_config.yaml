@@ -162,3 +162,12 @@ logging:
   level: "INFO"                 # 日志级别
   file: "logs/data_prep.log"    # 日志文件
   console: true                 # 是否输出到控制台
+
+# 频域表示配置（用于 Data/prepared 的 freq_features 输出）
+frequency:
+  mode: "stft"           # 可选: summary | fft | stft
+  signal: "P_kW"         # 频谱计算优先使用的信号列
+  n_fft: 256              # FFT长度（决定频点数）
+  win_length: 256         # STFT帧长度（与窗口长度一致时为整窗）
+  hop_length: 64          # STFT帧步长
+  magnitude: true         # 使用幅度谱（true）或复数谱（false）

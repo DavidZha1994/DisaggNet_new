@@ -22,6 +22,7 @@ from scipy import signal
 from typing import Dict, List, Tuple, Optional, Any
 import pickle
 import json
+from dataclasses import asdict
 
 from .segmentation import DataSegmenter
 from .windowing import WindowGenerator
@@ -447,9 +448,9 @@ class DataPreparationPipeline:
                     except Exception:
                         # 兜底：仅保留功率列
                         train_raw_list.append(window[:, :1])
-                # 频域摘要（对优选通道执行 RFFT 并提取能量/质心/带宽等）
-                freq_summary = self._extract_frequency_summary(window, feature_columns)
-                train_freq_list.append(freq_summary)
+                # 频域表示（支持摘要/FFT/STFT）
+                freq_repr = self._extract_frequency_representation(window, feature_columns)
+                train_freq_list.append(freq_repr)
             train_features = np.array(train_features_list)
             train_features = np.where(np.isfinite(train_features), train_features, global_col_median)
             train_features = train_features[:, global_valid_cols_mask]
@@ -457,8 +458,8 @@ class DataPreparationPipeline:
             # 拟合缩放器（按折）
             self.feature_engineer.fit_normalization(train_features)
             train_features_scaled = self.feature_engineer.apply_normalization(train_features)
-            # 组装频域摘要数组
-            train_freq = np.array(train_freq_list) if train_freq_list else np.empty((0,))
+            # 组装频域数组（summary/fft 为 (N, F)，stft 为 (N, T_f, F)）
+            train_freq = np.stack(train_freq_list, axis=0) if train_freq_list else np.empty((0,))
 
             # 验证集
             val_windows = windows[val_indices]
@@ -477,15 +478,15 @@ class DataPreparationPipeline:
                         val_raw_list.append(np.stack([window[:, idx] for idx in raw_channel_indices], axis=-1))
                     except Exception:
                         val_raw_list.append(window[:, :1])
-                # 频域摘要
-                freq_summary = self._extract_frequency_summary(window, feature_columns)
-                val_freq_list.append(freq_summary)
+                # 频域表示（支持摘要/FFT/STFT）
+                freq_repr = self._extract_frequency_representation(window, feature_columns)
+                val_freq_list.append(freq_repr)
             val_features = np.array(val_features_list)
             val_features = np.where(np.isfinite(val_features), val_features, global_col_median)
             val_features = val_features[:, global_valid_cols_mask]
             val_features_scaled = self.feature_engineer.apply_normalization(val_features)
-            # 组装频域摘要数组
-            val_freq = np.array(val_freq_list) if val_freq_list else np.empty((0,))
+            # 组装频域数组
+            val_freq = np.stack(val_freq_list, axis=0) if val_freq_list else np.empty((0,))
 
             # 组装原始序列数组
             train_raw = np.array(train_raw_list) if train_raw_list else np.empty((0, 0, 0))
@@ -555,6 +556,96 @@ class DataPreparationPipeline:
         bandwidth = float(np.sqrt(max(var, 0.0)))
 
         return np.array([total, low_energy, high_energy, centroid, bandwidth], dtype=np.float32)
+
+    def _extract_frequency_representation(self, window: np.ndarray, feature_columns: List[str]) -> np.ndarray:
+        """
+        根据配置提取频域表示，支持三种模式：
+        - summary: 5维摘要特征（保持现有逻辑）
+        - fft: 对整窗做 rFFT，返回幅度谱向量 (F_bins)
+        - stft: 对窗内进行短时FFT分帧，返回 (T_frames, F_bins)
+
+        配置示例：
+        frequency:
+          mode: stft  # summary | fft | stft
+          signal: P_kW
+          n_fft: 256
+          win_length: 256
+          hop_length: 64
+          magnitude: true
+        """
+        freq_cfg = (self.config or {}).get('frequency', {})
+        mode = str(freq_cfg.get('mode', 'summary')).lower()
+        signal_pref = freq_cfg.get('signal', 'P_kW')
+        n_fft = int(freq_cfg.get('n_fft', max(8, window.shape[0])))
+        win_length = int(freq_cfg.get('win_length', n_fft))
+        hop_length = int(freq_cfg.get('hop_length', max(1, win_length // 4)))
+        use_magnitude = bool(freq_cfg.get('magnitude', True))
+
+        # 选择信号列
+        sig_idx: Optional[int] = None
+        if signal_pref in feature_columns:
+            idx = feature_columns.index(signal_pref)
+            if idx < window.shape[1]:
+                sig_idx = idx
+        if sig_idx is None:
+            for cname in ['P_kW', 'V2_V', 'I2_A', 'Q_kvar']:
+                if cname in feature_columns:
+                    idx = feature_columns.index(cname)
+                    if idx < window.shape[1]:
+                        sig_idx = idx
+                        break
+        if sig_idx is None:
+            sig_idx = 0 if window.shape[1] > 0 else None
+        if sig_idx is None:
+            # 空窗口兜底
+            return np.zeros((1,), dtype=np.float32)
+
+        x = window[:, sig_idx].astype(np.float32)
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if mode == 'summary':
+            return self._extract_frequency_summary(window, feature_columns)
+
+        # FFT：整窗一次谱
+        if mode == 'fft':
+            if x.size < 2:
+                return np.zeros((1,), dtype=np.float32)
+            # 零填充或截断到 n_fft
+            if x.size < n_fft:
+                x_pad = np.pad(x, (0, n_fft - x.size))
+            else:
+                x_pad = x[:n_fft]
+            spec = np.fft.rfft(x_pad, n=n_fft)
+            return np.abs(spec).astype(np.float32) if use_magnitude else spec.astype(np.complex64)
+
+        # STFT：按帧提取谱
+        if mode == 'stft':
+            frames: List[np.ndarray] = []
+            if win_length <= 0:
+                win_length = min(x.size, n_fft)
+            if hop_length <= 0:
+                hop_length = max(1, win_length // 2)
+            start = 0
+            while start + win_length <= x.size:
+                seg = x[start:start + win_length]
+                if seg.size < win_length:
+                    seg = np.pad(seg, (0, win_length - seg.size))
+                spec = np.fft.rfft(seg, n=n_fft)
+                mag = np.abs(spec).astype(np.float32) if use_magnitude else spec.astype(np.complex64)
+                frames.append(mag)
+                start += hop_length
+            if not frames:
+                # 不足一帧时，用整体零填充
+                seg = x
+                if seg.size < win_length:
+                    seg = np.pad(seg, (0, win_length - seg.size))
+                spec = np.fft.rfft(seg, n=n_fft)
+                mag = np.abs(spec).astype(np.float32) if use_magnitude else spec.astype(np.complex64)
+                frames.append(mag)
+            return np.stack(frames, axis=0)
+
+        # 未知模式，回退摘要
+        return self._extract_frequency_summary(window, feature_columns)
     
     def _extract_window_features(self, window: np.ndarray, feature_columns: List[str]) -> np.ndarray:
         """
@@ -1072,7 +1163,20 @@ class DataPreparationPipeline:
             for meta in segments_meta
         ])
         segments_df.to_csv(os.path.join(self.output_dir, 'segments_meta.csv'), index=False)
-        
+
+        # 构建并保存设备名称到ID的映射（基于所有窗口元数据）
+        all_label_meta = labels_data.get('label_metadata', [])
+        try:
+            all_device_names = [(
+                m['device_name'] if isinstance(m, dict) else getattr(m, 'device_name', None)
+            ) for m in all_label_meta]
+        except Exception:
+            all_device_names = []
+        unique_devices = sorted({name for name in all_device_names if name is not None})
+        device_name_to_id = {name: idx for idx, name in enumerate(unique_devices)}
+        with open(os.path.join(self.output_dir, 'device_name_to_id.json'), 'w') as f:
+            json.dump(device_name_to_id, f, ensure_ascii=False, indent=2)
+
         # 保存每个折的处理数据
         for fold_data in processed_data['folds']:
             fold_idx = fold_data['fold_idx']
@@ -1098,11 +1202,51 @@ class DataPreparationPipeline:
             # 保存索引
             np.save(os.path.join(fold_dir, 'train_indices.npy'), fold_data['train_indices'])
             np.save(os.path.join(fold_dir, 'val_indices.npy'), fold_data['val_indices'])
-            
+
+            # 保存该折的元数据快照（包含设备名等，便于下游按设备分析）
+            train_meta_rows = []
+            val_meta_rows = []
+            for i in fold_data['train_indices']:
+                meta_obj = labels_data['label_metadata'][int(i)]
+                # dataclass 或字典均统一转为字典行
+                if hasattr(meta_obj, '__dict__'):
+                    train_meta_rows.append(asdict(meta_obj))
+                elif isinstance(meta_obj, dict):
+                    train_meta_rows.append(meta_obj)
+                else:
+                    train_meta_rows.append({'index': int(i)})
+            for i in fold_data['val_indices']:
+                meta_obj = labels_data['label_metadata'][int(i)]
+                if hasattr(meta_obj, '__dict__'):
+                    val_meta_rows.append(asdict(meta_obj))
+                elif isinstance(meta_obj, dict):
+                    val_meta_rows.append(meta_obj)
+                else:
+                    val_meta_rows.append({'index': int(i)})
+            if train_meta_rows:
+                pd.DataFrame(train_meta_rows).to_csv(os.path.join(fold_dir, 'train_metadata.csv'), index=False)
+            if val_meta_rows:
+                pd.DataFrame(val_meta_rows).to_csv(os.path.join(fold_dir, 'val_metadata.csv'), index=False)
+
+            # 保存设备ID序列（与索引对齐），便于按设备建模或筛选
+            if device_name_to_id:
+                train_device_ids = []
+                val_device_ids = []
+                for i in fold_data['train_indices']:
+                    meta_obj = labels_data['label_metadata'][int(i)]
+                    dev_name = meta_obj['device_name'] if isinstance(meta_obj, dict) else getattr(meta_obj, 'device_name', None)
+                    train_device_ids.append(device_name_to_id.get(dev_name, -1))
+                for i in fold_data['val_indices']:
+                    meta_obj = labels_data['label_metadata'][int(i)]
+                    dev_name = meta_obj['device_name'] if isinstance(meta_obj, dict) else getattr(meta_obj, 'device_name', None)
+                    val_device_ids.append(device_name_to_id.get(dev_name, -1))
+                np.save(os.path.join(fold_dir, 'train_device_ids.npy'), np.asarray(train_device_ids, dtype=np.int64))
+                np.save(os.path.join(fold_dir, 'val_device_ids.npy'), np.asarray(val_device_ids, dtype=np.int64))
+
             # 保存缩放器
             with open(os.path.join(fold_dir, 'scaler.pkl'), 'wb') as f:
                 pickle.dump(fold_data['scaler'], f)
-            
+
             # 保存特征名称
             with open(os.path.join(fold_dir, 'feature_names.json'), 'w') as f:
                 json.dump(fold_data['feature_names'], f)
@@ -1159,6 +1303,21 @@ class DataPreparationPipeline:
         # 加载索引
         train_indices = np.load(os.path.join(fold_dir, 'train_indices.npy'))
         val_indices = np.load(os.path.join(fold_dir, 'val_indices.npy'))
+
+        # 加载设备ID（可选）与映射
+        train_device_ids = None
+        val_device_ids = None
+        device_map_path = os.path.join(self.output_dir, 'device_name_to_id.json')
+        device_name_to_id = {}
+        train_dev_path = os.path.join(fold_dir, 'train_device_ids.npy')
+        val_dev_path = os.path.join(fold_dir, 'val_device_ids.npy')
+        if os.path.exists(train_dev_path):
+            train_device_ids = np.load(train_dev_path)
+        if os.path.exists(val_dev_path):
+            val_device_ids = np.load(val_dev_path)
+        if os.path.exists(device_map_path):
+            with open(device_map_path, 'r') as f:
+                device_name_to_id = json.load(f)
         
         # 加载缩放器
         with open(os.path.join(fold_dir, 'scaler.pkl'), 'rb') as f:
@@ -1184,6 +1343,9 @@ class DataPreparationPipeline:
             'val_labels': val_labels,
             'train_indices': train_indices,
             'val_indices': val_indices,
+            'train_device_ids': train_device_ids,
+            'val_device_ids': val_device_ids,
+            'device_name_to_id': device_name_to_id,
             'scaler': scaler,
             'feature_names': feature_names,
             'raw_channel_names': raw_channel_names
