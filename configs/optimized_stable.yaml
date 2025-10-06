@@ -30,6 +30,12 @@ training:
   scheduler:
     warmup_steps: 1000
     T_max: 200
+
+# 损失设置（优化版本）
+loss:
+  weights:
+    regression: 1.0
+    classification: 1.0
     consistency_schedule:
       start_epoch: 5
       end_epoch: 40
@@ -43,38 +49,43 @@ training:
       gamma: 2.0
       alpha: 1.0
 
+# 评估设置
 evaluation:
   threshold_method: "optimal"
 
+# 不平衡处理
 imbalance_handling:
   sampling_strategy: "mixed"
 
+# Walk-Forward 交叉验证（优化版本）
 walk_forward:
-  n_folds: 3
-  purge_gap_minutes: 10
-  val_span_days: 3.0
-  test_span_days: 3.0
-  min_train_days: 7.0
-  segment_isolation: false
+  n_folds: 5
+  purge_gap_minutes: 15
+  val_span_days: 5.0
+  test_span_days: 5.0
+  min_train_days: 10.0
+  segment_isolation: true
   holdout_test: true
   time_based_split: true
 
-windowing:
-  window_lengths: [256]
-  step_sizes: [128]
-  default_window_length: 256
-  default_step_size: 128
-  max_filled_ratio: 0.3
-  overlap_within_set: true
-  overlap_across_sets: false
-  max_windows_per_segment: 500
+# 稳定性设置
+stability:
+  numerical:
+    detect_anomaly: true
+    gradient_clip_val: 1.0
+  reproducibility:
+    deterministic: true
+    benchmark: false
 
-conformal_prediction:
-  enable: true
-  alpha: 0.1
-  regression_method: "quantile"
-  classification_method: "logits"
+# 数据准备设置（优化版本）
+data_preparation:
+  window_size: 1024
+  stride: 512
+  feature_engineering:
+    enable_advanced: true
+    statistical_windows: [12, 24, 48]
 
+# 复现实验设置（供 main.py 使用）
 reproducibility:
   seed: 42
   deterministic: true

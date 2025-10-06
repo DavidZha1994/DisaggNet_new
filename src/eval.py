@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 from omegaconf import DictConfig, OmegaConf
 import json
-import pickle
 from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
@@ -18,7 +17,7 @@ warnings.filterwarnings('ignore')
 # 添加项目根目录到路径
 sys.path.append(str(Path(__file__).parent.parent))
 
-from src.train import NILMLightningModule, create_trainer, setup_logging, load_device_info
+from src.train import NILMLightningModule, load_device_info
 from src.data.datamodule import NILMDataModule  # 使用新的工业级数据模块
 from src.utils.metrics import NILMMetrics, ConsistencyMetrics, DelayMetrics
 

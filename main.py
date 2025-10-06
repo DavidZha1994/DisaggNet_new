@@ -65,18 +65,24 @@ class UnifiedTrainingSystem:
         self.logs_dir.mkdir(exist_ok=True)
     
     def setup_environment(self, config_name: str = "optimized_stable") -> DictConfig:
-        """设置训练环境"""
+        """设置训练环境（合并 base 与目标配置）"""
         # 加载配置
         config_path = self.configs_dir / f"{config_name}.yaml"
         if not config_path.exists():
             logger.warning(f"配置文件 {config_path} 不存在，使用默认配置")
             config_path = self.configs_dir / "default.yaml"
+
+        # 手工合并 base.yaml 与目标配置，避免仅 OmegaConf.load 无法解析 Hydra defaults
+        base_config_path = self.configs_dir / "base.yaml"
+        base_cfg = OmegaConf.load(base_config_path) if base_config_path.exists() else OmegaConf.create({})
+        user_cfg = OmegaConf.load(config_path)
+        config = OmegaConf.merge(base_cfg, user_cfg)
         
-        config = OmegaConf.load(config_path)
-        
-        # 设置随机种子
+        # 设置随机种子（优先使用 reproducibility.seed，其次回退到顶层 seed，再默认 42）
         if hasattr(config, 'reproducibility') and hasattr(config.reproducibility, 'seed'):
             seed = config.reproducibility.seed
+        elif hasattr(config, 'seed'):
+            seed = config.seed
         else:
             seed = 42
             

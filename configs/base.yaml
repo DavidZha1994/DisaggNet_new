@@ -3,8 +3,11 @@
 
 project_name: "DisaggNet"
 
-# 通用随机种子
-seed: 42
+# 复现实验设置（全局默认）
+reproducibility:
+  seed: 42
+  deterministic: true
+  benchmark: false
 
 # 路径与日志
 paths:
@@ -90,7 +93,4 @@ conformal_prediction:
   regression_method: "quantile"
   classification_method: "adaptive"
 
-# 可重现性
-reproducibility:
-  deterministic: true
-  benchmark: false
+# 可重现性（已在文件顶部统一配置）

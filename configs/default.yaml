@@ -47,26 +47,32 @@ walk_forward:
   holdout_test: true
   time_based_split: true
 
-# 窗口化与数据准备（与 prep_config 对齐的简化版本）
-windowing:
-  window_lengths: [256]
-  step_sizes: [128]
-  default_window_length: 256
-  default_step_size: 128
-  max_filled_ratio: 0.3
-  overlap_within_set: true
-  overlap_across_sets: false
-  max_windows_per_segment: 500
+# 数据准备设置（基础版本）
+data_preparation:
+  window_size: 256
+  stride: 128
+  feature_engineering:
+    enable_advanced: false
+    statistical_windows: [6, 12, 24]
 
-# 置信区间（可选）
+# 稳定性设置（基础版本）
+stability:
+  numerical:
+    detect_anomaly: false
+    gradient_clip_val: 0.5
+  reproducibility:
+    deterministic: false
+    benchmark: true
+
+# 保留的配置项（避免重复）
 conformal_prediction:
   enable: false
   alpha: 0.1
   regression_method: "quantile"
   classification_method: "logits"
 
-# 复现实验（main.py 使用）
+# 复现实验设置（供 main.py 使用）
 reproducibility:
   seed: 42
-  deterministic: true
-  benchmark: false
+  deterministic: false
+  benchmark: true

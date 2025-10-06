@@ -1,123 +1,62 @@
 """
-评估模块
-Evaluation Module
-
-实现时序数据的评估系统，包括：
-- 事件级指标计算
-- 模型性能评估
-- 报告生成
-- 可视化分析
+事件评估模块 - 重构版本
+使用统一的NILMMetrics进行度量计算，避免重复代码
 """
 
+import os
+import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import List, Dict, Tuple, Optional, Any
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    roc_auc_score, precision_recall_curve, roc_curve,
-    confusion_matrix, classification_report
-)
+from sklearn.metrics import confusion_matrix, classification_report
 from sklearn.calibration import calibration_curve
 import logging
 from datetime import datetime
 import json
 
+# 添加项目根目录到路径
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+
+# 导入统一的度量计算模块
+from src.utils.metrics import NILMMetrics
+
 logger = logging.getLogger(__name__)
 
 class EventEvaluator:
-    """事件评估器"""
+    """事件评估器 - 重构版本，使用统一的NILMMetrics"""
     
     def __init__(self, config: Dict):
         self.config = config
-        self.evaluation_config = config['evaluation']
-        self.metrics_config = self.evaluation_config['metrics']
-        self.visualization_config = self.evaluation_config['visualization']
+        # 使用统一的度量计算器
+        self.metrics_calculator = NILMMetrics(config.get('device_names', ['fridge', 'microwave', 'kettle']))
         
     def evaluate_predictions(self, y_true: np.ndarray, y_pred: np.ndarray, 
                            y_prob: Optional[np.ndarray] = None,
                            metadata: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
-        """
-        评估预测结果
-        
-        Args:
-            y_true: 真实标签
-            y_pred: 预测标签
-            y_prob: 预测概率
-            metadata: 元数据
-            
-        Returns:
-            evaluation_results: 评估结果字典
-        """
-        logger.info("开始评估预测结果")
-        
+        """评估预测结果"""
         results = {}
         
-        # 基础分类指标
-        results['basic_metrics'] = self._calculate_basic_metrics(y_true, y_pred, y_prob)
+        # 使用统一的度量计算器计算基础指标
+        basic_metrics = self.metrics_calculator.compute_all_metrics(
+            y_true, y_pred, y_prob
+        )
+        results['basic_metrics'] = basic_metrics
         
-        # 事件级指标
+        # 计算事件级指标（保留原有逻辑，因为这是特定于事件的）
         if metadata is not None:
             results['event_metrics'] = self._calculate_event_metrics(y_true, y_pred, metadata)
-        
-        # 设备级指标
-        if metadata is not None and 'device_name' in metadata.columns:
             results['device_metrics'] = self._calculate_device_metrics(y_true, y_pred, metadata)
-        
-        # 时间级指标
-        if metadata is not None and 'start_ts' in metadata.columns:
             results['temporal_metrics'] = self._calculate_temporal_metrics(y_true, y_pred, metadata)
         
         # 校准指标
         if y_prob is not None:
             results['calibration_metrics'] = self._calculate_calibration_metrics(y_true, y_prob)
         
-        logger.info("预测结果评估完成")
         return results
     
-    def _calculate_basic_metrics(self, y_true: np.ndarray, y_pred: np.ndarray, 
-                                y_prob: Optional[np.ndarray] = None) -> Dict[str, float]:
-        """计算基础分类指标"""
-        metrics = {}
-        
-        # 准确率
-        metrics['accuracy'] = accuracy_score(y_true, y_pred)
-        
-        # 精确率、召回率、F1分数
-        metrics['precision'] = precision_score(y_true, y_pred, average='weighted', zero_division=0)
-        metrics['recall'] = recall_score(y_true, y_pred, average='weighted', zero_division=0)
-        metrics['f1'] = f1_score(y_true, y_pred, average='weighted', zero_division=0)
-        
-        # 各类别的详细指标
-        precision_per_class = precision_score(y_true, y_pred, average=None, zero_division=0)
-        recall_per_class = recall_score(y_true, y_pred, average=None, zero_division=0)
-        f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
-        
-        unique_classes = np.unique(np.concatenate([y_true, y_pred]))
-        for i, cls in enumerate(unique_classes):
-            if i < len(precision_per_class):
-                metrics[f'precision_class_{cls}'] = precision_per_class[i]
-                metrics[f'recall_class_{cls}'] = recall_per_class[i]
-                metrics[f'f1_class_{cls}'] = f1_per_class[i]
-        
-        # ROC-AUC（如果有概率预测）
-        if y_prob is not None:
-            try:
-                if len(np.unique(y_true)) == 2:  # 二分类
-                    metrics['roc_auc'] = roc_auc_score(y_true, y_prob)
-                else:  # 多分类
-                    metrics['roc_auc'] = roc_auc_score(y_true, y_prob, multi_class='ovr', average='weighted')
-            except ValueError as e:
-                logger.warning(f"无法计算ROC-AUC: {e}")
-                metrics['roc_auc'] = np.nan
-        
-        # PR-AUC
-        if y_prob is not None and len(np.unique(y_true)) == 2:
-            precision_curve, recall_curve, _ = precision_recall_curve(y_true, y_prob)
-            metrics['pr_auc'] = np.trapz(precision_curve, recall_curve)
-        
-        return metrics
+
     
     def _calculate_event_metrics(self, y_true: np.ndarray, y_pred: np.ndarray, 
                                 metadata: pd.DataFrame) -> Dict[str, Any]:
@@ -269,7 +208,7 @@ class EventEvaluator:
             device_y_pred = y_pred[device_mask]
             
             if len(device_y_true) > 0:
-                device_metrics[device] = self._calculate_basic_metrics(device_y_true, device_y_pred)
+                device_metrics[device] = self.metrics_calculator.compute_all_metrics(device_y_true, device_y_pred)
         
         return device_metrics
     
@@ -287,7 +226,7 @@ class EventEvaluator:
             if np.sum(hour_mask) > 0:
                 hour_y_true = y_true[hour_mask]
                 hour_y_pred = y_pred[hour_mask]
-                hourly_metrics[hour] = self._calculate_basic_metrics(hour_y_true, hour_y_pred)
+                hourly_metrics[hour] = self.metrics_calculator.compute_all_metrics(hour_y_true, hour_y_pred)
         
         temporal_metrics['hourly'] = hourly_metrics
         
@@ -300,7 +239,7 @@ class EventEvaluator:
             if np.sum(weekday_mask) > 0:
                 weekday_y_true = y_true[weekday_mask]
                 weekday_y_pred = y_pred[weekday_mask]
-                weekday_metrics[weekday] = self._calculate_basic_metrics(weekday_y_true, weekday_y_pred)
+                weekday_metrics[weekday] = self.metrics_calculator.compute_all_metrics(weekday_y_true, weekday_y_pred)
         
         temporal_metrics['weekday'] = weekday_metrics
         
