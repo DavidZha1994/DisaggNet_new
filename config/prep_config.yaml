@@ -2,12 +2,40 @@
 # Time Series Data Preparation and Cross-Validation Configuration
 
 # 数据分段配置 (Data Segmentation)
+hipe:
+  enable: true
+  timestamp_col: "datetime"
+  mains_file: "MainTerminal*_PhaseCount_*.csv"
+  device_pattern: "*_PhaseCount_*.csv"
+  resample_seconds: 5
+  window_length: 256
+  step_size: 128   # 恢复50%重叠，保证上下文（不要减少窗口数量）
+  mains_cols:
+    P_kW: "P_total_W"
+    Q_kvar: "Q_total_var"
+    S_kVA: "S_total_VA"
+    PF: "PF_total"
+  device_cols:
+    P: "P_W"
+    Q: "Q_var"
+    S: "S_VA"
+  stft:
+    n_fft: 256
+    win_length: 256
+    hop_length: 64  # 与窗口长度一致时每窗1帧，沿用默认
+    window: "hann"
+  # 新增：HIPE标签生成模式与阈值（用于 labels.pkl）
+  label_mode: "regression"      # "classification" 或 "regression"
+  on_power_threshold_w: 0.5          # 设备“开”功率阈值（单位W）
+  on_ratio_threshold: 0.5            # 窗口内“开”占比阈值
+
 segmentation:
   gap_threshold_seconds: 300  # 大间隔阈值(秒)，超过此值将数据切分为不同段
   min_segment_length: 100     # 最小段长度(数据点)，短于此长度的段将被丢弃
   fill_small_gaps: true       # 是否填充小间隔
   small_gap_threshold: 30     # 小间隔阈值(秒)，小于此值的间隔将被填充
   fill_method: "forward"      # 填充方法: "forward", "backward", "interpolate"
+  max_segment_hours: 24       # 新增：最大段时长上限，避免超长段导致内存膨胀
 
 # 窗口化配置 (Windowing)
 windowing:
@@ -47,8 +75,121 @@ labels:
     label_type: "binary"          # 标签类型: "binary", "multiclass", "regression"
     aggregation: "any"            # 聚合方法: "any", "count", "max", "mean"
     causality_check: true         # 是否使用因果窗口(不使用未来信息)
+  onoff:
+    enabled: true                 # 是否启用基于开关状态的标签生成
+    feature_column: "P_kW"        # 观测列（功率/电压/电流）
+    method: "absolute"            # 绝对阈值 | delta 跃变 | hybrid 混合
+    on_threshold: 0.5             # 上电阈值（单位与列一致）
+    off_threshold: 0.3            # 断电阈值
+    hysteresis_margin: 0.1        # 迟滞边界增强，避免抖动
+    min_on_duration: 5            # 判定开启的最小连续样本数
+    min_off_duration: 5           # 判定关闭的最小连续样本数
+    on_ratio_threshold: 0.5       # 窗口内开启占比达到此阈值即标1
+    smooth_window: 3              # 简单移动平均平滑窗口
+    per_device:                   # 每设备阈值与方法覆盖（由评估脚本自动生成）
+      ChipPress:
+        method: "absolute"
+        smooth_window: 9
+        median_window: 5
+        min_on_duration: 67
+        min_off_duration: 67
+        on_threshold: 12.079923
+        off_threshold: 12.079921
+        hysteresis_margin: 0.000001
+        mad: 0.000001
+      ChipSaw:
+        method: "absolute"
+        smooth_window: 9
+        median_window: 5
+        min_on_duration: 96
+        min_off_duration: 96
+        on_threshold: 0.010665
+        off_threshold: 0.010663
+        hysteresis_margin: 0.000001
+        mad: 0.000001
+      HighTemperatureOven:
+        method: "absolute"
+        smooth_window: 5
+        median_window: 3
+        min_on_duration: 96
+        min_off_duration: 96
+        on_threshold: 2.008030
+        off_threshold: 2.008029
+        hysteresis_margin: 0.000001
+        mad: 0.000001
+      # MainTerminal 主表不参与开关检测（评估脚本也已跳过写入）
+      PickAndPlaceUnit:
+        method: "absolute"
+        smooth_window: 9
+        median_window: 5
+        min_on_duration: 96
+        min_off_duration: 96
+        on_threshold: -0.002382
+        off_threshold: -0.002384
+        hysteresis_margin: 0.000001
+        mad: 0.000001
+      ScreenPrinter:
+        method: "absolute"
+        smooth_window: 9
+        median_window: 5
+        min_on_duration: 96
+        min_off_duration: 96
+        on_threshold: 0.009875
+        off_threshold: 0.009873
+        hysteresis_margin: 0.000001
+        mad: 0.000001
+      SolderingOven:
+        method: "absolute"
+        smooth_window: 5
+        median_window: 3
+        min_on_duration: 96
+        min_off_duration: 96
+        on_threshold: 2.709597
+        off_threshold: 2.709596
+        hysteresis_margin: 0.000001
+        mad: 0.000001
+      VacuumOven:
+        method: "absolute"
+        smooth_window: 5
+        median_window: 3
+        min_on_duration: 59
+        min_off_duration: 59
+        on_threshold: 0.720183
+        off_threshold: 0.720182
+        hysteresis_margin: 0.000001
+        mad: 0.000001
+      VacuumPump1:
+        method: "absolute"
+        smooth_window: 9
+        median_window: 5
+        min_on_duration: 96
+        min_off_duration: 96
+        on_threshold: 0.012579
+        off_threshold: 0.012577
+        hysteresis_margin: 0.000001
+        mad: 0.000001
+      VacuumPump2:
+        method: "absolute"
+        smooth_window: 5
+        median_window: 3
+        min_on_duration: 96
+        min_off_duration: 96
+        on_threshold: 0.017275
+        off_threshold: 0.017274
+        hysteresis_margin: 0.000001
+        mad: 0.000001
+      WashingMachine:
+        method: "delta"
+        smooth_window: 5
+        median_window: 3
+        min_on_duration: 96
+        min_off_duration: 96
+        delta_k: 3.0
+        delta_threshold: 0.000003
+        mad_diff: 0.000001
   
   imbalance_handling:
+    enabled: true                 # 启用不平衡标签采样处理
     strategy: "mixed"             # 采样策略: "oversample", "undersample", "mixed"
     target_ratio: 0.3             # 目标事件比例
     
@@ -103,13 +244,24 @@ feature_engineering:
     interaction_terms: false    # 交互项特征(可能导致特征爆炸)
     polynomial_features: false  # 多项式特征
   
-  frequency_domain: true      # 频域特征(已启用)
+  # 频域特征统一由顶层 frequency 控制（已简化为 STFT）
     
   feature_selection:
     enabled: true               # 是否启用特征选择
     method: "mutual_info"       # 特征选择方法: "mutual_info", "f_score", "chi2"
     k_best: 30                  # 选择前k个特征(减少特征数量)
     variance_threshold: 0.01    # 方差阈值
+
+# 顶层频域配置 (Frequency Domain Extraction)
+# 说明：数据准备管线从此块读取频域模式与参数，而非 feature_engineering.frequency_domain。
+# 如需切换为 FFT 或 STFT，请在此处设置。
+frequency:
+  # 统一最佳实践：使用 STFT，不再区分 summary/fft
+  signal: "P_kW"         # 优先信号列: P_kW | V2_V | I2_A | Q_kvar
+  n_fft: 256              # FFT 点数（建议与窗口长度一致）
+  win_length: 256         # STFT窗口长度
+  hop_length: 64          # STFT步长（通常 win_length/4）
+  magnitude: true         # 返回幅度谱（true）或复谱（false）
 
 # 评估配置 (Evaluation)
 evaluation:
@@ -162,12 +314,3 @@ logging:
   level: "INFO"                 # 日志级别
   file: "logs/data_prep.log"    # 日志文件
   console: true                 # 是否输出到控制台
-
-# 频域表示配置（用于 Data/prepared 的 freq_features 输出）
-frequency:
-  mode: "stft"           # 可选: summary | fft | stft
-  signal: "P_kW"         # 频谱计算优先使用的信号列
-  n_fft: 256              # FFT长度（决定频点数）
-  win_length: 256         # STFT帧长度（与窗口长度一致时为整窗）
-  hop_length: 64          # STFT帧步长
-  magnitude: true         # 使用幅度谱（true）或复数谱（false）

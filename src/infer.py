@@ -26,6 +26,8 @@ from src.utils.metrics import ConsistencyMetrics
 from src.utils.conformal_prediction import MultiTaskConformalPredictor
 from src.utils.conformal_evaluation import ConformalEvaluator
 from src.utils.online_conformal_monitor import OnlineConformalMonitor, ConformalAlertSystem
+from src.inference.post_processing import InferencePostProcessor, create_post_processor, RECOMMENDED_POST_PROCESSING_CONFIGS
+from src.utils.prototypes import PrototypeLibrary
 
 
 class CircularBuffer:
@@ -297,6 +299,17 @@ class RealTimeInferenceEngine:
             device_names=self.device_names,
             map_location='cpu'
         )
+
+        # 若检查点包含原型库状态且模型启用了度量学习，则加载原型库
+        try:
+            proto_state = checkpoint.get('prototype_library_state', None)
+            if proto_state is not None and getattr(model, 'prototype_library', None) is not None:
+                model.prototype_library.load_state_dict(proto_state)
+                print("原型库状态已从检查点加载，推理时启用异常距离监控。")
+            else:
+                print("检查点未包含原型库状态或模型未启用度量学习。")
+        except Exception as e:
+            print(f"加载原型库状态失败（推理继续）: {e}")
         
         return model
     
@@ -355,6 +368,7 @@ class RealTimeInferenceEngine:
             default_power_thr = float(self.config.inference.get('default_power_threshold', 10.0))
             power_thresholds = {device: default_power_thr for device in self.device_names}
 
+        # 保留原有的滤波器用于兼容性（但主要使用统一后处理器）
         self.hysteresis_filter = HysteresisFilter(
             power_thresholds,
             hysteresis_ratio=self.config.inference.hysteresis_ratio
@@ -372,23 +386,39 @@ class RealTimeInferenceEngine:
             alert_duration=self.config.inference.alert_duration
         )
         
+        # 统一后处理器 - 使用推荐配置
+        post_processing_config = RECOMMENDED_POST_PROCESSING_CONFIGS.get('balanced', {})
+        # 如果config中有自定义后处理配置，则覆盖默认值
+        if hasattr(self.config, 'post_processing') and self.config.post_processing:
+            post_processing_config.update(OmegaConf.to_container(self.config.post_processing, resolve=True))
+        
+        # 设置设备名称用于后处理器
+        post_processing_config['device_names'] = self.device_names
+        
+        self.post_processor = create_post_processor(post_processing_config)
+        
+        # 打印后处理配置用于验证
+        print(f"后处理器配置: 滞回比例={self.post_processor.config.hysteresis_ratio}, "
+              f"最短持续时间={self.post_processor.config.min_on_duration}, "
+              f"重叠窗口融合={self.post_processor.config.overlap_fusion_method}")
+        
         # Conformal Prediction预测器
         if hasattr(self.model, 'conformal_predictor') and self.model.conformal_predictor is not None:
             self.conformal_predictor = self.model.conformal_predictor
             # 创建评估器用于在线监控
             self.conformal_evaluator = ConformalEvaluator(
                 device_names=list(self.device_info.keys()),
-                alpha=config.get('conformal_prediction', {}).get('alpha', 0.1)
+                alpha=self.config.get('conformal_prediction', {}).get('alpha', 0.1)
             )
             # 创建在线监控器
             self.conformal_monitor = OnlineConformalMonitor(
                 device_names=list(self.device_info.keys()),
-                alpha=config.get('conformal_prediction', {}).get('alpha', 0.1),
-                window_size=config.get('conformal_prediction', {}).get('monitoring', {}).get('window_size', 1000),
-                alert_threshold=config.get('conformal_prediction', {}).get('monitoring', {}).get('alert_threshold', 0.05)
+                alpha=self.config.get('conformal_prediction', {}).get('alpha', 0.1),
+                window_size=self.config.get('conformal_prediction', {}).get('monitoring', {}).get('window_size', 1000),
+                alert_threshold=self.config.get('conformal_prediction', {}).get('monitoring', {}).get('alert_threshold', 0.05)
             )
             # 创建告警系统
-            alert_config = config.get('conformal_prediction', {}).get('alerts', {})
+            alert_config = self.config.get('conformal_prediction', {}).get('alerts', {})
             if alert_config.get('enable', False):
                 self.alert_system = ConformalAlertSystem(alert_config)
             else:
@@ -492,30 +522,113 @@ class RealTimeInferenceEngine:
                 'time_positional': features.get('time_positional'),
                 'aux_features': features.get('aux_features')
             }
-            outputs = self.model(batch)
+            # 优先尝试获取嵌入以进行异常距离计算
+            outputs = None
+            pred_embeddings = None
+            try:
+                if hasattr(self.model, 'forward_with_embeddings') and self.model.metric_learning_enable:
+                    out = self.model.forward_with_embeddings(batch)
+                    if isinstance(out, tuple) and len(out) == 4:
+                        pred_power, pred_states, unknown_pred, pred_embeddings = out
+                        outputs = (pred_power, pred_states, unknown_pred)
+                    else:
+                        pred_power, pred_states, pred_embeddings = out
+                        outputs = (pred_power, pred_states)
+                else:
+                    outputs = self.model(batch)
+            except Exception:
+                outputs = self.model(batch)
+
+            # 推理期计算 Mahalanobis 距离并进行门控（可选）
+            try:
+                if pred_embeddings is not None and getattr(self.model, 'prototype_library', None) is not None:
+                    distances = self.model.prototype_library.mahalanobis(pred_embeddings)  # (B, N)
+                    # 将距离作为 anomaly_score 融入输出，供后续 _post_process 使用
+                    self._last_anomaly_distances = distances.squeeze(0).detach().cpu().numpy().tolist()
+                else:
+                    self._last_anomaly_distances = None
+            except Exception as e:
+                print(f"推理期距离计算失败（忽略）: {e}")
+                self._last_anomaly_distances = None
+
             return outputs
 
     def _post_process(self, predictions: Tuple[torch.Tensor, torch.Tensor], mains_power: float, 
                      timestamp: datetime) -> Dict[str, Any]:
-        """后处理预测结果"""
+        """后处理预测结果 - 使用统一后处理器"""
         
-        # 提取功率预测和状态预测（logits）
-        pred_power, pred_states = predictions
+        # 提取功率预测和状态预测（logits），兼容unknown
+        if isinstance(predictions, tuple) and len(predictions) == 3:
+            pred_power, pred_states, unknown_pred = predictions
+        else:
+            pred_power, pred_states = predictions
+            unknown_pred = None
         power_preds = pred_power.cpu().numpy().flatten()
-        # 温度缩放 + Sigmoid 生成状态概率（仅用于输出；滞回/投票仍基于功率阈值）
+        # 温度缩放 + Sigmoid 生成状态概率
         logits = pred_states
         if hasattr(self.model, 'temperature_scaling') and self.model.temperature_scaling is not None:
             logits = self.model.temperature_scaling(logits)
         state_probs_np = torch.sigmoid(logits).cpu().numpy().flatten()
+
+        # 异常距离门控：根据训练期原型的 Mahalanobis 距离与 Unknown 能量协同调整
+        anomaly_scores = self._last_anomaly_distances if hasattr(self, '_last_anomaly_distances') else None
+        if anomaly_scores is not None:
+            # 根据配置设置门槛与权重
+            gating_conf = self.config.get('inference', {}).get('prototype_gating', {})
+            threshold = float(gating_conf.get('distance_threshold', 2.5))
+            unknown_boost = float(gating_conf.get('unknown_boost', 0.3))
+            suppress_power_ratio = float(gating_conf.get('suppress_power_ratio', 0.5))
+            # 若模型输出 Unknown，则提升其权重；同时抑制高异常设备的激活
+            high_anomaly = [i for i, d in enumerate(anomaly_scores) if d >= threshold]
+            if len(high_anomaly) > 0:
+                # 抑制对应设备的状态概率与功率
+                for i in high_anomaly:
+                    d = float(anomaly_scores[i])
+                    # 异常严重度：距离超过阈值的相对超额，截断到 [0, 1]
+                    severity = min(max(d / threshold - 1.0, 0.0), 1.0)
+                    # 抑制状态概率
+                    state_probs_np[i] = state_probs_np[i] * (1.0 - 0.5 * severity)
+                    # 抑制功率预测
+                    power_preds[i] = power_preds[i] * (1.0 - suppress_power_ratio * severity)
+                # Unknown 加权提升（若可用）
+                if unknown_pred is not None:
+                    unknown_pred = unknown_pred + unknown_boost * torch.tensor([1.0], device=unknown_pred.device)
         
         # 构建设备功率字典
         device_powers = {}
         for i, device in enumerate(self.device_names):
             device_powers[device] = float(power_preds[i])
-        # 构建设备状态概率字典（用于在线展示/后续策略）
+        
+        # 构建设备状态概率字典
         state_probs = {}
         for i, device in enumerate(self.device_names):
             state_probs[device] = float(state_probs_np[i])
+        
+        # 使用统一后处理器进行后处理
+        try:
+            # 准备输入数据
+            inference_data = {
+                'device_powers': device_powers,
+                'state_probs': state_probs,
+                'mains_power': mains_power,
+                'timestamp': timestamp,
+                'anomaly_scores': {self.device_names[i]: float(anomaly_scores[i]) for i in range(len(self.device_names))} if anomaly_scores is not None else None
+            }
+            
+            # 调用统一后处理器
+            processed_results = self.post_processor.process_single_window(inference_data)
+            
+            # 提取处理后的状态
+            final_states = processed_results.get('final_states', {})
+            
+            print(f"统一后处理器处理结果: {processed_results}")
+            
+        except Exception as e:
+            print(f"统一后处理器处理失败，回退到原有逻辑: {e}")
+            # 回退到原有的后处理逻辑
+            hysteresis_states = self.hysteresis_filter.filter(device_powers)
+            final_states = self.voting_filter.filter(hysteresis_states)
+            processed_results = {}
         
         # Conformal Prediction区间预测
         conformal_results = {}
@@ -597,39 +710,55 @@ class RealTimeInferenceEngine:
                     if alerts:
                         conformal_results[device]['alerts'] = alerts
         
-        # 应用滞回滤波
-        hysteresis_states = self.hysteresis_filter.filter(device_powers)
-        
-        # 应用投票滤波
-        final_states = self.voting_filter.filter(hysteresis_states)
-        
-        # 一致性检查
+        # 一致性检查（保持原有逻辑）
         consistency_check = self.consistency_monitor.check_consistency(
             mains_power, device_powers, timestamp
         )
         
+        # 计算unknown与残差
+        unknown_power = None
+        residual_power = None
+        try:
+            if unknown_pred is not None:
+                unknown_power = float(F.softplus(unknown_pred).squeeze().cpu().numpy())
+            # 残差 = 主表功率 - 已预测设备激活功率和 - unknown（若存在）
+            active_power = pred_power * torch.sigmoid(pred_states)
+            predicted_total = float(active_power.sum().cpu().item())
+            if unknown_power is not None:
+                predicted_total += unknown_power
+            residual_power = float(mains_power - predicted_total)
+        except Exception:
+            pass
+
         result = {
             'device_powers': device_powers,
             'device_states': final_states,
             'state_probs': state_probs,
-            'consistency_check': consistency_check
+            'consistency_check': consistency_check,
+            'post_processing_details': processed_results  # 添加后处理详情
         }
 
         # 若存在分类阈值，补充基于概率的二值化状态（与功率滞回并行提供）
         try:
             if self.class_thresholds is not None:
-                threshold_states = {}
-                for dev, prob in state_probs.items():
-                    thr = float(self.class_thresholds.get(dev, 0.5))
-                    threshold_states[dev] = bool(prob >= thr)
-                result['threshold_states'] = threshold_states
+                prob_based_states = {}
+                for device in self.device_names:
+                    threshold = self.class_thresholds.get(device, 0.5)
+                    prob_based_states[device] = state_probs[device] > threshold
+                result['prob_based_states'] = prob_based_states
         except Exception:
             pass
-        
-        # 添加conformal prediction结果
+
+        # 添加Unknown与残差监控输出
+        if unknown_power is not None:
+            result['unknown_power'] = unknown_power
+        if residual_power is not None:
+            result['residual_power'] = residual_power
+
+        # 添加Conformal结果
         if conformal_results:
-            result['conformal_intervals'] = conformal_results
-        
+            result['conformal_prediction'] = conformal_results
+
         return result
     
     def get_performance_stats(self) -> Dict[str, Any]:

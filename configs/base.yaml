@@ -94,6 +94,13 @@ training:
     monitor: "val_score"
     patience: 5
     mode: "max"
+  masking:
+    window_strategy: "none"       # none | drop | downweight
+    min_valid_ratio_time: 0.5
+    min_valid_ratio_freq: 0.5
+    combine_modalities: "min"     # min | mean
+    downweight_power: 1.0
+    epsilon: 0.0                  # clamp minimum weight
 debug:
   track_grad_norm: 0
   strict_validation: false

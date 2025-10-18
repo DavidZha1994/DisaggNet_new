@@ -381,13 +381,17 @@ class NILMMetrics:
     
     def compute_all_metrics(self, y_pred_power: torch.Tensor, y_pred_proba: torch.Tensor,
                           y_true_power: torch.Tensor, y_true_states: torch.Tensor,
-                          optimize_thresholds: bool = True) -> Dict[str, Union[float, Dict[str, float]]]:
+                          optimize_thresholds: bool = True,
+                          classification_enabled: bool = True) -> Dict[str, Union[float, Dict[str, float]]]:
         """计算所有指标"""
         metrics = {}
         
-        # 优化阈值
-        if optimize_thresholds:
-            self.optimize_thresholds(y_pred_proba, y_true_states)
+        # 优化阈值（仅分类启用时）
+        if classification_enabled and optimize_thresholds:
+            try:
+                self.optimize_thresholds(y_pred_proba, y_true_states)
+            except Exception:
+                pass
         
         # 回归指标
         metrics['mae'] = self.mean_absolute_error(y_pred_power, y_true_power)
@@ -398,20 +402,23 @@ class NILMMetrics:
         metrics['teca'] = self.total_energy_correctly_assigned(y_pred_power, y_true_power)
         metrics['teca_per_device'] = self.total_energy_correctly_assigned(y_pred_power, y_true_power, per_device=True)
         
-        # 分类指标
-        metrics['f1'] = self.f1_score(y_pred_proba, y_true_states)
-        metrics['f1_per_device'] = self.f1_score(y_pred_proba, y_true_states, per_device=True)
-        metrics['mcc'] = self.matthews_correlation_coefficient(y_pred_proba, y_true_states)
-        metrics['mcc_per_device'] = self.matthews_correlation_coefficient(y_pred_proba, y_true_states, per_device=True)
-        metrics['pr_auc'] = self.precision_recall_auc(y_pred_proba, y_true_states)
-        metrics['pr_auc_per_device'] = self.precision_recall_auc(y_pred_proba, y_true_states, per_device=True)
-        metrics['roc_auc'] = self.roc_auc(y_pred_proba, y_true_states)
-        metrics['roc_auc_per_device'] = self.roc_auc(y_pred_proba, y_true_states, per_device=True)
+        # 分类指标（可选）
+        if classification_enabled:
+            try:
+                metrics['f1'] = self.f1_score(y_pred_proba, y_true_states)
+                metrics['f1_per_device'] = self.f1_score(y_pred_proba, y_true_states, per_device=True)
+                metrics['mcc'] = self.matthews_correlation_coefficient(y_pred_proba, y_true_states)
+                metrics['mcc_per_device'] = self.matthews_correlation_coefficient(y_pred_proba, y_true_states, per_device=True)
+                metrics['pr_auc'] = self.precision_recall_auc(y_pred_proba, y_true_states)
+                metrics['pr_auc_per_device'] = self.precision_recall_auc(y_pred_proba, y_true_states, per_device=True)
+                metrics['roc_auc'] = self.roc_auc(y_pred_proba, y_true_states)
+                metrics['roc_auc_per_device'] = self.roc_auc(y_pred_proba, y_true_states, per_device=True)
+                # 事件检测指标
+                metrics['event_metrics'] = self.event_detection_metrics(y_pred_proba, y_true_states)
+            except Exception:
+                pass
         
-        # 事件检测指标
-        metrics['event_metrics'] = self.event_detection_metrics(y_pred_proba, y_true_states)
-        
-        # 综合评分
+        # 综合评分（会根据已有指标自动加权）
         metrics['score'] = self._compute_composite_score(metrics)
         
         return metrics
@@ -435,13 +442,29 @@ class NILMMetrics:
         for metric_name, weight in weights.items():
             if metric_name in metrics:
                 value = metrics[metric_name]
-                if isinstance(value, (int, float)) and not np.isnan(value):
+                # 统一将 numpy 标量/torch 标量 转换为 Python float
+                try:
+                    if isinstance(value, (int, float)):
+                        val = float(value)
+                    elif isinstance(value, np.ndarray) and value.shape == ():
+                        val = float(value.item())
+                    elif isinstance(value, np.floating):
+                        val = float(value)
+                    elif torch.is_tensor(value) and value.dim() == 0:
+                        val = float(value.item())
+                    else:
+                        # 非标量（如字典/数组）不计入综合分
+                        continue
+                except Exception:
+                    continue
+                
+                if not np.isnan(val):
                     if weight < 0:
                         # 对于越小越好的指标，使用负指数变换
-                        normalized_value = np.exp(-value)
+                        normalized_value = np.exp(-val)
                     else:
                         # 对于越大越好的指标，直接使用
-                        normalized_value = value
+                        normalized_value = val
                     
                     score += abs(weight) * normalized_value
                     total_weight += abs(weight)

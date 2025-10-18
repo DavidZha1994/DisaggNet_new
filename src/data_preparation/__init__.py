@@ -19,6 +19,7 @@ from .feature_engineering import FeatureEngineer
 from .label_handling import LabelHandler
 from .evaluation import EventEvaluator
 from .pipeline import DataPreparationPipeline
+from .hipe_pipeline import HIPEDataPreparationPipeline
 
 __all__ = [
     'DataSegmenter',
@@ -27,5 +28,6 @@ __all__ = [
     'FeatureEngineer',
     'LabelHandler',
     'EventEvaluator',
-    'DataPreparationPipeline'
+    'DataPreparationPipeline',
+    'HIPEDataPreparationPipeline'
 ]

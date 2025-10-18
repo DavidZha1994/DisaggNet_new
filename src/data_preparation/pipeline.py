@@ -257,11 +257,27 @@ class DataPreparationPipeline:
     
     def _process_labels(self, windows_data: Dict[str, Any], 
                        segments_meta: List) -> Dict[str, Any]:
-        """处理标签：基于窗口内阈值策略进行事件标注，避免依赖占位逻辑。"""
+        """处理标签：优先使用开关(on/off)配置生成；否则回退事件检测。"""
         windows = windows_data['windows']
         metadata = windows_data['metadata']
         feature_columns = windows_data.get('feature_columns', [])
 
+        # 优先尝试基于on/off阈值的标签生成
+        labels_onoff = None
+        try:
+            labels_onoff = self.label_handler.generate_onoff_labels_from_windows(
+                windows, feature_columns, metadata
+            )
+        except Exception as e:
+            logger.warning(f"on/off 标签生成异常，回退事件检测: {e}")
+
+        if labels_onoff is not None:
+            return {
+                'labels': labels_onoff,
+                'label_metadata': metadata
+            }
+
+        # 回退：基于事件定义的窗口检测
         labels = []
         for window, meta in zip(windows, metadata):
             has_event = self._window_has_event(window, feature_columns)
@@ -559,14 +575,11 @@ class DataPreparationPipeline:
 
     def _extract_frequency_representation(self, window: np.ndarray, feature_columns: List[str]) -> np.ndarray:
         """
-        根据配置提取频域表示，支持三种模式：
-        - summary: 5维摘要特征（保持现有逻辑）
-        - fft: 对整窗做 rFFT，返回幅度谱向量 (F_bins)
-        - stft: 对窗内进行短时FFT分帧，返回 (T_frames, F_bins)
+        最佳实践：统一使用 STFT 生成频域时序波形。
+        返回：(T_frames, F_bins)，默认返回幅度谱（magnitude=True）。
 
         配置示例：
         frequency:
-          mode: stft  # summary | fft | stft
           signal: P_kW
           n_fft: 256
           win_length: 256
@@ -574,14 +587,13 @@ class DataPreparationPipeline:
           magnitude: true
         """
         freq_cfg = (self.config or {}).get('frequency', {})
-        mode = str(freq_cfg.get('mode', 'summary')).lower()
         signal_pref = freq_cfg.get('signal', 'P_kW')
         n_fft = int(freq_cfg.get('n_fft', max(8, window.shape[0])))
         win_length = int(freq_cfg.get('win_length', n_fft))
         hop_length = int(freq_cfg.get('hop_length', max(1, win_length // 4)))
         use_magnitude = bool(freq_cfg.get('magnitude', True))
 
-        # 选择信号列
+        # 选择信号列（优先功率，退化到电压/电流，再兜底第0列）
         sig_idx: Optional[int] = None
         if signal_pref in feature_columns:
             idx = feature_columns.index(signal_pref)
@@ -603,49 +615,30 @@ class DataPreparationPipeline:
         x = window[:, sig_idx].astype(np.float32)
         x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
-        if mode == 'summary':
-            return self._extract_frequency_summary(window, feature_columns)
-
-        # FFT：整窗一次谱
-        if mode == 'fft':
-            if x.size < 2:
-                return np.zeros((1,), dtype=np.float32)
-            # 零填充或截断到 n_fft
-            if x.size < n_fft:
-                x_pad = np.pad(x, (0, n_fft - x.size))
-            else:
-                x_pad = x[:n_fft]
-            spec = np.fft.rfft(x_pad, n=n_fft)
-            return np.abs(spec).astype(np.float32) if use_magnitude else spec.astype(np.complex64)
-
-        # STFT：按帧提取谱
-        if mode == 'stft':
-            frames: List[np.ndarray] = []
-            if win_length <= 0:
-                win_length = min(x.size, n_fft)
-            if hop_length <= 0:
-                hop_length = max(1, win_length // 2)
-            start = 0
-            while start + win_length <= x.size:
-                seg = x[start:start + win_length]
-                if seg.size < win_length:
-                    seg = np.pad(seg, (0, win_length - seg.size))
-                spec = np.fft.rfft(seg, n=n_fft)
-                mag = np.abs(spec).astype(np.float32) if use_magnitude else spec.astype(np.complex64)
-                frames.append(mag)
-                start += hop_length
-            if not frames:
-                # 不足一帧时，用整体零填充
-                seg = x
-                if seg.size < win_length:
-                    seg = np.pad(seg, (0, win_length - seg.size))
-                spec = np.fft.rfft(seg, n=n_fft)
-                mag = np.abs(spec).astype(np.float32) if use_magnitude else spec.astype(np.complex64)
-                frames.append(mag)
-            return np.stack(frames, axis=0)
-
-        # 未知模式，回退摘要
-        return self._extract_frequency_summary(window, feature_columns)
+        # 统一 STFT：按帧提取谱
+        frames: List[np.ndarray] = []
+        if win_length <= 0:
+            win_length = min(x.size, n_fft)
+        if hop_length <= 0:
+            hop_length = max(1, win_length // 4)
+        start = 0
+        while start + win_length <= x.size:
+            seg = x[start:start + win_length]
+            if seg.size < win_length:
+                seg = np.pad(seg, (0, win_length - seg.size))
+            spec = np.fft.rfft(seg, n=n_fft)
+            mag = np.abs(spec).astype(np.float32) if use_magnitude else spec.astype(np.complex64)
+            frames.append(mag)
+            start += hop_length
+        if not frames:
+            # 不足一帧时，用整体零填充生成一帧
+            seg = x
+            if seg.size < win_length:
+                seg = np.pad(seg, (0, win_length - seg.size))
+            spec = np.fft.rfft(seg, n=n_fft)
+            mag = np.abs(spec).astype(np.float32) if use_magnitude else spec.astype(np.complex64)
+            frames.append(mag)
+        return np.stack(frames, axis=0)
     
     def _extract_window_features(self, window: np.ndarray, feature_columns: List[str]) -> np.ndarray:
         """

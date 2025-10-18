@@ -39,13 +39,29 @@ class LabelConfig:
     aggregation: str  # 'any', 'count', 'max', 'mean'
     causality_check: bool  # 是否检查因果性
 
+@dataclass
+class OnOffConfig:
+    """开关状态标签配置"""
+    enabled: bool = False
+    feature_column: str = "P_kW"  # 观测功率/电压/电流列名
+    method: str = "absolute"      # 'absolute'|'delta'|'hybrid'
+    on_threshold: float = 0.5      # 上电阈值（绝对法）
+    off_threshold: float = 0.3     # 断电阈值（绝对法）
+    hysteresis_margin: float = 0.0 # 迟滞边界增强（可选）
+    min_on_duration: int = 5       # 连续样本达到上电判定的最小长度
+    min_off_duration: int = 5      # 连续样本达到断电判定的最小长度
+    on_ratio_threshold: float = 0.5 # 窗口内判为“开启”的比例阈值
+    smooth_window: int = 1         # 平滑窗口长度（>1时进行简单移动平均）
+    per_device: Optional[Dict[str, Dict[str, float]]] = None  # 每设备阈值
+
 class LabelHandler:
     """标签处理器"""
     
     def __init__(self, config: Dict):
         self.event_definitions = self._parse_event_definitions(config['labels']['event_definitions'])
         self.label_config = LabelConfig(**config['labels']['label_config'])
-        self.imbalance_handling = config['labels']['imbalance_handling']
+        self.imbalance_handling = config['labels'].get('imbalance_handling', {'enabled': False, 'strategy': 'mixed'})
+        self.onoff_config = self._parse_onoff_config(config['labels'].get('onoff', {}))
         self.sampling_strategy = config['labels']['sampling_strategy']
         self.config = config
         
@@ -55,6 +71,15 @@ class LabelHandler:
         for event_def in event_defs:
             definitions.append(EventDefinition(**event_def))
         return definitions
+
+    def _parse_onoff_config(self, onoff_cfg: Dict[str, Any]) -> OnOffConfig:
+        """解析开关状态配置"""
+        if not onoff_cfg:
+            return OnOffConfig()  # 默认禁用
+        # 兼容配置中缺失字段
+        defaults = OnOffConfig().__dict__.copy()
+        merged = {**defaults, **onoff_cfg}
+        return OnOffConfig(**merged)
     
     def detect_events(self, df: pl.DataFrame) -> pl.DataFrame:
         """
@@ -83,6 +108,139 @@ class LabelHandler:
             logger.info(f"检测到 {event_def.event_type} 事件: {event_count} 个")
         
         return df_events
+
+    # === 开关状态生成（绝对阈值/跃变/混合） ===
+    def _smooth_series(self, x: np.ndarray, k: int) -> np.ndarray:
+        if k is None or k <= 1:
+            return x
+        k = int(k)
+        if k > len(x):
+            k = len(x)
+        kernel = np.ones(k, dtype=float) / float(k)
+        return np.convolve(x, kernel, mode='same')
+
+    def _compute_onoff_state_absolute(self, x: np.ndarray, on_thr: float, off_thr: float,
+                                      min_on: int, min_off: int) -> np.ndarray:
+        """基于绝对阈值并带滞回与最小持续的开关状态计算。"""
+        state = np.zeros_like(x, dtype=bool)
+        cur = False
+        on_run = 0
+        off_run = 0
+        for i, v in enumerate(x):
+            if not cur:
+                if v >= on_thr:
+                    on_run += 1
+                    if on_run >= min_on:
+                        cur = True
+                        on_run = 0
+                        off_run = 0
+                else:
+                    on_run = 0
+            else:
+                if v <= off_thr:
+                    off_run += 1
+                    if off_run >= min_off:
+                        cur = False
+                        off_run = 0
+                        on_run = 0
+                else:
+                    off_run = 0
+            state[i] = cur
+        return state
+
+    def _compute_onoff_state_delta(self, x: np.ndarray, up_delta: float, down_delta: float,
+                                   min_on: int, min_off: int) -> np.ndarray:
+        """基于跃变检测的开关状态（上升/下降突变）。"""
+        state = np.zeros_like(x, dtype=bool)
+        cur = False
+        diff = np.diff(x, prepend=x[0])
+        on_run = 0
+        off_run = 0
+        for i, d in enumerate(diff):
+            if not cur:
+                if d >= up_delta:
+                    on_run += 1
+                    if on_run >= min_on:
+                        cur = True
+                        on_run = 0
+                        off_run = 0
+                else:
+                    on_run = 0
+            else:
+                if d <= -down_delta:
+                    off_run += 1
+                    if off_run >= min_off:
+                        cur = False
+                        off_run = 0
+                        on_run = 0
+                else:
+                    off_run = 0
+            state[i] = cur
+        return state
+
+    def generate_onoff_labels_from_windows(self,
+                                           windows: List[np.ndarray],
+                                           feature_columns: List[str],
+                                           window_metadata: List) -> np.ndarray:
+        """基于窗口内的功率/电压/电流生成开关状态标签。
+        - 支持绝对阈值、跃变与混合策略；
+        - 支持每设备阈值；
+        - 标签为窗口内“开启”占比超过 on_ratio_threshold 的二值。
+        """
+        cfg = self.onoff_config
+        if not cfg.enabled:
+            logger.info("on/off 标签未启用，回退事件标签")
+            return None
+
+        if cfg.feature_column not in feature_columns:
+            logger.warning(f"开关观测列 {cfg.feature_column} 不存在，回退事件标签")
+            return None
+
+        col_idx = feature_columns.index(cfg.feature_column)
+
+        labels: List[int] = []
+        for i, window in enumerate(windows):
+            x = window[:, col_idx].astype(float)
+            # 平滑
+            x_proc = self._smooth_series(np.nan_to_num(x, nan=0.0), cfg.smooth_window)
+
+            # 每设备阈值覆盖
+            on_thr = cfg.on_threshold
+            off_thr = cfg.off_threshold
+            meta = window_metadata[i]
+            dev_name = getattr(meta, 'device_name', None) if hasattr(meta, 'device_name') else (
+                meta.get('device_name') if isinstance(meta, dict) else None
+            )
+            if cfg.per_device and dev_name and dev_name in cfg.per_device:
+                pd_cfg = cfg.per_device[dev_name]
+                on_thr = float(pd_cfg.get('on_threshold', on_thr))
+                off_thr = float(pd_cfg.get('off_threshold', off_thr))
+
+            # 迟滞边界增强
+            on_thr_eff = on_thr + max(0.0, cfg.hysteresis_margin)
+            off_thr_eff = off_thr - max(0.0, cfg.hysteresis_margin)
+
+            # 状态序列
+            if cfg.method == 'absolute':
+                state = self._compute_onoff_state_absolute(x_proc, on_thr_eff, off_thr_eff,
+                                                           cfg.min_on_duration, cfg.min_off_duration)
+            elif cfg.method == 'delta':
+                state = self._compute_onoff_state_delta(x_proc, on_thr_eff, off_thr_eff,
+                                                        cfg.min_on_duration, cfg.min_off_duration)
+            else:  # hybrid：先绝对，后用跃变修正边缘
+                state_abs = self._compute_onoff_state_absolute(x_proc, on_thr_eff, off_thr_eff,
+                                                               cfg.min_on_duration, cfg.min_off_duration)
+                state_delta = self._compute_onoff_state_delta(x_proc, on_thr_eff, off_thr_eff,
+                                                              cfg.min_on_duration, cfg.min_off_duration)
+                state = np.where(state_delta, True, state_abs)
+
+            # 窗口标签：开启占比是否超过阈值
+            on_ratio = float(np.mean(state)) if state.size > 0 else 0.0
+            labels.append(1 if on_ratio >= cfg.on_ratio_threshold else 0)
+
+        y = np.asarray(labels, dtype=np.int64)
+        logger.info(f"on/off 标签分布: {dict(Counter(y))}")
+        return y
     
     def _detect_single_event_type(self, df: pl.DataFrame, event_def: EventDefinition) -> np.ndarray:
         """
@@ -352,7 +510,7 @@ class LabelHandler:
             y_balanced: 平衡后的标签数据
             metadata_balanced: 平衡后的元数据
         """
-        if not self.imbalance_handling['enabled']:
+        if not self.imbalance_handling.get('enabled', False):
             return X, y, metadata
         
         logger.info("开始处理不平衡标签")

@@ -10,41 +10,68 @@ experiment:
 logging:
   version: "v1"
 
-# 损失设置（与 MultiTaskLoss 对齐）
+# 损失设置（统一损失函数配置）
 loss:
-  weights:
-    regression: 1.0
-    classification: 1.0
-    consistency_schedule:
-      type: "linear"
-      initial: 0.0
-      final: 0.5
-      warmup_epochs: 20
-  device_weights:
-    enable: false
-  regression:
-    type: "mse"
-    huber_delta: 1.0
-    quantiles: [0.1, 0.5, 0.9]
-  classification:
-    type: "bce"
-    pos_weight:
-      enable: false
-    focal_alpha: 1.0
-    focal_gamma: 2.0
-  priors:
-    enable: false
+  # 多任务损失权重 (推荐配置: 2*L_cls + 1*L_reg + 0.5*L_conservation + 1*L_consistency)
+  classification_weight: 2.0    # 分类损失权重
+  regression_weight: 1.0        # 回归损失权重  
+  conservation_weight: 0.5      # 能量守恒损失权重
+  consistency_weight: 1.0       # 一致性损失权重
+  
+  # Focal Loss参数
+  focal_alpha: 0.25            # Focal Loss alpha参数
+  focal_gamma: 2.0             # Focal Loss gamma参数
+  
+  # Huber Loss参数
+  huber_delta: 1.0             # Huber Loss delta参数
 
 # 评估与策略
 evaluation:
   threshold_method: "optimal"
 
-# 启用频域编码与交叉注意力融合（使用 Data/prepared 的freq_features）
+# 模型配置
 model:
   freq_encoder:
     enable: true
   fusion:
     type: "cross_attention"
+  # 多任务头配置
+  heads:
+    classification:
+      # 分类头初始化先验概率 (将在训练时自动注入数据统计先验)
+      init_p: null  # 自动从数据统计计算
+    regression:
+      # 回归头配置
+      dropout: 0.1
+  
+  # 校准配置
+  calibration:
+    enable: true
+    temperature_init: 1.0
+
+# 训练策略配置
+training:
+  max_epochs: 100
+  patience: 15
+  min_delta: 0.001
+  
+  # 学习率调度
+  lr_scheduler:
+    name: "cosine"
+    warmup_epochs: 5
+    eta_min: 1e-6
+  
+  # 优化器配置
+  optimizer:
+    name: "adamw"
+    lr: 1e-3
+  masking:
+    window_strategy: "none"
+    min_valid_ratio_time: 0.5
+    min_valid_ratio_freq: 0.5
+    combine_modalities: "min"
+    downweight_power: 1.0
+    epsilon: 0.0
 
 # 不平衡处理（数据模块读取）
 imbalance_handling:

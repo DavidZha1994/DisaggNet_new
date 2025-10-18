@@ -57,6 +57,17 @@ python run_data_preparation.py --config config/prep_config.yaml --summary-only -
 python validate_prepared_data.py
 ```
 
+## 标签与时间窗口最佳实践
+
+- 窗口生成在数据准备阶段完成：通过 `WindowGenerator` 统一滑动窗口与质量过滤，避免训练阶段重复切片导致泄漏。
+- Walk-Forward 分割与净化间隔：`WalkForwardCV` 基于时间进行划分，使用 `purge_gap_minutes` 隔离训练/验证边界，防止时间泄漏与相邻窗口重叠。
+- 开关(on/off)标签生成：在 `config/prep_config.yaml` 的 `labels.onoff` 中配置观测列（如 `P_kW`）、阈值与迟滞，支持 `absolute`/`delta`/`hybrid` 策略与每设备阈值覆盖，标签定义为窗口内“开启”占比达到阈值。
+- 事件标签回退：若未启用 on/off 或观测列缺失，自动回退至事件定义（阈值+最小持续时间）进行窗口事件检测。
+- 不平衡处理：在数据模块中自动统计 `pos_weight` 与 `prior_p` 并注入训练；可启用 `labels.imbalance_handling.enabled` 与采样策略（过采样/欠采样/混合）作为数据级补充。
+- 模型输入映射：数据模块将原始窗口映射到 `time_features`，频域摘要/帧映射到 `freq_features`，工程特征映射到 `aux_features`，并生成 `target_power` 与 `target_states`。
+
+建议：优先使用绝对阈值+迟滞的稳定开关判定，结合跃变检测修正边缘情况；阈值可按设备自适应或通过分位数/标准差策略调优。
+
 ### 模型训练
 ```bash
 # 基础训练

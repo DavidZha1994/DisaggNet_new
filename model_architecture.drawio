@@ -1,0 +1,318 @@
+<mxfile host="65bd71144e">
+    <diagram name="DisaggNet架构图" id="architecture">
+        <mxGraphModel dx="924" dy="667" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1200" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="title" value="DisaggNet 2.0 - 融合Transformer架构" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=20;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="600" y="20" width="400" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="input_layer" value="数据输入层" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=14;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="50" y="80" width="1500" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="raw_time_data" value="原始时域窗口\ntime_features\n形状: (B, T, C)\nB=批次大小, T=256(窗口长度), C=7(P,Q,S,V2,V3,I2,I3)\n采样率: 5秒间隔" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="80" y="160" width="280" height="100" as="geometry"/>
+                </mxCell>
+                <mxCell id="aux_features" value="工程统计特征（辅助）\naux_features\n形状: (B, F_aux)\nF_aux=120维特征, weight=0.3\n包含: 统计量、谐波、THD、时间特征等" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="400" y="160" width="280" height="100" as="geometry"/>
+                </mxCell>
+                <mxCell id="freq_features" value="频域特征\nfreq_features\n形状: (B, T_f, F_f)\nT_f=频域帧数, F_f=频域特征维度\nSTFT参数: n_fft=256, hop=64" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="720" y="160" width="280" height="100" as="geometry"/>
+                </mxCell>
+                <mxCell id="device_info" value="设备信息\n设备数量: N_devices=10\n设备名称: [dishwasher, fridge, ...]\n设备嵌入维度: d_model=256" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="1040" y="160" width="280" height="100" as="geometry"/>
+                </mxCell>
+                <mxCell id="encoder_layer" value="编码器层" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=14;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="50" y="300" width="1500" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="time_encoder" value="时域编码器 (TimeEncoder)\n输入: (B, T=256, C=7)\n位置编码: PositionalEncoding(d_model=256)\nTransformer层数: 4层\n注意力头数: 8\n输出: (B, T=256, d_model=256)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="80" y="380" width="300" height="120" as="geometry"/>
+                </mxCell>
+                <mxCell id="freq_encoder" value="频域编码器 (FreqEncoder)\n输入: (B, T_f, F_f)\n卷积层: Conv1d(kernel=3, stride=1)\nTransformer层数: 2层\n注意力头数: 4\n输出: (B, T_f, d_model=256)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="420" y="380" width="300" height="120" as="geometry"/>
+                </mxCell>
+                <mxCell id="aux_encoder" value="辅助编码器 (AuxEncoder)\n输入: (B, F_aux=120)\nMLP层: Linear(120→512→256)\n激活函数: ELU + Dropout(0.1)\n输出: (B, d_model=256)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="760" y="380" width="300" height="120" as="geometry"/>
+                </mxCell>
+                <mxCell id="device_embedding" value="设备嵌入层\n输入: device_ids (B,)\nEmbedding(N_devices=10, d_model=256)\n输出: (B, d_model=256)\n用于路由和条件化" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="1100" y="380" width="300" height="120" as="geometry"/>
+                </mxCell>
+                <mxCell id="fusion_layer" value="融合层" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=14;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="50" y="500" width="600" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="cross_attention" value="交叉注意力融合&#10;(支持双向: time↔freq)&#10;d_model=256, n_heads=8" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" parent="1" vertex="1">
+                    <mxGeometry x="70" y="600" width="180" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="attention_pooling" value="注意力池化&#10;(全局表示)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" parent="1" vertex="1">
+                    <mxGeometry x="280" y="600" width="120" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="lightweight_routing" value="轻量级路由&#10;(可选)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" parent="1" vertex="1">
+                    <mxGeometry x="430" y="600" width="120" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="prediction_layer" value="多任务预测头（设备嵌入在输出层）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="50" y="720" width="600" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="device_embeddings" value="设备嵌入向量&#10;(N_devices=10, d_model=256)&#10;避免特征泄漏" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0f0;strokeColor=#666666;" parent="1" vertex="1">
+                    <mxGeometry x="70" y="820" width="150" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="regression_heads" value="功率回归头&#10;(10个设备)&#10;ReLU激活确保非负" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" parent="1" vertex="1">
+                    <mxGeometry x="250" y="820" width="150" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="classification_heads" value="开关分类头&#10;(10个设备)&#10;Sigmoid激活" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" parent="1" vertex="1">
+                    <mxGeometry x="430" y="820" width="150" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="device_outputs_detail" value="设备级输出细化" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0f0;strokeColor=#666666;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+                    <mxGeometry x="610" y="729" width="900" height="230" as="geometry"/>
+                </mxCell>
+                <mxCell id="detail_cls_title" value="分类头（逐设备）\nLinear → Sigmoid\n输出: (B, N)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="640" y="750" width="200" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_cls_1" value="设备1 分类" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff7e6;strokeColor=#d79b00;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="640" y="830" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_cls_2" value="设备2 分类" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff7e6;strokeColor=#d79b00;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="745" y="830" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_cls_3" value="设备3 分类" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff7e6;strokeColor=#d79b00;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="640" y="865" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_cls_4" value="设备4 分类" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff7e6;strokeColor=#d79b00;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="745" y="865" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_cls_5" value="设备5 分类" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff7e6;strokeColor=#d79b00;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="640" y="900" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_cls_6" value="设备6 分类" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff7e6;strokeColor=#d79b00;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="745" y="900" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_cls_7" value="设备7 分类" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff7e6;strokeColor=#d79b00;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="640" y="935" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_cls_8" value="设备8 分类" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff7e6;strokeColor=#d79b00;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="745" y="935" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_cls_9" value="设备9 分类" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff7e6;strokeColor=#d79b00;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="640" y="970" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_cls_10" value="设备10 分类" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff7e6;strokeColor=#d79b00;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="745" y="970" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="detail_reg_title" value="回归头（逐设备）\nLinear → ReLU\n输出: (B, N)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="870" y="750" width="200" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_reg_1" value="设备1 回归" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e9f7ef;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="870" y="830" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_reg_2" value="设备2 回归" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e9f7ef;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="975" y="830" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_reg_3" value="设备3 回归" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e9f7ef;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="870" y="865" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_reg_4" value="设备4 回归" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e9f7ef;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="975" y="865" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_reg_5" value="设备5 回归" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e9f7ef;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="870" y="900" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_reg_6" value="设备6 回归" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e9f7ef;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="975" y="900" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_reg_7" value="设备7 回归" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e9f7ef;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="870" y="935" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_reg_8" value="设备8 回归" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e9f7ef;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="975" y="935" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_reg_9" value="设备9 回归" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e9f7ef;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="870" y="970" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="dev_reg_10" value="设备10 回归" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e9f7ef;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="975" y="970" width="95" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="unknown_head" value="Unknown 头（能量）\nLinear → ReLU\n输出: (B, 1)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d0cee2;strokeColor=#56517e;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="1090" y="750" width="180" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="edge_routing_to_detail_cls" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;strokeColor=#D6B656;dashed=1;" edge="1" parent="1" source="lightweight_routing" target="detail_cls_title">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="edge_routing_to_detail_reg" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;strokeColor=#82B366;dashed=1;" edge="1" parent="1" source="lightweight_routing" target="detail_reg_title">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="edge_routing_to_unknown" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;strokeColor=#56517e;dashed=1;" edge="1" parent="1" source="lightweight_routing" target="unknown_head">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="edge_device_embed_to_detail" value="输出层条件化" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;strokeColor=#B85450;dashed=1;" edge="1" parent="1" source="device_embeddings" target="device_outputs_detail">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="arrow1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;strokeColor=#0066CC;" parent="1" source="raw_time_data" target="time_encoder" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="arrow2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;strokeColor=#D6B656;" parent="1" source="freq_features" target="freq_encoder" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="arrow3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;strokeColor=#82B366;" parent="1" source="aux_features" target="aux_encoder" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="arrow4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;strokeColor=#B85450;" parent="1" source="device_info" target="device_embedding" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="arrow5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.2;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;strokeColor=#0066CC;" parent="1" source="time_encoder" target="cross_attention" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="arrow6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.8;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;strokeColor=#D6B656;" parent="1" source="freq_encoder" target="cross_attention" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="arrow7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;strokeColor=#82B366;" parent="1" source="aux_encoder" target="cross_attention" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="arrow8" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeWidth=2;strokeColor=#4D79FF;" parent="1" source="cross_attention" target="attention_pooling" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="arrow9" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeWidth=2;strokeColor=#4D79FF;" parent="1" source="attention_pooling" target="lightweight_routing" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="arrow10" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;strokeColor=#B85450;" parent="1" source="device_embedding" target="lightweight_routing" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="arrow11" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.2;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;strokeColor=#82B366;" parent="1" source="lightweight_routing" target="regression_heads" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="arrow12" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;strokeColor=#D6B656;" parent="1" source="lightweight_routing" target="classification_heads" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="arrow13" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.8;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;strokeColor=#B85450;" parent="1" source="lightweight_routing" target="device_embeddings" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="edge_prediction_to_loss" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;strokeColor=#666666;" parent="1" source="prediction_layer" target="loss_config" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="edge_loss_to_postprocess" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;strokeColor=#666666;" parent="1" source="loss_config" target="post_processing" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="loss_config" value="损失函数配置（明确权重策略）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=14;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="50" y="940" width="600" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="focal_loss" value="Focal Loss&#10;weight=2.0&#10;α=0.25, γ=2.0" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" parent="1" vertex="1">
+                    <mxGeometry x="70" y="1040" width="120" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="huber_loss" value="Huber Loss&#10;weight=1.0&#10;δ=1.0" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" parent="1" vertex="1">
+                    <mxGeometry x="210" y="1040" width="120" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="conservation_loss" value="能量守恒约束&#10;weight=0.5&#10;(不宜过大)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" parent="1" vertex="1">
+                    <mxGeometry x="350" y="1040" width="120" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="consistency_loss" value="一致性约束&#10;weight=1.0&#10;功率-开关一致性" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" parent="1" vertex="1">
+                    <mxGeometry x="490" y="1040" width="120" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="post_processing" value="推理后处理层（工业级稳定预测）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d0cee2;strokeColor=#56517e;fontSize=14;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="50" y="1140" width="600" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="hysteresis" value="滞回阈值过滤&#10;开启: 0.6, 关闭: 0.4&#10;避免抖动" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0f0;strokeColor=#666666;" parent="1" vertex="1">
+                    <mxGeometry x="70" y="1240" width="120" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="duration_filter" value="最短持续时间&#10;开机: 5步, 关机: 3步&#10;工业稳定性" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0f0;strokeColor=#666666;" parent="1" vertex="1">
+                    <mxGeometry x="210" y="1240" width="120" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="overlap_fusion" value="重叠窗口融合&#10;加权平均&#10;提升预测稳定性" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0f0;strokeColor=#666666;" parent="1" vertex="1">
+                    <mxGeometry x="350" y="1240" width="120" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="conservation_enforce" value="能量守恒强制&#10;总功率约束&#10;容忍度: 10%" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0f0;strokeColor=#666666;" parent="1" vertex="1">
+                    <mxGeometry x="490" y="1240" width="120" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="training_config" value="训练配置\n• 批次大小: 32\n• 学习率: 1e-4 (AdamW)\n• 梯度裁剪: 1.0\n• 权重衰减: 1e-5\n• 调度器: CosineAnnealingLR\n• 混合精度: FP16" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0f0;strokeColor=#666666;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="700" y="1040" width="300" height="140" as="geometry"/>
+                </mxCell>
+                <mxCell id="data_config" value="数据配置\n• 窗口长度: 256 (21.3分钟 @ 5s采样)\n• 步长: 128 (50%重叠)\n• 特征维度: 120 (工程特征)\n• 设备数量: 10\n• Walk-Forward验证: 5折\n• 数据增强: 时间抖动 + 噪声注入" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="1050" y="1040" width="350" height="140" as="geometry"/>
+                </mxCell>
+                <mxCell id="performance" value="性能指标\n• 分类: F1-Score, PR-AUC, Recall@K\n• 回归: MAE, RMSE, MAPE\n• 不确定性: 共形预测区间\n• 推理速度: ~10ms/batch\n• 内存占用: ~2GB (训练)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d4edda;strokeColor=#28a745;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="1450" y="1040" width="300" height="140" as="geometry"/>
+                </mxCell>
+                <mxCell id="legend_title" value="图例" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=14;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="1420" y="160" width="60" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="legend_time" value="时域数据流" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" parent="1" vertex="1">
+                    <mxGeometry x="1420" y="200" width="120" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="legend_freq" value="频域数据流" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" parent="1" vertex="1">
+                    <mxGeometry x="1420" y="240" width="120" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="legend_aux" value="辅助特征流" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" parent="1" vertex="1">
+                    <mxGeometry x="1420" y="280" width="120" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="legend_device" value="设备信息流" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;" parent="1" vertex="1">
+                    <mxGeometry x="1420" y="320" width="120" height="30" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+    <diagram name="度量学习与原型库" id="prototype_arch">
+        <mxGraphModel dx="1422" dy="794" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1200" math="0" shadow="0">
+            <root>
+                <mxCell id="p0"/>
+                <mxCell id="p1" parent="p0"/>
+                <!-- 标题 -->
+                <mxCell id="p_title" value="DisaggNet 2.0 - 原型库与异常门控" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=20;fontStyle=1;" vertex="1" parent="p1">
+                    <mxGeometry x="520" y="20" width="560" height="40" as="geometry"/>
+                </mxCell>
+                <!-- 预测头输出与嵌入 -->
+                <mxCell id="p_prediction_outputs" value="多任务预测头输出\n• 回归: (B, N)\n• 分类: (B, N)\n• Unknown能量: (B, 1)\n• 设备嵌入: (B, N, d_model)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="p1">
+                    <mxGeometry x="60" y="100" width="360" height="140" as="geometry"/>
+                </mxCell>
+                <!-- 原型库模块 -->
+                <mxCell id="p_prototype_library" value="原型库 (PrototypeLibrary)\n• 统计: 每设备均值/协方差/样本数\n• 嵌入维度: d_model=256\n• 更新: 训练时流式\n• 稳定化: 对角正则" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d0cee2;strokeColor=#56517e;fontSize=12;fontStyle=1;" vertex="1" parent="p1">
+                    <mxGeometry x="460" y="100" width="360" height="160" as="geometry"/>
+                </mxCell>
+                <!-- 原型库日志与可视化 -->
+                <mxCell id="p_logging" value="训练期日志与可视化\n• 每设备样本数\n• Mahalanobis距离: 均值/分位数/最大值\n• on_train_epoch_end 可视化" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0f0;strokeColor=#666666;fontSize=12;" vertex="1" parent="p1">
+                    <mxGeometry x="860" y="100" width="320" height="160" as="geometry"/>
+                </mxCell>
+                <!-- Checkpoint 持久化 -->
+                <mxCell id="p_checkpoint" value="Checkpoint 持久化\n• 保存原型均值/协方差/样本数\n• 随模型一起存储/加载" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0f0;strokeColor=#666666;fontSize=12;" vertex="1" parent="p1">
+                    <mxGeometry x="60" y="280" width="360" height="120" as="geometry"/>
+                </mxCell>
+                <!-- 推理端原型加载与距离计算 -->
+                <mxCell id="p_infer_prototypes" value="推理端原型加载\n• 计算设备级 Mahalanobis 距离\n• 异常度指标" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d4edda;strokeColor=#28a745;fontSize=12;" vertex="1" parent="p1">
+                    <mxGeometry x="460" y="280" width="360" height="120" as="geometry"/>
+                </mxCell>
+                <!-- 异常门控策略 -->
+                <mxCell id="p_anomaly_gate" value="异常门控（推理）\n• 高异常→提升 Unknown 权重\n• 抑制可疑设备激活\n• 输入: 距离 + Unknown 能量" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;fontStyle=1;" vertex="1" parent="p1">
+                    <mxGeometry x="860" y="280" width="320" height="140" as="geometry"/>
+                </mxCell>
+                <!-- 度量学习损失 -->
+                <mxCell id="p_metric_loss" value="度量学习损失\n• 目标: 嵌入对齐设备原型\n• 权重: λ_metric" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" vertex="1" parent="p1">
+                    <mxGeometry x="60" y="440" width="360" height="100" as="geometry"/>
+                </mxCell>
+                <!-- 连接线：嵌入到原型库 -->
+                <mxCell id="p_edge_embed_to_proto" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;strokeColor=#56517e;" edge="1" parent="p1" source="p_prediction_outputs" target="p_prototype_library">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <!-- 连接线：原型库到日志 -->
+                <mxCell id="p_edge_proto_to_log" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;strokeColor=#666666;" edge="1" parent="p1" source="p_prototype_library" target="p_logging">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <!-- 连接线：原型库到持久化 -->
+                <mxCell id="p_edge_proto_to_ckpt" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;strokeColor=#666666;" edge="1" parent="p1" source="p_prototype_library" target="p_checkpoint">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <!-- 连接线：持久化到推理加载 -->
+                <mxCell id="p_edge_ckpt_to_infer" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;strokeColor=#28a745;" edge="1" parent="p1" source="p_checkpoint" target="p_infer_prototypes">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <!-- 连接线：推理原型到异常门控 -->
+                <mxCell id="p_edge_infer_to_gate" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;strokeColor=#d79b00;" edge="1" parent="p1" source="p_infer_prototypes" target="p_anomaly_gate">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <!-- 连接线：Unknown能量到异常门控 -->
+                <mxCell id="p_edge_unknown_to_gate" value="Unknown 能量" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;strokeColor=#d79b00;dashed=1;" edge="1" parent="p1" source="p_prediction_outputs" target="p_anomaly_gate">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <!-- 连接线：嵌入到度量学习损失 -->
+                <mxCell id="p_edge_embed_to_metric" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;strokeColor=#9673a6;" edge="1" parent="p1" source="p_prediction_outputs" target="p_metric_loss">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>
