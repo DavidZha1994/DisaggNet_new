@@ -3,7 +3,7 @@
 """
 验证 Data/prepared 下由 HIPEDataPreparationPipeline 生成的数据折结构与形状一致性。
 - 检查顶层文件：cv_splits.pkl、labels.pkl、device_name_to_id.json
-- 对每个 fold_*：检查 train/val 的 raw/freq/features/indices 是否存在
+- 对每个 fold_*：检查 train/val 的 raw/freq/features/indices 是否存在（仅 .pt 文件）
 - 校验形状一致：features/raw/freq 的第一维应与对应 indices 长度一致
 - 校验 metadata CSV 行数与 indices 一致
 """
@@ -17,17 +17,18 @@ import pandas as pd
 
 TOP_FILES = ["cv_splits.pkl", "labels.pkl", "device_name_to_id.json"]
 FOLD_FILES = [
-    "train_raw.npy", "val_raw.npy",
-    "train_freq.npy", "val_freq.npy",
-    "train_features.npy", "val_features.npy",
-    "train_indices.npy", "val_indices.npy",
+    "train_raw.pt", "val_raw.pt",
+    "train_freq.pt", "val_freq.pt",
+    "train_features.pt", "val_features.pt",
+    "train_indices.pt", "val_indices.pt",
     "train_metadata.csv", "val_metadata.csv",
     "feature_names.json", "raw_channel_names.json",
 ]
 
 
-def load_optional_npy(fp: str):
-    return np.load(fp) if os.path.exists(fp) else None
+def load_optional_pt(fp: str):
+    import torch
+    return torch.load(fp) if os.path.exists(fp) else None
 
 
 def check_fold(fold_dir: str) -> dict:
@@ -36,23 +37,39 @@ def check_fold(fold_dir: str) -> dict:
     present = {f: os.path.exists(os.path.join(fold_dir, f)) for f in FOLD_FILES}
     out["present"] = present
     # 读取
-    train_features = load_optional_npy(os.path.join(fold_dir, "train_features.npy"))
-    val_features = load_optional_npy(os.path.join(fold_dir, "val_features.npy"))
-    train_raw = load_optional_npy(os.path.join(fold_dir, "train_raw.npy"))
-    val_raw = load_optional_npy(os.path.join(fold_dir, "val_raw.npy"))
-    train_freq = load_optional_npy(os.path.join(fold_dir, "train_freq.npy"))
-    val_freq = load_optional_npy(os.path.join(fold_dir, "val_freq.npy"))
-    train_idx = load_optional_npy(os.path.join(fold_dir, "train_indices.npy"))
-    val_idx = load_optional_npy(os.path.join(fold_dir, "val_indices.npy"))
+    train_features = load_optional_pt(os.path.join(fold_dir, "train_features.pt"))
+    val_features = load_optional_pt(os.path.join(fold_dir, "val_features.pt"))
+    train_raw = load_optional_pt(os.path.join(fold_dir, "train_raw.pt"))
+    val_raw = load_optional_pt(os.path.join(fold_dir, "val_raw.pt"))
+    train_freq = load_optional_pt(os.path.join(fold_dir, "train_freq.pt"))
+    val_freq = load_optional_pt(os.path.join(fold_dir, "val_freq.pt"))
+    train_idx = load_optional_pt(os.path.join(fold_dir, "train_indices.pt"))
+    val_idx = load_optional_pt(os.path.join(fold_dir, "val_indices.pt"))
+    # 统一转 numpy 便于下游检查
+    def to_np(x):
+        try:
+            import torch
+            return x.detach().cpu().numpy() if hasattr(x, 'detach') else (x.cpu().numpy() if isinstance(x, torch.Tensor) else x)
+        except Exception:
+            return x
+    train_features_np = None if train_features is None else to_np(train_features)
+    val_features_np = None if val_features is None else to_np(val_features)
+    train_raw_np = None if train_raw is None else to_np(train_raw)
+    val_raw_np = None if val_raw is None else to_np(val_raw)
+    train_freq_np = None if train_freq is None else to_np(train_freq)
+    val_freq_np = None if val_freq is None else to_np(val_freq)
+    train_idx_np = None if train_idx is None else to_np(train_idx)
+    val_idx_np = None if val_idx is None else to_np(val_idx)
+
     out.update({
-        "train_features_shape": None if train_features is None else tuple(train_features.shape),
-        "val_features_shape": None if val_features is None else tuple(val_features.shape),
-        "train_raw_shape": None if train_raw is None else tuple(train_raw.shape),
-        "val_raw_shape": None if val_raw is None else tuple(val_raw.shape),
-        "train_freq_shape": None if train_freq is None else tuple(train_freq.shape),
-        "val_freq_shape": None if val_freq is None else tuple(val_freq.shape),
-        "train_indices_len": None if train_idx is None else int(len(train_idx)),
-        "val_indices_len": None if val_idx is None else int(len(val_idx)),
+        "train_features_shape": None if train_features_np is None else tuple(train_features_np.shape),
+        "val_features_shape": None if val_features_np is None else tuple(val_features_np.shape),
+        "train_raw_shape": None if train_raw_np is None else tuple(train_raw_np.shape),
+        "val_raw_shape": None if val_raw_np is None else tuple(val_raw_np.shape),
+        "train_freq_shape": None if train_freq_np is None else tuple(train_freq_np.shape),
+        "val_freq_shape": None if val_freq_np is None else tuple(val_freq_np.shape),
+        "train_indices_len": None if train_idx_np is None else int(len(train_idx_np)),
+        "val_indices_len": None if val_idx_np is None else int(len(val_idx_np)),
     })
     # 元数据CSV
     tm_path = os.path.join(fold_dir, "train_metadata.csv")
@@ -74,29 +91,29 @@ def check_fold(fold_dir: str) -> dict:
     checks = []
     def add_check(name: str, cond: bool):
         checks.append((name, bool(cond)))
-    if train_features is not None and train_idx is not None:
-        add_check("train_features_vs_indices", train_features.shape[0] == len(train_idx))
-    if val_features is not None and val_idx is not None:
-        add_check("val_features_vs_indices", val_features.shape[0] == len(val_idx))
-    if train_raw is not None and train_idx is not None:
-        add_check("train_raw_vs_indices", train_raw.shape[0] == len(train_idx))
-    if val_raw is not None and val_idx is not None:
-        add_check("val_raw_vs_indices", val_raw.shape[0] == len(val_idx))
-    if train_freq is not None and train_idx is not None:
-        add_check("train_freq_vs_indices", train_freq.shape[0] == len(train_idx))
-    if val_freq is not None and val_idx is not None:
-        add_check("val_freq_vs_indices", val_freq.shape[0] == len(val_idx))
-    if tm_len is not None and train_idx is not None:
-        add_check("train_metadata_vs_indices", tm_len == len(train_idx))
-    if vm_len is not None and val_idx is not None:
-        add_check("val_metadata_vs_indices", vm_len == len(val_idx))
+    if train_features_np is not None and train_idx_np is not None:
+        add_check("train_features_vs_indices", train_features_np.shape[0] == len(train_idx_np))
+    if val_features_np is not None and val_idx_np is not None:
+        add_check("val_features_vs_indices", val_features_np.shape[0] == len(val_idx_np))
+    if train_raw_np is not None and train_idx_np is not None:
+        add_check("train_raw_vs_indices", train_raw_np.shape[0] == len(train_idx_np))
+    if val_raw_np is not None and val_idx_np is not None:
+        add_check("val_raw_vs_indices", val_raw_np.shape[0] == len(val_idx_np))
+    if train_freq_np is not None and train_idx_np is not None:
+        add_check("train_freq_vs_indices", train_freq_np.shape[0] == len(train_idx_np))
+    if val_freq_np is not None and val_idx_np is not None:
+        add_check("val_freq_vs_indices", val_freq_np.shape[0] == len(val_idx_np))
+    if tm_len is not None and train_idx_np is not None:
+        add_check("train_metadata_vs_indices", tm_len == len(train_idx_np))
+    if vm_len is not None and val_idx_np is not None:
+        add_check("val_metadata_vs_indices", vm_len == len(val_idx_np))
     out["checks"] = checks
     out["ok"] = all(c for _, c in checks) if checks else False
     return out
 
 
 def main():
-    parser = argparse.ArgumentParser(description="验证HIPE管线生成的prepared数据折结构与形状一致性")
+    parser = argparse.ArgumentParser(description="验证HIPE管线生成的prepared数据折结构与形状一致性（.pt 文件）")
     parser.add_argument("--prepared", default=os.path.join("Data", "prepared"), help="prepared数据目录")
     args = parser.parse_args()
 

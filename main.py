@@ -27,6 +27,12 @@ import logging
 from pathlib import Path
 from typing import Optional, Dict, Any
 import yaml
+import platform
+
+# macOS: 预先设置 OpenMP 运行时重复加载的进程级容忍，避免导入期崩溃
+if platform.system() == "Darwin" and "KMP_DUPLICATE_LIB_OK" not in os.environ:
+    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import torch
 import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf

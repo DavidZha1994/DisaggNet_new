@@ -596,22 +596,22 @@ class HIPEDataPreparationPipeline:
             m_val = np.where(np.isnan(m_val), 0.0, m_val)
             X_train_filled = np.where(np.isnan(X_train), m_train, X_train).astype(np.float32)
             X_val_filled = np.where(np.isnan(X_val), m_val, X_val).astype(np.float32)
-            # 保存掩码与原始窗
-            np.save(os.path.join(fold_dir, "train_mask.npy"), train_mask)
-            np.save(os.path.join(fold_dir, "val_mask.npy"), val_mask)
-            np.save(os.path.join(fold_dir, "train_raw.npy"), X_train_filled)
-            np.save(os.path.join(fold_dir, "val_raw.npy"), X_val_filled)
-            # 频域 STFT 序列供 FreqEncoder
-            np.save(os.path.join(fold_dir, "train_freq.npy"), freq_feats[train_idx].astype(np.float32))
-            np.save(os.path.join(fold_dir, "val_freq.npy"), freq_feats[val_idx].astype(np.float32))
-            # aux 特征供 AuxEncoder
-            np.save(os.path.join(fold_dir, "train_features.npy"), aux_feats[train_idx].astype(np.float32))
-            np.save(os.path.join(fold_dir, "val_features.npy"), aux_feats[val_idx].astype(np.float32))
-            np.save(os.path.join(fold_dir, "train_targets_seq.npy"), Yp_seq[train_idx].astype(np.float32))
-            np.save(os.path.join(fold_dir, "val_targets_seq.npy"), Yp_seq[val_idx].astype(np.float32))
-            # indices
-            np.save(os.path.join(fold_dir, "train_indices.npy"), train_idx)
-            np.save(os.path.join(fold_dir, "val_indices.npy"), val_idx)
+            # 保存掩码与原始窗（仅 .pt）
+            import torch
+            torch.save(torch.from_numpy(train_mask.astype(np.uint8)), os.path.join(fold_dir, "train_mask.pt"))
+            torch.save(torch.from_numpy(val_mask.astype(np.uint8)), os.path.join(fold_dir, "val_mask.pt"))
+            # 保存张量版本，减少后续加载转换
+            torch.save(torch.from_numpy(X_train_filled).float(), os.path.join(fold_dir, "train_raw.pt"))
+            torch.save(torch.from_numpy(X_val_filled).float(), os.path.join(fold_dir, "val_raw.pt"))
+            torch.save(torch.from_numpy(freq_feats[train_idx].astype(np.float32)).float(), os.path.join(fold_dir, "train_freq.pt"))
+            torch.save(torch.from_numpy(freq_feats[val_idx].astype(np.float32)).float(), os.path.join(fold_dir, "val_freq.pt"))
+            torch.save(torch.from_numpy(aux_feats[train_idx].astype(np.float32)).float(), os.path.join(fold_dir, "train_features.pt"))
+            torch.save(torch.from_numpy(aux_feats[val_idx].astype(np.float32)).float(), os.path.join(fold_dir, "val_features.pt"))
+            torch.save(torch.from_numpy(Yp_seq[train_idx].astype(np.float32)).float(), os.path.join(fold_dir, "train_targets_seq.pt"))
+            torch.save(torch.from_numpy(Yp_seq[val_idx].astype(np.float32)).float(), os.path.join(fold_dir, "val_targets_seq.pt"))
+            torch.save(torch.from_numpy(train_idx.astype(np.int64)), os.path.join(fold_dir, "train_indices.pt"))
+            torch.save(torch.from_numpy(val_idx.astype(np.int64)), os.path.join(fold_dir, "val_indices.pt"))
+            # 已移除 NPY 兼容保存（统一生成 .pt 文件）
             # metadata（时间戳，直接使用秒整数）
             if "start_ts" in windows_meta.columns:
                 train_ts = windows_meta["start_ts"].iloc[train_idx].astype('int64').to_numpy()
@@ -644,17 +644,18 @@ class HIPEDataPreparationPipeline:
 
     def load_processed_data(self, fold_id: int = 0) -> Dict:
         fold_dir = os.path.join(self.output_dir, f"fold_{fold_id}")
+        import torch
         data = {
-            "train_raw": self._safe_load(os.path.join(fold_dir, "train_raw.npy")),
-            "val_raw": self._safe_load(os.path.join(fold_dir, "val_raw.npy")),
-            "train_freq": self._safe_load(os.path.join(fold_dir, "train_freq.npy")),
-            "val_freq": self._safe_load(os.path.join(fold_dir, "val_freq.npy")),
-            "train_features": self._safe_load(os.path.join(fold_dir, "train_features.npy")),
-            "val_features": self._safe_load(os.path.join(fold_dir, "val_features.npy")),
-            "train_indices": self._safe_load(os.path.join(fold_dir, "train_indices.npy")),
-            "val_indices": self._safe_load(os.path.join(fold_dir, "val_indices.npy")),
-            "train_mask": self._safe_load(os.path.join(fold_dir, "train_mask.npy")),
-            "val_mask": self._safe_load(os.path.join(fold_dir, "val_mask.npy")),
+            "train_raw": torch.load(os.path.join(fold_dir, "train_raw.pt")) if os.path.exists(os.path.join(fold_dir, "train_raw.pt")) else None,
+            "val_raw": torch.load(os.path.join(fold_dir, "val_raw.pt")) if os.path.exists(os.path.join(fold_dir, "val_raw.pt")) else None,
+            "train_freq": torch.load(os.path.join(fold_dir, "train_freq.pt")) if os.path.exists(os.path.join(fold_dir, "train_freq.pt")) else None,
+            "val_freq": torch.load(os.path.join(fold_dir, "val_freq.pt")) if os.path.exists(os.path.join(fold_dir, "val_freq.pt")) else None,
+            "train_features": torch.load(os.path.join(fold_dir, "train_features.pt")) if os.path.exists(os.path.join(fold_dir, "train_features.pt")) else None,
+            "val_features": torch.load(os.path.join(fold_dir, "val_features.pt")) if os.path.exists(os.path.join(fold_dir, "val_features.pt")) else None,
+            "train_indices": torch.load(os.path.join(fold_dir, "train_indices.pt")) if os.path.exists(os.path.join(fold_dir, "train_indices.pt")) else None,
+            "val_indices": torch.load(os.path.join(fold_dir, "val_indices.pt")) if os.path.exists(os.path.join(fold_dir, "val_indices.pt")) else None,
+            "train_mask": torch.load(os.path.join(fold_dir, "train_mask.pt")) if os.path.exists(os.path.join(fold_dir, "train_mask.pt")) else None,
+            "val_mask": torch.load(os.path.join(fold_dir, "val_mask.pt")) if os.path.exists(os.path.join(fold_dir, "val_mask.pt")) else None,
         }
         return data
 

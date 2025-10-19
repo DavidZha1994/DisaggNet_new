@@ -47,10 +47,12 @@ def _get_device_names_from_prepared(prepared_dir: str):
         # 回退：按键排序
         device_names = sorted(list(mapping.keys()))
 
-    # 与targets_seq维度一致性快速检查（若存在）
-    seq_path = Path(prepared_dir) / f"fold_{FOLD_ID}" / "train_targets_seq.npy"
+    # 与targets_seq维度一致性快速检查（若存在，.pt 文件）
+    seq_path = Path(prepared_dir) / f"fold_{FOLD_ID}" / "train_targets_seq.pt"
     if seq_path.exists():
-        arr = np.load(seq_path)
+        import torch
+        arr_t = torch.load(seq_path)
+        arr = arr_t.detach().cpu().numpy() if hasattr(arr_t, 'detach') else arr_t
         n_devices_from_seq = arr.shape[-1]
         assert n_devices_from_seq == len(device_names), (
             f"targets_seq设备维度({n_devices_from_seq})与映射设备数({len(device_names)})不一致")

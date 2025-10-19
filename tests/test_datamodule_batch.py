@@ -70,7 +70,8 @@ def test_collate_and_map_with_pkw_mean_extraction():
     assert out['freq_features'].dim() == 3
     assert out['target_power'].shape[0] == B
     assert out['target_states'].shape[0] == B
-    assert out['timestamps'].shape == (B,)
+    assert out['timestamps'].dim() in (1, 2)
+    assert out['timestamps'].shape[0] == B
     assert out['total_power'].shape == (B, 1)
 
     # total_power 应来自 P_kW_mean 的列

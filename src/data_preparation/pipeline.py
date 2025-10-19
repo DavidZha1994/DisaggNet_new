@@ -1176,25 +1176,26 @@ class DataPreparationPipeline:
             fold_dir = os.path.join(self.output_dir, f'fold_{fold_idx}')
             os.makedirs(fold_dir, exist_ok=True)
             
-            # 保存特征数据
-            np.save(os.path.join(fold_dir, 'train_features.npy'), fold_data['train_features'])
-            np.save(os.path.join(fold_dir, 'val_features.npy'), fold_data['val_features'])
+            # 保存特征数据（仅 .pt）
+            import torch
+            torch.save(torch.from_numpy(fold_data['train_features']).float(), os.path.join(fold_dir, 'train_features.pt'))
+            torch.save(torch.from_numpy(fold_data['val_features']).float(), os.path.join(fold_dir, 'val_features.pt'))
             
-            # 保存原始窗口序列（与特征对齐）
+            # 保存原始窗口序列（与特征对齐，仅 .pt）
             if 'train_raw' in fold_data and fold_data['train_raw'] is not None and fold_data['train_raw'].size > 0:
-                np.save(os.path.join(fold_dir, 'train_raw.npy'), fold_data['train_raw'])
+                torch.save(torch.from_numpy(fold_data['train_raw']).float(), os.path.join(fold_dir, 'train_raw.pt'))
             if 'val_raw' in fold_data and fold_data['val_raw'] is not None and fold_data['val_raw'].size > 0:
-                np.save(os.path.join(fold_dir, 'val_raw.npy'), fold_data['val_raw'])
+                torch.save(torch.from_numpy(fold_data['val_raw']).float(), os.path.join(fold_dir, 'val_raw.pt'))
 
-            # 保存频域摘要帧（可选）
+            # 保存频域摘要帧（可选，仅 .pt）
             if 'train_freq' in fold_data and fold_data['train_freq'] is not None and np.size(fold_data['train_freq']) > 0:
-                np.save(os.path.join(fold_dir, 'train_freq.npy'), fold_data['train_freq'])
+                torch.save(torch.from_numpy(fold_data['train_freq']).float(), os.path.join(fold_dir, 'train_freq.pt'))
             if 'val_freq' in fold_data and fold_data['val_freq'] is not None and np.size(fold_data['val_freq']) > 0:
-                np.save(os.path.join(fold_dir, 'val_freq.npy'), fold_data['val_freq'])
+                torch.save(torch.from_numpy(fold_data['val_freq']).float(), os.path.join(fold_dir, 'val_freq.pt'))
             
-            # 保存索引
-            np.save(os.path.join(fold_dir, 'train_indices.npy'), fold_data['train_indices'])
-            np.save(os.path.join(fold_dir, 'val_indices.npy'), fold_data['val_indices'])
+            # 保存索引（仅 .pt）
+            torch.save(torch.from_numpy(np.asarray(fold_data['train_indices']).astype(np.int64)), os.path.join(fold_dir, 'train_indices.pt'))
+            torch.save(torch.from_numpy(np.asarray(fold_data['val_indices']).astype(np.int64)), os.path.join(fold_dir, 'val_indices.pt'))
 
             # 保存该折的元数据快照（包含设备名等，便于下游按设备分析）
             train_meta_rows = []
@@ -1221,20 +1222,9 @@ class DataPreparationPipeline:
             if val_meta_rows:
                 pd.DataFrame(val_meta_rows).to_csv(os.path.join(fold_dir, 'val_metadata.csv'), index=False)
 
-            # 保存设备ID序列（与索引对齐），便于按设备建模或筛选
+            # 设备ID序列保存已移除，统一 .pt 文件策略，仅保留设备名称映射
             if device_name_to_id:
-                train_device_ids = []
-                val_device_ids = []
-                for i in fold_data['train_indices']:
-                    meta_obj = labels_data['label_metadata'][int(i)]
-                    dev_name = meta_obj['device_name'] if isinstance(meta_obj, dict) else getattr(meta_obj, 'device_name', None)
-                    train_device_ids.append(device_name_to_id.get(dev_name, -1))
-                for i in fold_data['val_indices']:
-                    meta_obj = labels_data['label_metadata'][int(i)]
-                    dev_name = meta_obj['device_name'] if isinstance(meta_obj, dict) else getattr(meta_obj, 'device_name', None)
-                    val_device_ids.append(device_name_to_id.get(dev_name, -1))
-                np.save(os.path.join(fold_dir, 'train_device_ids.npy'), np.asarray(train_device_ids, dtype=np.int64))
-                np.save(os.path.join(fold_dir, 'val_device_ids.npy'), np.asarray(val_device_ids, dtype=np.int64))
+                pass
 
             # 保存缩放器
             with open(os.path.join(fold_dir, 'scaler.pkl'), 'wb') as f:
@@ -1274,43 +1264,56 @@ class DataPreparationPipeline:
         if not os.path.exists(fold_dir):
             raise FileNotFoundError(f"找不到折 {fold_idx} 的数据: {fold_dir}")
         
-        # 加载特征数据
-        train_features = np.load(os.path.join(fold_dir, 'train_features.npy'))
-        val_features = np.load(os.path.join(fold_dir, 'val_features.npy'))
+        # 加载特征数据（.pt -> numpy）
+        import torch
+        train_features_t = torch.load(os.path.join(fold_dir, 'train_features.pt'))
+        val_features_t = torch.load(os.path.join(fold_dir, 'val_features.pt'))
+        train_features = train_features_t.detach().cpu().numpy() if hasattr(train_features_t, 'detach') else train_features_t
+        val_features = val_features_t.detach().cpu().numpy() if hasattr(val_features_t, 'detach') else val_features_t
         
-        # 加载原始窗口序列（可选）
+        # 加载原始窗口序列（可选，.pt -> numpy）
         train_raw = None
         val_raw = None
         raw_channel_names = []
-        train_raw_path = os.path.join(fold_dir, 'train_raw.npy')
-        val_raw_path = os.path.join(fold_dir, 'val_raw.npy')
+        train_raw_path_pt = os.path.join(fold_dir, 'train_raw.pt')
+        val_raw_path_pt = os.path.join(fold_dir, 'val_raw.pt')
         raw_names_path = os.path.join(fold_dir, 'raw_channel_names.json')
-        if os.path.exists(train_raw_path):
-            train_raw = np.load(train_raw_path)
-        if os.path.exists(val_raw_path):
-            val_raw = np.load(val_raw_path)
+        if os.path.exists(train_raw_path_pt):
+            tr = torch.load(train_raw_path_pt)
+            train_raw = tr.detach().cpu().numpy() if hasattr(tr, 'detach') else tr
+        if os.path.exists(val_raw_path_pt):
+            vr = torch.load(val_raw_path_pt)
+            val_raw = vr.detach().cpu().numpy() if hasattr(vr, 'detach') else vr
         if os.path.exists(raw_names_path):
             with open(raw_names_path, 'r') as f:
                 raw_channel_names = json.load(f)
         
-        # 加载索引
-        train_indices = np.load(os.path.join(fold_dir, 'train_indices.npy'))
-        val_indices = np.load(os.path.join(fold_dir, 'val_indices.npy'))
+        # 加载频域摘要（可选，.pt -> numpy）
+        train_freq = None
+        val_freq = None
+        train_freq_path = os.path.join(fold_dir, 'train_freq.pt')
+        val_freq_path = os.path.join(fold_dir, 'val_freq.pt')
+        if os.path.exists(train_freq_path):
+            tf = torch.load(train_freq_path)
+            train_freq = tf.detach().cpu().numpy() if hasattr(tf, 'detach') else tf
+        if os.path.exists(val_freq_path):
+            vf = torch.load(val_freq_path)
+            val_freq = vf.detach().cpu().numpy() if hasattr(vf, 'detach') else vf
+        
+        # 加载索引（.pt -> numpy）
+        train_indices_t = torch.load(os.path.join(fold_dir, 'train_indices.pt'))
+        val_indices_t = torch.load(os.path.join(fold_dir, 'val_indices.pt'))
+        train_indices = train_indices_t.detach().cpu().numpy() if hasattr(train_indices_t, 'detach') else train_indices_t
+        val_indices = val_indices_t.detach().cpu().numpy() if hasattr(val_indices_t, 'detach') else val_indices_t
 
-        # 加载设备ID（可选）与映射
-        train_device_ids = None
-        val_device_ids = None
+        # 加载设备名称映射（不再加载设备ID数组）
         device_map_path = os.path.join(self.output_dir, 'device_name_to_id.json')
         device_name_to_id = {}
-        train_dev_path = os.path.join(fold_dir, 'train_device_ids.npy')
-        val_dev_path = os.path.join(fold_dir, 'val_device_ids.npy')
-        if os.path.exists(train_dev_path):
-            train_device_ids = np.load(train_dev_path)
-        if os.path.exists(val_dev_path):
-            val_device_ids = np.load(val_dev_path)
         if os.path.exists(device_map_path):
             with open(device_map_path, 'r') as f:
                 device_name_to_id = json.load(f)
+        train_device_ids = None
+        val_device_ids = None
         
         # 加载缩放器
         with open(os.path.join(fold_dir, 'scaler.pkl'), 'rb') as f:
@@ -1332,6 +1335,8 @@ class DataPreparationPipeline:
             'val_features': val_features,
             'train_raw': train_raw,
             'val_raw': val_raw,
+            'train_freq': train_freq,
+            'val_freq': val_freq,
             'train_labels': train_labels,
             'val_labels': val_labels,
             'train_indices': train_indices,

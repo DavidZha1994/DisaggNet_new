@@ -61,20 +61,24 @@ class NILMMetrics:
         return numerator / denominator if denominator != 0 else default
     
     def mean_absolute_error(self, y_pred: torch.Tensor, y_true: torch.Tensor, 
-                           per_device: bool = False) -> Union[float, Dict[str, float]]:
+                           per_device: bool = False, sample_weights: Optional[torch.Tensor] = None) -> Union[float, Dict[str, float]]:
         """平均绝对误差 (MAE)"""
         y_pred = self._to_numpy(y_pred)
         y_true = self._to_numpy(y_true)
-        
-        mae_values = np.mean(np.abs(y_pred - y_true), axis=0)
-        
-        if per_device:
-            return {self.device_names[i]: mae_values[i] for i in range(self.n_devices)}
+        err = np.abs(y_pred - y_true)  # (B, N)
+        if sample_weights is not None:
+            w = self._to_numpy(sample_weights).reshape(-1, 1)
+            wsum = np.maximum(np.sum(w, axis=0), 1e-8)
+            mae_values = np.sum(err * w, axis=0) / wsum
         else:
-            return np.mean(mae_values)
+            mae_values = np.mean(err, axis=0)
+        if per_device:
+            return {self.device_names[i]: float(mae_values[i]) for i in range(self.n_devices)}
+        else:
+            return float(np.mean(mae_values))
     
     def normalized_disaggregation_error(self, y_pred: torch.Tensor, y_true: torch.Tensor,
-                                      per_device: bool = False) -> Union[float, Dict[str, float]]:
+                                      per_device: bool = False, sample_weights: Optional[torch.Tensor] = None) -> Union[float, Dict[str, float]]:
         """归一化分解误差 (NDE)"""
         y_pred = self._to_numpy(y_pred)
         y_true = self._to_numpy(y_true)
@@ -82,43 +86,59 @@ class NILMMetrics:
         # 计算每个设备的NDE
         nde_values = []
         for i in range(self.n_devices):
-            numerator = np.sum(np.abs(y_pred[:, i] - y_true[:, i]))
-            denominator = np.sum(y_true[:, i])
+            err_i = np.abs(y_pred[:, i] - y_true[:, i])
+            true_i = y_true[:, i]
+            if sample_weights is not None:
+                w = self._to_numpy(sample_weights).reshape(-1)
+                numerator = np.sum(err_i * w)
+                denominator = np.sum(true_i * w)
+            else:
+                numerator = np.sum(err_i)
+                denominator = np.sum(true_i)
             nde = self._safe_divide(numerator, denominator, 1.0)
             nde_values.append(nde)
         
         nde_values = np.array(nde_values)
         
         if per_device:
-            return {self.device_names[i]: nde_values[i] for i in range(self.n_devices)}
+            return {self.device_names[i]: float(nde_values[i]) for i in range(self.n_devices)}
         else:
-            return np.mean(nde_values)
+            return float(np.mean(nde_values))
     
-    def signal_aggregate_error(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> float:
+    def signal_aggregate_error(self, y_pred: torch.Tensor, y_true: torch.Tensor, sample_weights: Optional[torch.Tensor] = None) -> float:
         """信号聚合误差 (SAE)"""
         y_pred = self._to_numpy(y_pred)
         y_true = self._to_numpy(y_true)
-        
         # 计算总功率
         pred_total = np.sum(y_pred, axis=1)
         true_total = np.sum(y_true, axis=1)
-        
-        # SAE
-        numerator = np.sum(np.abs(pred_total - true_total))
-        denominator = np.sum(true_total)
-        
-        return self._safe_divide(numerator, denominator, 1.0)
+        # SAE（支持样本权重）
+        if sample_weights is not None:
+            w = self._to_numpy(sample_weights).reshape(-1)
+            numerator = np.sum(np.abs(pred_total - true_total) * w)
+            denominator = np.sum(true_total * w)
+        else:
+            numerator = np.sum(np.abs(pred_total - true_total))
+            denominator = np.sum(true_total)
+        return float(self._safe_divide(numerator, denominator, 1.0))
     
     def total_energy_correctly_assigned(self, y_pred: torch.Tensor, y_true: torch.Tensor,
-                                      per_device: bool = False) -> Union[float, Dict[str, float]]:
+                                      per_device: bool = False, sample_weights: Optional[torch.Tensor] = None) -> Union[float, Dict[str, float]]:
         """总能量正确分配比例 (TECA)"""
         y_pred = self._to_numpy(y_pred)
         y_true = self._to_numpy(y_true)
         
         teca_values = []
+        w = None if sample_weights is None else self._to_numpy(sample_weights).reshape(-1)
         for i in range(self.n_devices):
-            pred_energy = np.sum(y_pred[:, i])
-            true_energy = np.sum(y_true[:, i])
+            pred_i = y_pred[:, i]
+            true_i = y_true[:, i]
+            if w is not None:
+                pred_energy = np.sum(pred_i * w)
+                true_energy = np.sum(true_i * w)
+            else:
+                pred_energy = np.sum(pred_i)
+                true_energy = np.sum(true_i)
             
             if true_energy == 0:
                 teca = 1.0 if pred_energy == 0 else 0.0
@@ -126,14 +146,14 @@ class NILMMetrics:
                 teca = 1.0 - abs(pred_energy - true_energy) / true_energy
                 teca = max(0.0, teca)  # 确保非负
             
-            teca_values.append(teca)
+            teca_values.append(float(teca))
         
         teca_values = np.array(teca_values)
         
         if per_device:
-            return {self.device_names[i]: teca_values[i] for i in range(self.n_devices)}
+            return {self.device_names[i]: float(teca_values[i]) for i in range(self.n_devices)}
         else:
-            return np.mean(teca_values)
+            return float(np.mean(teca_values))
     
     def optimize_thresholds(self, y_pred_proba: torch.Tensor, y_true: torch.Tensor,
                           method: str = 'f1') -> Dict[str, float]:
@@ -192,10 +212,11 @@ class NILMMetrics:
     
     def f1_score(self, y_pred_proba: torch.Tensor, y_true: torch.Tensor,
                 thresholds: Optional[Dict[str, float]] = None,
-                per_device: bool = False, average: str = 'macro') -> Union[float, Dict[str, float]]:
+                per_device: bool = False, average: str = 'macro', sample_weights: Optional[torch.Tensor] = None) -> Union[float, Dict[str, float]]:
         """F1分数"""
         y_true = self._to_numpy(y_true)
         y_pred_binary = self.apply_thresholds(y_pred_proba, thresholds)
+        w = None if sample_weights is None else self._to_numpy(sample_weights).reshape(-1)
         
         if per_device:
             f1_scores = {}
@@ -203,19 +224,21 @@ class NILMMetrics:
                 if len(np.unique(y_true[:, i])) < 2:
                     f1_scores[device_name] = 0.0
                 else:
-                    f1_scores[device_name] = f1_score(y_true[:, i], y_pred_binary[:, i], average='binary')
+                    f1_scores[device_name] = float(f1_score(y_true[:, i], y_pred_binary[:, i], average='binary', sample_weight=w))
             return f1_scores
         else:
             # 计算macro或micro平均
             if average == 'macro':
-                f1_scores = []
+                f1_values = []
                 for i in range(self.n_devices):
                     if len(np.unique(y_true[:, i])) >= 2:
-                        f1 = f1_score(y_true[:, i], y_pred_binary[:, i], average='binary')
-                        f1_scores.append(f1)
-                return np.mean(f1_scores) if f1_scores else 0.0
+                        f1 = f1_score(y_true[:, i], y_pred_binary[:, i], average='binary', sample_weight=w)
+                        f1_values.append(f1)
+                return float(np.mean(f1_values)) if f1_values else 0.0
             else:
-                return f1_score(y_true.flatten(), y_pred_binary.flatten(), average=average)
+                # 为简化，将样本权重按设备重复
+                rep_w = None if w is None else np.repeat(w, y_true.shape[1])
+                return float(f1_score(y_true.flatten(), y_pred_binary.flatten(), average=average, sample_weight=rep_w))
     
     def matthews_correlation_coefficient(self, y_pred_proba: torch.Tensor, y_true: torch.Tensor,
                                        thresholds: Optional[Dict[str, float]] = None,
@@ -244,10 +267,11 @@ class NILMMetrics:
                 return 0.0
     
     def precision_recall_auc(self, y_pred_proba: torch.Tensor, y_true: torch.Tensor,
-                           per_device: bool = False) -> Union[float, Dict[str, float]]:
+                           per_device: bool = False, sample_weights: Optional[torch.Tensor] = None) -> Union[float, Dict[str, float]]:
         """Precision-Recall AUC"""
         y_pred_proba = self._to_numpy(y_pred_proba)
         y_true = self._to_numpy(y_true)
+        w = None if sample_weights is None else self._to_numpy(sample_weights).reshape(-1)
         
         if per_device:
             pr_auc_scores = {}
@@ -257,28 +281,29 @@ class NILMMetrics:
                 else:
                     try:
                         from sklearn.metrics import average_precision_score
-                        pr_auc = average_precision_score(y_true[:, i], y_pred_proba[:, i])
-                        pr_auc_scores[device_name] = pr_auc
+                        pr_auc = average_precision_score(y_true[:, i], y_pred_proba[:, i], sample_weight=w)
+                        pr_auc_scores[device_name] = float(pr_auc)
                     except:
                         pr_auc_scores[device_name] = 0.0
             return pr_auc_scores
         else:
             try:
                 from sklearn.metrics import average_precision_score
-                pr_auc_scores = []
+                pr_auc_values = []
                 for i in range(self.n_devices):
                     if len(np.unique(y_true[:, i])) >= 2:
-                        pr_auc = average_precision_score(y_true[:, i], y_pred_proba[:, i])
-                        pr_auc_scores.append(pr_auc)
-                return np.mean(pr_auc_scores) if pr_auc_scores else 0.0
+                        pr_auc = average_precision_score(y_true[:, i], y_pred_proba[:, i], sample_weight=w)
+                        pr_auc_values.append(pr_auc)
+                return float(np.mean(pr_auc_values)) if pr_auc_values else 0.0
             except:
                 return 0.0
     
     def roc_auc(self, y_pred_proba: torch.Tensor, y_true: torch.Tensor,
-               per_device: bool = False) -> Union[float, Dict[str, float]]:
+               per_device: bool = False, sample_weights: Optional[torch.Tensor] = None) -> Union[float, Dict[str, float]]:
         """ROC AUC"""
         y_pred_proba = self._to_numpy(y_pred_proba)
         y_true = self._to_numpy(y_true)
+        w = None if sample_weights is None else self._to_numpy(sample_weights).reshape(-1)
         
         if per_device:
             roc_auc_scores = {}
@@ -287,19 +312,19 @@ class NILMMetrics:
                     roc_auc_scores[device_name] = 0.5
                 else:
                     try:
-                        roc_auc = roc_auc_score(y_true[:, i], y_pred_proba[:, i])
-                        roc_auc_scores[device_name] = roc_auc
+                        roc_auc = roc_auc_score(y_true[:, i], y_pred_proba[:, i], sample_weight=w)
+                        roc_auc_scores[device_name] = float(roc_auc)
                     except:
                         roc_auc_scores[device_name] = 0.5
             return roc_auc_scores
         else:
             try:
-                roc_auc_scores = []
+                roc_auc_values = []
                 for i in range(self.n_devices):
                     if len(np.unique(y_true[:, i])) >= 2:
-                        roc_auc = roc_auc_score(y_true[:, i], y_pred_proba[:, i])
-                        roc_auc_scores.append(roc_auc)
-                return np.mean(roc_auc_scores) if roc_auc_scores else 0.5
+                        roc_auc = roc_auc_score(y_true[:, i], y_pred_proba[:, i], sample_weight=w)
+                        roc_auc_values.append(roc_auc)
+                return float(np.mean(roc_auc_values)) if roc_auc_values else 0.5
             except:
                 return 0.5
     
@@ -382,7 +407,8 @@ class NILMMetrics:
     def compute_all_metrics(self, y_pred_power: torch.Tensor, y_pred_proba: torch.Tensor,
                           y_true_power: torch.Tensor, y_true_states: torch.Tensor,
                           optimize_thresholds: bool = True,
-                          classification_enabled: bool = True) -> Dict[str, Union[float, Dict[str, float]]]:
+                          classification_enabled: bool = True,
+                          sample_weights: Optional[torch.Tensor] = None) -> Dict[str, Union[float, Dict[str, float]]]:
         """计算所有指标"""
         metrics = {}
         
@@ -393,27 +419,27 @@ class NILMMetrics:
             except Exception:
                 pass
         
-        # 回归指标
-        metrics['mae'] = self.mean_absolute_error(y_pred_power, y_true_power)
-        metrics['mae_per_device'] = self.mean_absolute_error(y_pred_power, y_true_power, per_device=True)
-        metrics['nde'] = self.normalized_disaggregation_error(y_pred_power, y_true_power)
-        metrics['nde_per_device'] = self.normalized_disaggregation_error(y_pred_power, y_true_power, per_device=True)
-        metrics['sae'] = self.signal_aggregate_error(y_pred_power, y_true_power)
-        metrics['teca'] = self.total_energy_correctly_assigned(y_pred_power, y_true_power)
-        metrics['teca_per_device'] = self.total_energy_correctly_assigned(y_pred_power, y_true_power, per_device=True)
+        # 回归指标（支持样本权重）
+        metrics['mae'] = self.mean_absolute_error(y_pred_power, y_true_power, sample_weights=sample_weights)
+        metrics['mae_per_device'] = self.mean_absolute_error(y_pred_power, y_true_power, per_device=True, sample_weights=sample_weights)
+        metrics['nde'] = self.normalized_disaggregation_error(y_pred_power, y_true_power, sample_weights=sample_weights)
+        metrics['nde_per_device'] = self.normalized_disaggregation_error(y_pred_power, y_true_power, per_device=True, sample_weights=sample_weights)
+        metrics['sae'] = self.signal_aggregate_error(y_pred_power, y_true_power, sample_weights=sample_weights)
+        metrics['teca'] = self.total_energy_correctly_assigned(y_pred_power, y_true_power, sample_weights=sample_weights)
+        metrics['teca_per_device'] = self.total_energy_correctly_assigned(y_pred_power, y_true_power, per_device=True, sample_weights=sample_weights)
         
-        # 分类指标（可选）
+        # 分类指标（可选，支持样本权重）
         if classification_enabled:
             try:
-                metrics['f1'] = self.f1_score(y_pred_proba, y_true_states)
-                metrics['f1_per_device'] = self.f1_score(y_pred_proba, y_true_states, per_device=True)
+                metrics['f1'] = self.f1_score(y_pred_proba, y_true_states, sample_weights=sample_weights)
+                metrics['f1_per_device'] = self.f1_score(y_pred_proba, y_true_states, per_device=True, sample_weights=sample_weights)
                 metrics['mcc'] = self.matthews_correlation_coefficient(y_pred_proba, y_true_states)
                 metrics['mcc_per_device'] = self.matthews_correlation_coefficient(y_pred_proba, y_true_states, per_device=True)
-                metrics['pr_auc'] = self.precision_recall_auc(y_pred_proba, y_true_states)
-                metrics['pr_auc_per_device'] = self.precision_recall_auc(y_pred_proba, y_true_states, per_device=True)
-                metrics['roc_auc'] = self.roc_auc(y_pred_proba, y_true_states)
-                metrics['roc_auc_per_device'] = self.roc_auc(y_pred_proba, y_true_states, per_device=True)
-                # 事件检测指标
+                metrics['pr_auc'] = self.precision_recall_auc(y_pred_proba, y_true_states, sample_weights=sample_weights)
+                metrics['pr_auc_per_device'] = self.precision_recall_auc(y_pred_proba, y_true_states, per_device=True, sample_weights=sample_weights)
+                metrics['roc_auc'] = self.roc_auc(y_pred_proba, y_true_states, sample_weights=sample_weights)
+                metrics['roc_auc_per_device'] = self.roc_auc(y_pred_proba, y_true_states, per_device=True, sample_weights=sample_weights)
+                # 事件检测指标（不采用样本权重）
                 metrics['event_metrics'] = self.event_detection_metrics(y_pred_proba, y_true_states)
             except Exception:
                 pass
@@ -442,29 +468,13 @@ class NILMMetrics:
         for metric_name, weight in weights.items():
             if metric_name in metrics:
                 value = metrics[metric_name]
-                # 统一将 numpy 标量/torch 标量 转换为 Python float
-                try:
-                    if isinstance(value, (int, float)):
-                        val = float(value)
-                    elif isinstance(value, np.ndarray) and value.shape == ():
-                        val = float(value.item())
-                    elif isinstance(value, np.floating):
-                        val = float(value)
-                    elif torch.is_tensor(value) and value.dim() == 0:
-                        val = float(value.item())
-                    else:
-                        # 非标量（如字典/数组）不计入综合分
-                        continue
-                except Exception:
-                    continue
-                
-                if not np.isnan(val):
+                if isinstance(value, (int, float)) and not np.isnan(value):
                     if weight < 0:
                         # 对于越小越好的指标，使用负指数变换
-                        normalized_value = np.exp(-val)
+                        normalized_value = np.exp(-value)
                     else:
                         # 对于越大越好的指标，直接使用
-                        normalized_value = val
+                        normalized_value = value
                     
                     score += abs(weight) * normalized_value
                     total_weight += abs(weight)

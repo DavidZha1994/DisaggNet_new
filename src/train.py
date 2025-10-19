@@ -2,6 +2,9 @@
 
 import os
 import sys
+# macOS OpenMP workaround: avoid multiple runtime init errors
+if sys.platform == 'darwin':
+    os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
@@ -141,12 +144,28 @@ class NILMLightningModule(pl.LightningModule):
         # 训练状态
         self.automatic_optimization = True
 
+        # 新增：事件关注与可视化配置，以及序列例子缓冲
+        ev_cfg = getattr(getattr(config, 'training', None), 'event_focus', None)
+        self.event_focus_enable = bool(getattr(ev_cfg, 'enable', True) if ev_cfg is not None else True)
+        self.event_weight_factor = float(getattr(ev_cfg, 'weight', 2.0) if ev_cfg is not None else 2.0)
+        vis_cfg = getattr(getattr(config, 'training', None), 'visualization', None)
+        self.plot_event_only = bool(getattr(vis_cfg, 'plot_event_only', True) if vis_cfg is not None else True)
+        self.max_plots_per_epoch = int(getattr(vis_cfg, 'max_plots_per_epoch', 16) if vis_cfg is not None else 16)
+        # 指标零窗口权重（降低全零窗口影响）
+        eval_cfg = getattr(getattr(config, 'evaluation', None), 'zero_window_weight', None)
+        self.metrics_zero_weight = float(eval_cfg if eval_cfg is not None else 0.2)
+        self._sequence_examples: List[Dict[str, Any]] = []
+
     def _safe_log(self, name: str, value: Any, **kwargs) -> None:
         """在未附加 Trainer 的环境中安全地进行日志记录。
-        当 `self.trainer` 尚未注册时，直接跳过以避免 PyTorch Lightning 警告。
+        当未附加 Trainer 时，直接跳过以避免 PyTorch Lightning 报错。
         """
-        if getattr(self, 'trainer', None) is not None:
-            self.log(name, value, **kwargs)
+        # 避免触发 Lightning 的 `trainer` 属性访问（未附加时会抛错）
+        if getattr(self, '_trainer', None) is not None:
+            try:
+                self.log(name, value, **kwargs)
+            except Exception:
+                pass
         
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """前向传播"""
@@ -230,7 +249,19 @@ class NILMLightningModule(pl.LightningModule):
             # 占位，避免下游张量形状依赖；分类指标会被门控跳过
             pred_proba = torch.zeros_like(pred_states)
         
-        # 计算所有窗口级指标（传入分类开关）
+        # 计算所有窗口级指标（传入分类开关），并降低全零窗口权重
+        # 事件定义：只要原始窗口非全 0 即视为事件
+        try:
+            tf = batch.get('time_features', None)
+            if tf is not None:
+                nonzero_mask = (tf.abs().sum(dim=(1, 2)) > 1e-8)
+            else:
+                # 回退：根据目标功率非零判断
+                nonzero_mask = (target_power.abs().sum(dim=1) > 1e-8)
+            metric_weights = torch.where(nonzero_mask, torch.ones_like(nonzero_mask, dtype=torch.float32), torch.full_like(nonzero_mask, self.metrics_zero_weight, dtype=torch.float32))
+        except Exception:
+            metric_weights = None
+
         metrics = self.metrics.compute_all_metrics(
             y_pred_power=pred_power,
             y_pred_proba=pred_proba,
@@ -238,6 +269,7 @@ class NILMLightningModule(pl.LightningModule):
             y_true_states=target_states,
             optimize_thresholds=(stage == 'val'),
             classification_enabled=self.classification_enabled,
+            sample_weights=metric_weights
         )
         
         # 记录主要指标（统一为层级式标签，按 epoch 写入）
@@ -340,6 +372,60 @@ class NILMLightningModule(pl.LightningModule):
         
         return metrics
     
+    def _collect_sequence_examples(self, pred_seq: torch.Tensor, target_seq: torch.Tensor, batch: Dict[str, torch.Tensor], stage: str = 'val') -> None:
+        """收集用于可视化的序列样本，支持仅包含事件窗口，并加入主表原始波形。"""
+        try:
+            if not isinstance(pred_seq, torch.Tensor) or not isinstance(target_seq, torch.Tensor):
+                return
+            B = pred_seq.size(0)
+            import numpy as np
+            if self.plot_event_only and ('has_events' in batch):
+                mask = batch['has_events'].detach().cpu().numpy().astype(bool)
+            else:
+                mask = np.ones(B, dtype=bool)
+            for i in range(B):
+                if len(self._sequence_examples) >= self.max_plots_per_epoch:
+                    break
+                if not mask[i]:
+                    continue
+                ts = batch.get('timestamps', None)
+                # 构造时间戳，仅在长度与序列长度一致时保留，否则置为 None
+                timestamps = None
+                try:
+                    if isinstance(ts, torch.Tensor):
+                        ts_i = ts[i].detach().cpu().to(torch.float64)
+                        if ts_i.dim() == 0:
+                            ts_i = ts_i.view(1)
+                        L_i = pred_seq[i].size(0)
+                        if int(ts_i.numel()) == int(L_i):
+                            timestamps = ts_i
+                except Exception:
+                    timestamps = None
+                # 清理 NaN/Inf，保证绘图可见
+                p = pred_seq[i].detach().cpu().to(torch.float32)
+                t = target_seq[i].detach().cpu().to(torch.float32)
+                p = torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
+                t = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+                # 主表原始波形（来自 datamodule 提供的 mains_seq）
+                m = None
+                try:
+                    ms = batch.get('mains_seq', None)
+                    if isinstance(ms, torch.Tensor):
+                        mi = ms[i].detach().cpu().to(torch.float32)
+                        if mi.dim() == 1 and int(mi.numel()) == int(p.size(0)):
+                            m = torch.nan_to_num(mi, nan=0.0, posinf=0.0, neginf=0.0)
+                except Exception:
+                    m = None
+                example = {
+                    'pred': p,
+                    'target': t,
+                    'timestamps': timestamps,
+                    'mains': m,
+                }
+                self._sequence_examples.append(example)
+        except Exception:
+            pass
+
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         """训练步骤"""
         # 数据验证和NaN检测
@@ -413,6 +499,19 @@ class NILMLightningModule(pl.LightningModule):
                             weights_unclamped
                         )
 
+        # 事件窗口加权（保持0窗口也参与训练）
+        if self.event_focus_enable and ('has_events' in batch):
+            try:
+                ev_flag = batch['has_events']  # (B,) bool
+                ev_w = torch.where(ev_flag, torch.full_like(ev_flag, float(self.event_weight_factor), dtype=torch.float32), torch.ones_like(ev_flag, dtype=torch.float32))
+                ev_w = ev_w.float()
+                if sample_weights is None:
+                    sample_weights = ev_w
+                else:
+                    sample_weights = sample_weights * ev_w
+            except Exception:
+                pass
+
         losses = self._compute_loss(batch, predictions, 'train', sample_weights=sample_weights)
 
         # 序列→序列回归损失（替代窗口均值回归）
@@ -466,8 +565,8 @@ class NILMLightningModule(pl.LightningModule):
         self._validate_losses(losses, 'train', batch_idx)
         
         # 记录学习率（按 epoch），在未附加 Trainer 的单元测试场景下跳过
-        if getattr(self, 'trainer', None) is not None and getattr(self.trainer, 'optimizers', None):
-            self._safe_log('train/metrics/optimization/lr', self.trainer.optimizers[0].param_groups[0]['lr'], on_step=False, on_epoch=True)
+        if getattr(self, '_trainer', None) is not None and getattr(self._trainer, 'optimizers', None):
+            self._safe_log('train/metrics/optimization/lr', self._trainer.optimizers[0].param_groups[0]['lr'], on_step=False, on_epoch=True)
         
         # 每隔一定步数计算训练指标
         if batch_idx % self.config.training.log_every_n_steps == 0:
@@ -634,6 +733,11 @@ class NILMLightningModule(pl.LightningModule):
             element_loss = torch.where(valid, element_loss, torch.zeros_like(element_loss))
             denom = valid.float().sum().clamp_min(1.0)
             seq_loss = element_loss.sum() / denom
+            # 收集合适样本用于可视化对比
+            try:
+                self._collect_sequence_examples(pred_seq, target_seq, batch, stage='val')
+            except Exception:
+                pass
             self._safe_log('val/seq_regression', seq_loss, on_step=False, on_epoch=True)
             losses['total'] = losses['total'] + seq_loss
         # 在添加序列损失后再进行损失有效性校验
@@ -749,6 +853,44 @@ class NILMLightningModule(pl.LightningModule):
     
     def on_validation_epoch_end(self) -> None:
         """验证轮次结束"""
+        # 序列对比可视化：绘制预测 vs 标签，并叠加主表原始波形
+        try:
+            if getattr(self, 'logger', None) is not None and len(self._sequence_examples) > 0:
+                import matplotlib.pyplot as plt
+                import numpy as np
+                from datetime import datetime
+                import matplotlib.dates as mdates
+                for idx, ex in enumerate(self._sequence_examples[:self.max_plots_per_epoch]):
+                    pred = ex['pred']
+                    target = ex['target']
+                    L = pred.size(0)
+                    K = pred.size(1) if pred.dim() == 2 else 1
+                    fig = plt.figure(figsize=(12, 3 + 1.5*K))
+                    for k in range(K):
+                        ax = fig.add_subplot(K, 1, k+1)
+                        ts = ex.get('timestamps', None)
+                        if ts is not None and hasattr(ts, 'numel') and int(ts.numel()) == int(L):
+                            ts_np = ts.view(-1).detach().cpu().numpy()
+                            x = [datetime.fromtimestamp(float(v)) for v in ts_np]
+                            ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=5, maxticks=10))
+                            ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+                        else:
+                            x = np.arange(L)
+                        y_pred = pred[:, k].numpy() if K > 1 else (pred[:, 0].numpy() if pred.dim() == 2 else pred.numpy())
+                        y_true = target[:, k].numpy() if K > 1 else (target[:, 0].numpy() if target.dim() == 2 else target.numpy())
+                        mains = ex.get('mains', None)
+                        if mains is not None and int(mains.numel()) == int(L):
+                            ax.plot(x, mains.numpy(), label='mains', color='tab:orange', linewidth=1.0, alpha=0.6)
+                        ax.plot(x, y_true, label='label', color='black', linewidth=1.2)
+                        ax.plot(x, y_pred, label='pred', color='tab:blue', linewidth=1.2, alpha=0.8)
+                        ax.set_title(f'Device {k}')
+                        ax.legend(loc='upper right')
+                    fig.autofmt_xdate()
+                    self.logger.experiment.add_figure(f'val/visualization/sequence/sample_{idx}', fig, self.current_epoch)
+                    plt.close(fig)
+                self._sequence_examples.clear()
+        except Exception as e:
+            print(f"sequence visualization failed: {e}")
         # 获取当前验证分数（兼容旧键名）
         current_score = self.trainer.callback_metrics.get('val/score', None)
         if current_score is None:
@@ -771,7 +913,7 @@ class NILMLightningModule(pl.LightningModule):
             
             # 记录最佳阈值
             for device_name, threshold in self.best_thresholds.items():
-                self._safe_log(f'best_threshold/{device_name}', threshold, on_epoch=True)
+                self._safe_log(f'val/best_threshold/{device_name}', threshold, on_epoch=True)
 
             # 持久化保存最佳阈值
             try:
@@ -1122,16 +1264,20 @@ def create_trainer(config: DictConfig, logger: Optional[pl.loggers.Logger] = Non
     if multi_gpu:
         strategy = DDPStrategy(find_unused_parameters=False)
     
-    # 精度配置 - 自动选择（GPU优先BF16，其次FP16；MPS使用FP16混合）
-    if hasattr(config.training, 'precision'):
-        precision = config.training.precision
-    else:
-        if accelerator == 'gpu':
-            precision = 'bf16-mixed' if torch.cuda.is_bf16_supported() else '16-mixed'
-        elif accelerator == 'mps':
+    # 精度配置 - 环境感知与兼容修正（GPU优先BF16，其次FP16；MPS使用FP16混合；CPU用FP32）
+    requested_precision = getattr(getattr(config, 'training', None), 'precision', None)
+    if accelerator == 'gpu':
+        auto_precision = 'bf16-mixed' if torch.cuda.is_bf16_supported() else '16-mixed'
+        precision = requested_precision or auto_precision
+    elif accelerator == 'mps':
+        # MPS 不支持 BF16 混合精度；若用户显式指定不兼容精度，则回退到 16-mixed
+        if requested_precision in (None, 'bf16-mixed'):
             precision = '16-mixed'
         else:
-            precision = '32'
+            precision = requested_precision
+    else:
+        # CPU 上强制使用 32 位精度，避免 AMP 不支持导致训练失败
+        precision = '32'
     
     # 创建训练器
     trainer = pl.Trainer(
@@ -1195,59 +1341,59 @@ def setup_logging(config: DictConfig, experiment_name: str) -> TensorBoardLogger
 
 def load_device_info(config: DictConfig) -> Tuple[Dict, List[str]]:
     """加载设备信息。
-    优先从 Data/prepared/device_name_to_id.json 推断设备名称；若不可用则回退到配置中的 data.device_names。
+    优先使用配置中的 data.device_names；若未提供，则尝试从 Data/prepared/device_name_to_id.json 推断。
     """
     # 推断 prepared 数据目录
     try:
         prepared_dir = Path(getattr(config.paths, 'prepared_dir'))
     except Exception:
         prepared_dir = Path('Data/prepared')
-    mapping_path = prepared_dir / 'device_name_to_id.json'
 
-    device_names: List[str] = []
-    # 若存在映射文件，按 id 顺序解析设备名称
-    if mapping_path.exists():
-        try:
-            with open(mapping_path, 'r') as f:
-                mapping = json.load(f)
+    # 若配置显式提供了设备名称，则直接使用（用于测试/最小配置场景）
+    try:
+        cfg_names = list(getattr(getattr(config, 'data', {}), 'device_names', []) or [])
+    except Exception:
+        cfg_names = []
+    if cfg_names:
+        device_names: List[str] = cfg_names
+    else:
+        mapping_path = prepared_dir / 'device_name_to_id.json'
+        device_names: List[str] = []
+        # 若存在映射文件，按 id 顺序解析设备名称
+        if mapping_path.exists():
+            try:
+                with open(mapping_path, 'r') as f:
+                    mapping = json.load(f)
 
-            def _to_int(x):
-                try:
-                    return int(x)
-                except Exception:
-                    return None
+                def _to_int(x):
+                    try:
+                        return int(x)
+                    except Exception:
+                        return None
 
-            sample_key = next(iter(mapping.keys()))
-            sample_val = mapping[sample_key]
-            key_is_int_like = _to_int(sample_key) is not None
-            val_is_int_like = _to_int(sample_val) is not None
+                sample_key = next(iter(mapping.keys()))
+                sample_val = mapping[sample_key]
+                key_is_int_like = _to_int(sample_key) is not None
+                val_is_int_like = _to_int(sample_val) is not None
 
-            if key_is_int_like and not val_is_int_like:
-                # id(str)->name(str)
-                pairs = sorted(((int(k), v) for k, v in mapping.items()), key=lambda kv: kv[0])
-                device_names = [name for _, name in pairs]
-            elif not key_is_int_like and val_is_int_like:
-                # name->id
-                pairs = sorted(((v, k) for k, v in mapping.items()), key=lambda kv: kv[0])
-                device_names = [name for _, name in pairs]
-            else:
-                # 回退：按键排序
-                device_names = sorted(list(mapping.keys()))
-        except Exception as e:
-            print(f"[警告] 解析 {mapping_path} 失败，回退到配置 data.device_names：{e}")
+                if key_is_int_like and not val_is_int_like:
+                    # id(str)->name(str)
+                    pairs = sorted(((int(k), v) for k, v in mapping.items()), key=lambda kv: kv[0])
+                    device_names = [name for _, name in pairs]
+                elif not key_is_int_like and val_is_int_like:
+                    # name->id
+                    pairs = sorted(((v, k) for k, v in mapping.items()), key=lambda kv: kv[0])
+                    device_names = [name for _, name in pairs]
+                else:
+                    # 回退：按键排序
+                    device_names = sorted(list(mapping.keys()))
+            except Exception as e:
+                print(f"[警告] 解析 {mapping_path} 失败，回退到默认设备名称：{e}")
 
-    # 若未能从映射获取，或设备列表为空，则使用配置中的 device_names
-    if not device_names:
-        try:
-            cfg_names = list(getattr(getattr(config, 'data', {}), 'device_names', []) or [])
-        except Exception:
-            cfg_names = []
-        device_names = cfg_names
-
-    # 若仍为空，构造占位名称
-    if not device_names:
-        device_names = ['device_1']
-        print('[警告] 未能推断设备名称，使用占位 device_1')
+        # 若仍为空，构造占位名称
+        if not device_names:
+            device_names = ['device_1']
+            print('[警告] 未能推断设备名称，使用占位 device_1')
 
     # 构造设备信息字典（默认值，后续会由数据模块注入 pos_weight 等）
     device_info: Dict[int, Dict[str, Any]] = {}

@@ -25,9 +25,7 @@ loss:
   # Huber Loss参数
   huber_delta: 1.0             # Huber Loss delta参数
 
-# 评估与策略
-evaluation:
-  threshold_method: "optimal"
+# 评估与策略（见文件末尾统一定义）
 
 # 模型配置
 model:
@@ -72,6 +70,16 @@ training:
     combine_modalities: "min"
     downweight_power: 1.0
     epsilon: 0.0
+  
+  # 事件关注配置（用于训练期提升含事件样本的权重）
+  event_focus:
+    enable: true
+    weight: 2.0
+  
+  # 训练期可视化设置（仅绘制含事件窗口以便快速对齐）
+  visualization:
+    plot_event_only: true
+    max_plots_per_epoch: 16
 
 # 不平衡处理（数据模块读取）
 imbalance_handling:
@@ -117,3 +125,9 @@ reproducibility:
   seed: 42
   deterministic: false
   benchmark: true
+
+# 评估与策略
+evaluation:
+  threshold_method: "optimal"
+  # 降低全零窗口在指标计算中的权重（0~1）
+  zero_window_weight: 0.2

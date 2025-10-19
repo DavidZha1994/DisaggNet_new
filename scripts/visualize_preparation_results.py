@@ -129,13 +129,18 @@ def visualize_prepared(prep_dir: str, out_dir: str):
             total = labels.sum(axis=1)
         else:
             total = labels
-        plt.figure(figsize=(8, 4))
-        plt.hist(total, bins=50)
-        plt.xlabel('labels_total')
-        plt.ylabel('count')
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, 'labels_total_hist.png'))
-        plt.close()
+        total = np.asarray(total)
+        # 过滤掉 NaN/Inf，避免绘图报错
+        finite_mask = np.isfinite(total)
+        if finite_mask.any():
+            total_clean = total[finite_mask]
+            plt.figure(figsize=(8, 4))
+            plt.hist(total_clean, bins=50)
+            plt.xlabel('labels_total')
+            plt.ylabel('count')
+            plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, 'labels_total_hist.png'))
+            plt.close()
         if labels.ndim == 2 and labels.shape[1] > 0:
             means = labels.mean(axis=0)
             plt.figure(figsize=(8, 4))
@@ -150,11 +155,12 @@ def visualize_prepared(prep_dir: str, out_dir: str):
     train_counts, val_counts, fids = [], [], []
     for fd in folds:
         fdir = os.path.join(prep_dir, fd)
-        tri = os.path.join(fdir, 'train_indices.npy')
-        vai = os.path.join(fdir, 'val_indices.npy')
+        tri = os.path.join(fdir, 'train_indices.pt')
+        vai = os.path.join(fdir, 'val_indices.pt')
         if os.path.exists(tri) and os.path.exists(vai):
-            train_counts.append(len(np.load(tri)))
-            val_counts.append(len(np.load(vai)))
+            import torch
+            train_counts.append(len(torch.load(tri)))
+            val_counts.append(len(torch.load(vai)))
             fids.append(fd)
     if fids:
         x = np.arange(len(fids))
@@ -170,10 +176,12 @@ def visualize_prepared(prep_dir: str, out_dir: str):
         plt.close()
     # samples from fold_0
     f0 = os.path.join(prep_dir, 'fold_0')
-    tr_raw = os.path.join(f0, 'train_raw.npy')
-    tr_freq = os.path.join(f0, 'train_freq.npy')
+    tr_raw = os.path.join(f0, 'train_raw.pt')
+    tr_freq = os.path.join(f0, 'train_freq.pt')
     if os.path.exists(tr_raw):
-        raw = np.load(tr_raw)
+        import torch
+        raw_t = torch.load(tr_raw)
+        raw = raw_t.detach().cpu().numpy() if hasattr(raw_t, 'detach') else raw_t
         n = min(3, raw.shape[0])
         fig, axes = plt.subplots(n, 1, figsize=(10, 3*n), sharex=True)
         ch = 0
@@ -185,7 +193,9 @@ def visualize_prepared(prep_dir: str, out_dir: str):
         fig.savefig(os.path.join(out_dir, 'fold0_train_raw_PkW_samples.png'))
         plt.close(fig)
     if os.path.exists(tr_freq):
-        freq = np.load(tr_freq)
+        import torch
+        freq_t = torch.load(tr_freq)
+        freq = freq_t.detach().cpu().numpy() if hasattr(freq_t, 'detach') else freq_t
         if freq.ndim == 3 and freq.shape[0] > 0:
             plt.figure(figsize=(8, 4))
             plt.imshow(freq[0].T, aspect='auto', origin='lower', cmap='magma')
