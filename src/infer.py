@@ -12,7 +12,6 @@ from collections import deque
 import time
 from datetime import datetime, timedelta
 import json
-import pickle
 from omegaconf import DictConfig, OmegaConf
 import warnings
 warnings.filterwarnings('ignore')
@@ -21,7 +20,6 @@ warnings.filterwarnings('ignore')
 sys.path.append(str(Path(__file__).parent.parent))
 
 from src.train import NILMLightningModule
-from src.data.industrial_pipeline import IndustrialDataPipeline  # 使用新的工业级流水线
 from src.utils.metrics import ConsistencyMetrics
 from src.utils.conformal_prediction import MultiTaskConformalPredictor
 from src.utils.conformal_evaluation import ConformalEvaluator
@@ -320,8 +318,8 @@ class RealTimeInferenceEngine:
         buffer_size = self.config.inference.buffer_size
         self.buffer = CircularBuffer(buffer_size)
         
-        # 工业级数据流水线（用于特征工程）
-        self.data_pipeline = IndustrialDataPipeline(self.config)
+        # 特征提取配置
+        self.feature_config = self.config.data.features if hasattr(self.config.data, 'features') else None
         
         # 增量STFT
         if self.config.data.features.freq_domain.enable:
@@ -495,20 +493,31 @@ class RealTimeInferenceEngine:
     
     def _extract_features(self, window_data: np.ndarray, timestamps: List[datetime]) -> Dict[str, torch.Tensor]:
         """提取特征：时域、频域与时间位置编码"""
-        feats = self.data_pipeline.prepare_features(window_data, timestamps)
         out: Dict[str, torch.Tensor] = {}
-        # 时域
-        time_feats = feats.get('time_features')  # torch.Tensor (1, T, C)
-        if time_feats is not None:
-            out['time_features'] = time_feats.to(self.device)
+        
+        # 时域特征 - 直接使用窗口数据
+        out['time_features'] = torch.from_numpy(window_data).float().unsqueeze(0).to(self.device)
+        
+        # 频域特征 - 如果启用STFT
+        if self.stft_computer is not None:
+            try:
+                # 使用增量STFT计算频域特征
+                freq_data = self.stft_computer.compute_stft(window_data)
+                if freq_data is not None:
+                    out['freq_features'] = torch.from_numpy(freq_data).float().unsqueeze(0).to(self.device)
+                else:
+                    out['freq_features'] = None
+            except Exception as e:
+                print(f"频域特征计算失败: {e}")
+                out['freq_features'] = None
         else:
-            out['time_features'] = torch.from_numpy(window_data).float().unsqueeze(0).to(self.device)
-        # 频域
-        freq_feats = feats.get('freq_features')  # torch.Tensor or None
-        out['freq_features'] = (freq_feats.to(self.device) if freq_feats is not None else None)
-        # 时间位置编码
-        time_pos = feats.get('time_positional')  # torch.Tensor (1, T)
-        out['time_positional'] = (time_pos.to(self.device) if time_pos is not None else None)
+            out['freq_features'] = None
+        
+        # 时间位置编码 - 简单的序列位置
+        seq_len = window_data.shape[0]
+        time_pos = torch.arange(seq_len, dtype=torch.float32).unsqueeze(0).to(self.device)
+        out['time_positional'] = time_pos
+        
         # 辅助特征占位
         out['aux_features'] = None
         return out

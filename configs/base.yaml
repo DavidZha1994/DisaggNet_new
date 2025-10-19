@@ -20,8 +20,8 @@ logging:
 
 # 数据设置
 data:
-  batch_size: 256
-  num_workers: 4
+  batch_size: 512
+  num_workers: 8
   pin_memory: true
   device_names: ["device_1"]
   window_size: 256
@@ -64,7 +64,7 @@ model:
 # 训练设置
 training:
   max_epochs: 50
-  precision: "16-mixed"
+  precision: "auto"
   log_every_n_steps: 10
   min_epochs: 1
   gradient_clip_val: 0.5
@@ -73,6 +73,10 @@ training:
   accelerator: "auto"
   devices: auto
   monitor_device_stats: false
+  visualization:
+    enable: false
+    plot_event_only: true
+    max_plots_per_epoch: 0
   optimizer:
     name: "adamw"
     lr: 0.001

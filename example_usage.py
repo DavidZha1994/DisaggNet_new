@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 # 添加项目根目录到Python路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from src.data_preparation import DataPreparationPipeline
+from src.data_preparation import HIPEDataPreparationPipeline
 
 def create_sample_data():
     """创建示例数据"""
@@ -154,7 +154,7 @@ def example_1_basic_usage():
         print("请先运行数据准备流程创建配置文件")
         return
     
-    pipeline = DataPreparationPipeline(config_path)
+    pipeline = HIPEDataPreparationPipeline(config_path)
     
     # 设置输出目录
     output_dir = "Data/prepared_sample"
@@ -188,7 +188,7 @@ def example_2_load_and_use_data():
         print(f"错误: 配置文件 {config_path} 不存在")
         return
     
-    pipeline = DataPreparationPipeline(config_path)
+    pipeline = HIPEDataPreparationPipeline(config_path)
     pipeline.output_dir = "Data/prepared_sample"
     
     # 检查是否有处理后的数据
@@ -259,7 +259,7 @@ def example_3_model_training_simulation():
     
     # 使用流程的评估功能
     config_path = "config/prep_config.yaml"
-    pipeline = DataPreparationPipeline(config_path)
+    pipeline = HIPEDataPreparationPipeline(config_path)
     pipeline.output_dir = "Data/prepared_sample"
     
     try:
@@ -306,7 +306,7 @@ def example_4_cross_validation():
         print(f"错误: 配置文件 {config_path} 不存在")
         return
     
-    pipeline = DataPreparationPipeline(config_path)
+    pipeline = HIPEDataPreparationPipeline(config_path)
     pipeline.output_dir = "Data/prepared_sample"
     
     # 检查有多少折

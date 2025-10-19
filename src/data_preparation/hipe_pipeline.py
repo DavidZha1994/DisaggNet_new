@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 import yaml
+from concurrent.futures import ThreadPoolExecutor
 
 
 @dataclass
@@ -84,310 +85,22 @@ class HIPEDataPreparationPipeline:
         )
         os.makedirs(self.output_dir, exist_ok=True)
         self.summary_: Dict = {}
+        # 计算加速配置
+        compute_cfg = self.config.get("compute") or {}
+        n_jobs_cfg = int(compute_cfg.get("n_jobs", 1))
+        if n_jobs_cfg == -1:
+            n_jobs_cfg = max(1, os.cpu_count() or 1)
+        self.n_jobs = n_jobs_cfg
+        self.use_polars = bool(compute_cfg.get("use_polars", False))
 
     def get_pipeline_summary(self) -> Dict:
         return self.summary_.copy()
 
-    # [已移除重复的旧版 run_full_pipeline，以下为最新实现]
-
-        return self.summary_.copy()
-
-    # ------------------------
-    # 读取与对齐
-    # ------------------------
-    def _find_mains_file(self, root: str) -> Optional[str]:
-        fp = os.path.join(root, self.hipe.mains_file)
-        if os.path.exists(fp):
-            return fp
-        # fallback: 任何含 main 的 csv
-        for cand in glob.glob(os.path.join(root, "*.csv")):
-            if "main" in os.path.basename(cand).lower():
-                return cand
-        return None
-
-    def _find_device_files(self, root: str) -> List[str]:
-        fps = glob.glob(os.path.join(root, self.hipe.device_pattern))
-        mains = self._find_mains_file(root)
-        mains_abs = os.path.abspath(mains) if mains else None
-        # 从匹配结果中排除主表文件（避免作为设备并入）
-        if mains_abs is not None:
-            fps = [f for f in fps if os.path.abspath(f) != mains_abs]
-        # fallback: 除 mains 外的其余 csv
-        if not fps:
-            candidates = glob.glob(os.path.join(root, "*.csv"))
-            if mains_abs is not None:
-                candidates = [f for f in candidates if os.path.abspath(f) != mains_abs]
-            fps = candidates
-        # 去重并排序
-        fps = sorted(set(fps))
-        return fps
-
-    def _read_mains(self, fp: str) -> pd.DataFrame:
-        # 仅读取必要列以降低内存占用
-        try:
-            header = pd.read_csv(fp, nrows=0).columns.tolist()
-        except Exception:
-            header = None
-        ts_col = self.hipe.timestamp_col
-        rename_map = self.hipe.mains_cols or {}
-        candidate = set([ts_col, "ts_utc", "SensorDateTime", "P_kW", "Q_kvar", "S_kVA", "PF"]) | set(rename_map.values() or [])
-        usecols = None
-        if header is not None:
-            usecols = [c for c in header if c in candidate]
-            # 若时间列缺失，则允许读全部以便回退重命名
-            if ts_col not in usecols and ("ts_utc" not in usecols and "SensorDateTime" not in usecols):
-                usecols = None
-        # 优先尝试使用 polars.scan_csv 流式读取，失败则回退 pandas
-        try:
-            import polars as pl
-            lf = pl.scan_csv(fp)
-            if usecols is not None:
-                lf = lf.select(usecols)
-            # 在流式阶段对常用数值列降精度为 Float32
-            num_cols = [c for c in ["P_kW", "Q_kvar", "S_kVA", "PF"] if c in lf.columns]
-            if num_cols:
-                lf = lf.with_columns([pl.col(c).cast(pl.Float32) for c in num_cols])
-            df = lf.collect(streaming=True).to_pandas()
-        except Exception:
-            df = pd.read_csv(fp, usecols=usecols)
-        # 解析时间列（支持回退）
-        if ts_col not in df.columns:
-            for fallback in ["ts_utc", "SensorDateTime"]:
-                if fallback in df.columns:
-                    df = df.rename(columns={fallback: ts_col})
-                    break
-        if ts_col not in df.columns:
-            raise KeyError(f"主端 CSV 缺少时间列: {ts_col}")
-        s = pd.to_datetime(df[ts_col], unit="s", errors="coerce")
-        if s.isna().any():
-            s = pd.to_datetime(df[ts_col], errors="coerce", utc=True)
-            try:
-                s = s.dt.tz_convert(None)
-            except Exception:
-                pass
-        df[ts_col] = s
-        df = df[df[ts_col].notna()].copy()
-        # 数值列降为 float32
-        for c in list(df.columns):
-            if c != ts_col and np.issubdtype(df[c].dtype, np.number):
-                df[c] = pd.to_numeric(df[c], errors="coerce").astype(np.float32)
-        return df
-
-    def _read_devices(self, fps: List[str]) -> Tuple[List[pd.DataFrame], List[str]]:
-        dev_dfs = []
-        names = []
-        for fp in fps:
-            name = os.path.splitext(os.path.basename(fp))[0]
-            # 仅读取必要列以降低内存占用
-            try:
-                header = pd.read_csv(fp, nrows=0).columns.tolist()
-            except Exception:
-                header = None
-            ts_col = self.hipe.timestamp_col
-            # 设备列既考虑原始键（如 P/Q/S），也考虑规范名（P_W/Q_var/S_VA）
-            dev_map = self.hipe.device_cols or {"P": "P_W", "Q": "Q_var", "S": "S_VA"}
-            wanted = set([ts_col, "ts_utc", "SensorDateTime", "P", "Q", "S", "P_W", "Q_var", "S_VA"]) | set(dev_map.keys()) | set(dev_map.values())
-            usecols = None
-            if header is not None:
-                usecols = [c for c in header if c in wanted]
-                if ts_col not in usecols and ("ts_utc" not in usecols and "SensorDateTime" not in usecols):
-                    usecols = None
-            # 优先尝试使用 polars.scan_csv 流式读取，失败则回退 pandas
-            try:
-                import polars as pl
-                lf = pl.scan_csv(fp)
-                if usecols is not None:
-                    lf = lf.select(usecols)
-                num_cols = [c for c in ["P", "Q", "S", "P_W", "Q_var", "S_VA"] if c in lf.columns]
-                if num_cols:
-                    lf = lf.with_columns([pl.col(c).cast(pl.Float32) for c in num_cols])
-                df = lf.collect(streaming=True).to_pandas()
-            except Exception:
-                df = pd.read_csv(fp, usecols=usecols)
-            if ts_col not in df.columns:
-                for fallback in ["ts_utc", "SensorDateTime"]:
-                    if fallback in df.columns:
-                        df = df.rename(columns={fallback: ts_col})
-                        break
-            if ts_col not in df.columns:
-                raise KeyError(f"设备 CSV 缺少时间列: {ts_col}")
-            s = pd.to_datetime(df[ts_col], unit="s", errors="coerce")
-            if s.isna().any():
-                s = pd.to_datetime(df[ts_col], errors="coerce", utc=True)
-                try:
-                    s = s.dt.tz_convert(None)
-                except Exception:
-                    pass
-            df[ts_col] = s
-            df = df[df[ts_col].notna()].copy()
-            # 数值列降为 float32
-            for c in list(df.columns):
-                if c != ts_col and np.issubdtype(df[c].dtype, np.number):
-                    df[c] = pd.to_numeric(df[c], errors="coerce").astype(np.float32)
-            dev_dfs.append(df)
-            names.append(name)
-        return dev_dfs, names
-
-    def _align_and_merge(self, df_main: pd.DataFrame, dev_dfs: List[pd.DataFrame], names: List[str]) -> Tuple[pd.DataFrame, Dict[int, str]]:
-        # 以主端时间为基准，按秒级重采样并保持索引为统一时间轴
-        ts_col = self.hipe.timestamp_col
-        df_main = df_main.sort_values(ts_col).set_index(ts_col).resample(f"{self.hipe.resample_seconds}s").mean(numeric_only=True)
-        # 主端列重命名/选择
-        rename_map = self.hipe.mains_cols or {}
-        for k, v in rename_map.items():
-            if v in df_main.columns:
-                df_main = df_main.rename(columns={v: k})
-        for col in ["P_kW", "Q_kvar", "S_kVA", "PF"]:
-            if col not in df_main.columns:
-                df_main[col] = 0.0
-        # 仅保留需要的主端列以降低内存占用
-        df_main = df_main[["P_kW", "Q_kvar", "S_kVA", "PF"]]
-
-        # 合并设备功率到主端时间轴
-        merged = df_main.copy()
-        label_map: Dict[int, str] = {}
-        for i, (df_dev, name) in enumerate(zip(dev_dfs, names)):
-            dev_res = df_dev.sort_values(ts_col).set_index(ts_col).resample(f"{self.hipe.resample_seconds}s").mean(numeric_only=True)
-            # 对齐到主端索引（统一长度，避免赋值长度不匹配）
-            dev_res = dev_res.reindex(merged.index)
-            # 设备列重命名
-            for dev_col, canon in (self.hipe.device_cols or {}).items():
-                if dev_col in dev_res.columns:
-                    dev_res = dev_res.rename(columns={dev_col: f"{name}_{canon}"})
-            # 仅保留需要的设备列以降低内存占用
-            needed = [f"{name}_{c}" for c in ["P_W", "Q_var", "S_VA"] if f"{name}_{c}" in dev_res.columns]
-            if needed:
-                dev_res = dev_res[needed]
-            # 仅并入 P/Q/S（保留缺失为 NaN 以支持掩码）
-            for canon in ["P_W", "Q_var", "S_VA"]:
-                colname = f"{name}_{canon}"
-                if colname not in dev_res.columns:
-                    # 保留为 NaN，避免将缺失误当作 0
-                    dev_res[colname] = np.nan
-                # 不填充 0，直接转为 float32，NaN 原样保留
-                merged[colname] = pd.to_numeric(dev_res[colname], errors="coerce").to_numpy(dtype=np.float32)
-            label_map[i] = name
-        merged = merged.reset_index()
-        return merged, label_map
-
-    # ------------------------
-    # 特征与目标
-    # ------------------------
-    def _build_mains_features(self, df: pd.DataFrame) -> np.ndarray:
-        # 仅保留总表的 P/Q/S 通道，确保与目标数据类型一致
-        arrs = []
-        for col in ["P_kW", "Q_kvar", "S_kVA"]:
-            if col in df.columns:
-                arrs.append(df[col].to_numpy(dtype=np.float32))
-            else:
-                arrs.append(np.zeros(len(df), dtype=np.float32))
-        X = np.stack(arrs, axis=1)  # [T,3]
-        return X
-
-    def _build_targets(self, df: pd.DataFrame, names: List[str], kind: str = "P") -> np.ndarray:
-        cols = [f"{name}_{'P_W' if kind=='P' else ('Q_var' if kind=='Q' else 'S_VA')}" for name in names]
-        arrs = []
-        for c in cols:
-            arrs.append(df[c].to_numpy(dtype=np.float32) if c in df.columns else np.zeros(len(df), dtype=np.float32))
-        return np.stack(arrs, axis=1)  # [T,K]
-
-    def _slide_window(self, X: np.ndarray, Yp: np.ndarray, L: int, H: int, starts_override: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        '''滑窗切片，返回 X/Y 序列与起始索引。兼容空窗口情况。支持在内存压力大时使用 np.memmap 预分配。'''
-        n = X.shape[0]
-        starts = starts_override if starts_override is not None else np.arange(0, max(0, n - L + 1), H, dtype=np.int64)
-        N = starts.size
-        if N == 0:
-            X_seq = np.empty((0, L, X.shape[1]), dtype=np.float32)
-            Yp_seq = np.empty((0, L, Yp.shape[1]), dtype=np.float32)
-            return X_seq, Yp_seq, starts
-        C = int(X.shape[1])
-        K = int(Yp.shape[1])
-        bytes_needed = int(N) * int(L) * (int(C) + int(K)) * 4
-        # 默认阈值约 6GB，可通过环境变量覆盖
-        mem_limit = int(os.environ.get("HIPE_MEMMAP_LIMIT_BYTES", str(6_000_000_000)))
-        use_memmap = bytes_needed > mem_limit
-        if use_memmap:
-            tmp_dir = os.path.join(self.output_dir, "_tmp_windows")
-            os.makedirs(tmp_dir, exist_ok=True)
-            x_path = os.path.join(tmp_dir, "X_seq.dat")
-            y_path = os.path.join(tmp_dir, "Yp_seq.dat")
-            X_seq = np.memmap(x_path, dtype=np.float32, mode="w+", shape=(N, L, C))
-            Yp_seq = np.memmap(y_path, dtype=np.float32, mode="w+", shape=(N, L, K))
-            for i, s in enumerate(starts):
-                X_seq[i, :, :] = X[s:s+L].astype(np.float32)
-                Yp_seq[i, :, :] = Yp[s:s+L].astype(np.float32)
-            X_seq.flush()
-            Yp_seq.flush()
-        else:
-            # 直接预分配目标数组，避免列表累积后 stack 的峰值内存
-            X_seq = np.empty((N, L, C), dtype=np.float32)
-            Yp_seq = np.empty((N, L, K), dtype=np.float32)
-            for i, s in enumerate(starts):
-                X_seq[i, :, :] = X[s:s+L].astype(np.float32)
-                Yp_seq[i, :, :] = Yp[s:s+L].astype(np.float32)
-        return X_seq, Yp_seq, starts
-
-    def _repair_small_gaps(self, df: pd.DataFrame) -> pd.DataFrame:
-        '''填补较小缺口（秒级到分钟级），保留较大缺口为 NaN 以便后续窗口丢弃。'''
-        cfg = self.config.get('segmentation', {})
-        ts_col = self.hipe.timestamp_col
-        small_gap_seconds = int(cfg.get('small_gap_threshold_seconds', 60))
-        resample_s = max(1, int(self.hipe.resample_seconds))
-        limit = max(1, small_gap_seconds // resample_s)
-
-        df2 = df.copy()
-        if ts_col in df2.columns:
-            df2[ts_col] = pd.to_datetime(df2[ts_col])
-            df2 = df2.set_index(ts_col)
-        # 仅对数值列进行插值与受限填充
-        num_cols = [c for c in df2.columns if np.issubdtype(df2[c].dtype, np.number)]
-        if num_cols:
-            # 时间插值（基于 DatetimeIndex）
-            df2[num_cols] = df2[num_cols].interpolate(method='time', limit=limit, limit_direction='both')
-            # 受限前填与后填
-            df2[num_cols] = df2[num_cols].fillna(method='ffill', limit=limit)
-            df2[num_cols] = df2[num_cols].fillna(method='bfill', limit=limit)
-        # 恢复时间列
-        if ts_col not in df2.columns:
-            df2 = df2.reset_index()
-        return df2
-
-    def _valid_window_mask(self, df: pd.DataFrame, starts: np.ndarray, L: int) -> np.ndarray:
-        '''窗口有效性判断：若窗内存在未修复的 NaN（表示跨越较大中断），则标记为无效。'''
-        ts_col = self.hipe.timestamp_col
-        num_cols = [c for c in df.columns if c != ts_col and np.issubdtype(df[c].dtype, np.number)]
-        n = len(starts)
-        valid = np.ones(n, dtype=bool)
-        for i, s in enumerate(starts):
-            win = df.iloc[s:s+L]
-            if num_cols and win[num_cols].isna().any().any():
-                valid[i] = False
-        return valid
-
-    def _valid_window_mask_by_ratio(self, Yp_full: np.ndarray, starts: np.ndarray, L: int, min_ratio: float = 0.8) -> np.ndarray:
-        '''基于设备有效点比例的窗口过滤：至少有一个设备在该窗口的有效比例 >= min_ratio 才保留。全局无设备数据则全部保留。'''
-        n = len(starts)
-        valid = np.ones(n, dtype=bool)
-        if Yp_full.size == 0:
-            return valid
-        # 全局设备有效性：有无任何非 NaN 样本
-        global_has_data = np.sum(~np.isnan(Yp_full), axis=0) > 0  # [K]
-        for i, s in enumerate(starts):
-            win = Yp_full[s:s+L, :]  # [L,K]
-            count_valid = np.sum(~np.isnan(win), axis=0)  # 每设备有效点数
-            ratio = count_valid.astype(np.float32) / float(L)
-            if np.any(global_has_data):
-                # 至少一个有数据的设备达到阈值则保留
-                keep = np.any(ratio[global_has_data] >= max(0.0, float(min_ratio)))
-                valid[i] = bool(keep)
-            else:
-                # 若全局没有任何设备数据，保留所有窗口（用于仅主端的下游特征）
-                valid[i] = True
-        return valid
-
     def run_full_pipeline(self, data_path: str) -> Dict:
         """运行完整 HIPE 数据准备（含 Walk-Forward、连续性修复、防泄漏与不平衡控制）。"""
         import shutil
+        from datetime import datetime
+        start_time = datetime.now().isoformat()
         # 1) 清理旧折数据
         for name in os.listdir(self.output_dir):
             if name.startswith("fold_"):
@@ -428,6 +141,11 @@ class HIPEDataPreparationPipeline:
         # 5) 生成窗口元数据与段元数据
         windows_meta = self._build_windows_metadata(df_merged, starts, L)
         segments_meta = self._create_segments_meta(df_merged)
+        # 保存段元数据供验证
+        try:
+            segments_meta.to_csv(os.path.join(self.output_dir, "segments_meta.csv"), index=False)
+        except Exception:
+            pass
 
         # 6) Walk-Forward CV 计划
         cv_cfg = self._ensure_cv_config()
@@ -499,6 +217,46 @@ class HIPEDataPreparationPipeline:
             "output_dir": self.output_dir,
             "folds": list(splits.keys()),
         }
+
+        # 写出 pipeline_results.json 供验证脚本使用
+        try:
+            end_time = datetime.now().isoformat()
+            steps_summary = {
+                "segmentation": {
+                    "status": "success",
+                    "details": {
+                        "segments_count": int(segments_meta.shape[0]) if hasattr(segments_meta, 'shape') else 0,
+                        "total_samples": int(df_merged.shape[0])
+                    }
+                },
+                "windowing": {
+                    "status": "success",
+                    "details": {
+                        "total_windows": int(windows_meta.shape[0]) if hasattr(windows_meta, 'shape') else n,
+                        "window_length": int(L)
+                    }
+                },
+                "cross_validation": {
+                    "status": "success",
+                    "details": {
+                        "n_folds": int(len(splits)),
+                        "purge_gap_minutes": int(cv_cfg.get("purge_gap_minutes", 0)),
+                        "segment_isolation": bool(cv_cfg.get("segment_isolation", True))
+                    }
+                }
+            }
+            results = {
+                "status": "success",
+                "start_time": start_time,
+                "end_time": end_time,
+                "steps": steps_summary,
+            }
+            with open(os.path.join(self.output_dir, "pipeline_results.json"), "w", encoding="utf-8") as f:
+                json.dump(results, f, ensure_ascii=False, indent=2)
+        except Exception:
+            # 保持流程不失败
+            pass
+
         return self.summary_.copy()
 
     def _save_outputs(
@@ -583,7 +341,7 @@ class HIPEDataPreparationPipeline:
             train_idx = part["train_indices"]
             val_idx = part["val_indices"]
 
-            # 原始序列供 TimeEncoder：对 NaN 做安全填充（窗均值），遇到全 NaN 则回退为 0
+            # 原始序列supply：对 NaN 做安全填充（窗均值），遇到全 NaN 则回退为 0
             X_train = X_seq[train_idx].astype(np.float32)
             X_val = X_seq[val_idx].astype(np.float32)
             # 原始掩码：True=有效，False=缺失；保存为 uint8 以节省空间
@@ -672,12 +430,12 @@ class HIPEDataPreparationPipeline:
         }
 
     def _window_stft_frames(self, X_seq: np.ndarray) -> np.ndarray:
-        """按窗口对 P_kW 通道计算STFT幅度谱，NaN安全填充。返回形状 [N, T_frames, F_bins]."""
+        """按窗口对 P/Q/S/PF 通道计算STFT幅度谱，NaN安全填充。返回形状 [N, T_frames, F_bins*C]."""
         if X_seq.size == 0:
             return np.empty((0, 0, 0), dtype=np.float32)
         N, L, C = X_seq.shape
-        # 选择 P_kW 通道（默认第0通道）
-        p_channel = 0
+        # 选择待计算的通道：P(0)/Q(1)/S(2)/PF(3)
+        stft_channels = [0, 1, 2, 3]
         win_len = int(self.hipe.stft_win_length)
         hop = int(self.hipe.stft_hop)
         n_fft = int(self.hipe.stft_n_fft)
@@ -691,32 +449,34 @@ class HIPEDataPreparationPipeline:
             window = np.hamming(win_len).astype(np.float32)
         else:
             window = np.ones(win_len, dtype=np.float32)
-        # 计算每窗帧数
+        # 帧数与频点数
         frames = 1 if L < win_len else (1 + (L - win_len) // hop)
         F = (n_fft // 2) + 1
-        out = np.empty((N, frames, F), dtype=np.float32)
+        C_eff = len(stft_channels)
+        out = np.empty((N, frames, F * C_eff), dtype=np.float32)
         for i in range(N):
-            sig = X_seq[i, :, p_channel].astype(np.float32)
-            m = np.nanmean(sig)
-            if np.isnan(m):
-                m = 0.0
-            sig = np.where(np.isnan(sig), m, sig)
-            for t in range(frames):
-                start = t * hop
-                end = start + win_len
-                if end <= L:
-                    frame = sig[start:end]
-                else:
-                    # 零填充最后一帧
-                    pad = np.zeros(win_len, dtype=np.float32)
-                    take = max(0, L - start)
-                    if take > 0:
-                        pad[:take] = sig[start:start+take]
-                    frame = pad
-                frame_win = frame * window
-                spec = np.fft.rfft(frame_win, n=n_fft)
-                mag = np.abs(spec).astype(np.float32)
-                out[i, t, :] = mag
+            for ci, ch in enumerate(stft_channels):
+                sig = X_seq[i, :, ch].astype(np.float32)
+                m = np.nanmean(sig)
+                if np.isnan(m):
+                    m = 0.0
+                sig = np.where(np.isnan(sig), m, sig)
+                for t in range(frames):
+                    start = t * hop
+                    end = start + win_len
+                    if end <= L:
+                        frame = sig[start:end]
+                    else:
+                        # 零填充最后一帧
+                        pad = np.zeros(win_len, dtype=np.float32)
+                        take = max(0, L - start)
+                        if take > 0:
+                            pad[:take] = sig[start:start+take]
+                        frame = pad
+                    frame_win = frame * window
+                    spec = np.fft.rfft(frame_win, n=n_fft)
+                    mag = np.abs(spec).astype(np.float32)
+                    out[i, t, ci * F:(ci + 1) * F] = mag
         return out
 
     def _aggregate_aux_features(self, X_seq: np.ndarray, df_merged: pd.DataFrame, starts: np.ndarray) -> Tuple[np.ndarray, List[str]]:
@@ -738,6 +498,113 @@ class HIPEDataPreparationPipeline:
             feats.append(sd)
             names.append(f"mean_{cname}")
             names.append(f"std_{cname}")
+        # 工业电气派生：功率角、PF动态、通断与斜率
+        try:
+            P_seq = X_seq[:, :, 0]
+            Q_seq = X_seq[:, :, 1]
+            PF_seq = X_seq[:, :, 3] if C >= 4 else np.full((N, L), np.nan, dtype=np.float32)
+            dP_seq = X_seq[:, :, 4] if C >= 5 else np.full((N, L), np.nan, dtype=np.float32)
+            # 功率角 φ
+            phi_seq = np.arctan2(Q_seq, P_seq)
+            feats.append(np.nanmean(phi_seq, axis=1))
+            feats.append(np.nanstd(phi_seq, axis=1))
+            names.append("mean_phi")
+            names.append("std_phi")
+            # PF 动态
+            if L > 1:
+                dPF_seq = PF_seq[:, 1:] - PF_seq[:, :-1]
+                feats.append(np.nanmean(dPF_seq, axis=1))
+                feats.append(np.nanstd(dPF_seq, axis=1))
+                names.append("mean_dPF")
+                names.append("std_dPF")
+            else:
+                feats.append(np.zeros(N, dtype=np.float32))
+                feats.append(np.zeros(N, dtype=np.float32))
+                names.append("mean_dPF")
+                names.append("std_dPF")
+            # 通断比例与边缘计数
+            thr = float(getattr(self.hipe, "on_power_threshold_w", 0.5))
+            validP = ~np.isnan(P_seq)
+            on = (P_seq > thr) & validP
+            denom = validP.sum(axis=1)
+            on_ratio = np.divide(on.sum(axis=1), denom, out=np.zeros_like(denom, dtype=np.float64), where=denom > 0)
+            feats.append(on_ratio.astype(np.float32))
+            names.append("on_ratio")
+            if L > 1:
+                edge_cnt = np.sum(np.abs(np.diff(on.astype(np.int8), axis=1)), axis=1)
+            else:
+                edge_cnt = np.zeros(N, dtype=np.int64)
+            feats.append(edge_cnt.astype(np.float32))
+            names.append("edge_count")
+            # 斜率统计（正/负）
+            pos_vals = np.where(dP_seq > 0, dP_seq, np.nan)
+            neg_vals = np.where(dP_seq < 0, dP_seq, np.nan)
+            feats.append(np.nanmean(pos_vals, axis=1))
+            feats.append(np.nanstd(pos_vals, axis=1))
+            names.append("pos_ramp_mean")
+            names.append("pos_ramp_std")
+            feats.append(np.nanmean(neg_vals, axis=1))
+            feats.append(np.nanstd(neg_vals, axis=1))
+            names.append("neg_ramp_mean")
+            names.append("neg_ramp_std")
+        except Exception:
+            pass
+        # 能量增量（kWh）
+        energy_delta = np.zeros(N, dtype=np.float32)
+        if "E_PP_kWh" in df_merged.columns:
+            e = df_merged["E_PP_kWh"].to_numpy(dtype=np.float64)
+            for i, s in enumerate(starts):
+                w = e[s:s + L]
+                if w.size > 1:
+                    a, b = w[0], w[-1]
+                    if np.isfinite(a) and np.isfinite(b):
+                        energy_delta[i] = float(b - a)
+        feats.append(energy_delta)
+        names.append("energy_delta_kWh")
+        # 电压/电流/频率/THD 汇总
+        def _window_mean_std(columns: list) -> tuple:
+            m = np.zeros(N, dtype=np.float32)
+            s = np.zeros(N, dtype=np.float32)
+            arrs = [df_merged[c].to_numpy(dtype=np.float64) for c in columns if c in df_merged.columns]
+            if arrs:
+                mat = np.stack(arrs, axis=1)
+                avg_ts = np.nanmean(mat, axis=1)
+                for i, st in enumerate(starts):
+                    w = avg_ts[st:st + L]
+                    if w.size:
+                        m[i] = np.nanmean(w)
+                        s[i] = np.nanstd(w)
+            return m, s
+        # Vrms 与 Irms
+        vr_m, vr_s = _window_mean_std(["V1_V", "V2_V", "V3_V"])  # 相电压
+        ir_m, ir_s = _window_mean_std(["I1_A", "I2_A", "I3_A"])  # 相电流
+        feats.extend([vr_m, vr_s, ir_m, ir_s])
+        names.extend(["Vrms_mean", "Vrms_std", "Irms_mean", "Irms_std"])
+        # 频率
+        f_m, f_s = _window_mean_std(["F_Hz"])
+        feats.extend([f_m, f_s])
+        names.extend(["F_Hz_mean", "F_Hz_std"])
+        # THD
+        thdv_m, thdv_s = _window_mean_std(["THD_V1_F", "THD_V2_F", "THD_V3_F"])  # 电压 THD
+        thdi_m, thdi_s = _window_mean_std(["THD_I1_F", "THD_I2_F", "THD_I3_F"])  # 电流 THD
+        feats.extend([thdv_m, thdv_s, thdi_m, thdi_s])
+        names.extend(["THD_V_mean", "THD_V_std", "THD_I_mean", "THD_I_std"])
+        # 电压不平衡度（std/mean 按相*时间平均）
+        v_unbalance = np.zeros(N, dtype=np.float32)
+        if all(c in df_merged.columns for c in ["V1_V", "V2_V", "V3_V"]):
+            v1 = df_merged["V1_V"].to_numpy(dtype=np.float64)
+            v2 = df_merged["V2_V"].to_numpy(dtype=np.float64)
+            v3 = df_merged["V3_V"].to_numpy(dtype=np.float64)
+            mat = np.stack([v1, v2, v3], axis=1)
+            for i, st in enumerate(starts):
+                w = mat[st:st + L, :]
+                mu_ts = np.nanmean(w, axis=1)
+                sd_ts = np.nanstd(w, axis=1)
+                with np.errstate(invalid='ignore', divide='ignore'):
+                    ratio = np.divide(sd_ts, mu_ts, out=np.zeros_like(sd_ts), where=mu_ts != 0)
+                v_unbalance[i] = float(np.nanmean(ratio))
+        feats.append(v_unbalance)
+        names.append("voltage_unbalance_mean")
         Fd = np.stack(feats, axis=1).astype(np.float32)
         return Fd, names
 
@@ -819,3 +686,269 @@ class HIPEDataPreparationPipeline:
     @staticmethod
     def _safe_load(fp: str) -> Optional[np.ndarray]:
         return np.load(fp) if os.path.exists(fp) else None
+
+    # === 缺失的私有方法补充实现 ===
+    def _find_mains_file(self, data_path: str) -> Optional[str]:
+        # 优先使用配置文件名
+        cand = os.path.join(data_path, self.hipe.mains_file)
+        if os.path.exists(cand):
+            return cand
+        # 回退匹配
+        patterns = ["*main*.csv", "*mains*.csv"]
+        for p in patterns:
+            hits = glob.glob(os.path.join(data_path, p))
+            if hits:
+                return sorted(hits)[0]
+        return None
+
+    def _find_device_files(self, data_path: str) -> List[str]:
+        pattern = os.path.join(data_path, self.hipe.device_pattern)
+        files = sorted(glob.glob(pattern))
+        return files
+
+    def _read_mains(self, fp: str) -> pd.DataFrame:
+        df = pd.read_csv(fp)
+        # 时间戳列检测
+        ts_col = self.hipe.timestamp_col
+        if ts_col not in df.columns:
+            # 简单推断：寻找包含"time"的列
+            time_cols = [c for c in df.columns if "time" in c.lower()]
+            if time_cols:
+                ts_col = time_cols[0]
+            else:
+                raise ValueError(f"主端CSV缺少时间戳列: {self.hipe.timestamp_col}")
+        # 统一为UTC无时区
+        dt = pd.to_datetime(df[ts_col], errors='coerce', utc=True)
+        df[ts_col] = dt.dt.tz_localize(None)
+        df = df.dropna(subset=[ts_col]).copy()
+        df = df.sort_values(ts_col)
+        # 列映射
+        mains_map = self.hipe.mains_cols or {}
+        # 反向映射：输入列 -> 目标列
+        rename_map = {}
+        for src, dst in mains_map.items():
+            if src in df.columns:
+                # 输入是 src，目标是标准列名（P_kW等）
+                rename_map[src] = src  # 若已是标准名则保留
+        # 若输入采用别名（如 P_total_W），也映射到标准名
+        for src, dst in mains_map.items():
+            if dst in df.columns and src not in df.columns:
+                rename_map[dst] = src
+        if rename_map:
+            df = df.rename(columns=rename_map)
+        # 保留标准列（扩展工业电气通道）
+        keep_cols = [c for c in [ts_col,
+                                 "P_kW", "Q_kvar", "S_kVA", "PF",
+                                 "F_Hz",
+                                 "U12_V", "U23_V", "U31_V",
+                                 "V1_V", "V2_V", "V3_V",
+                                 "I1_A", "I2_A", "I3_A", "IN_A",
+                                 "IAVR_A", "UAVR_V", "VAVR_V",
+                                 "E_PP_kWh", "E_QP_kvarh", "E_SP_kVAh",
+                                 "THD_U12_F", "THD_U23_F", "THD_U31_F",
+                                 "THD_V1_F", "THD_V2_F", "THD_V3_F",
+                                 "THD_I1_F", "THD_I2_F", "THD_I3_F"] if c in df.columns]
+        df = df[keep_cols].copy()
+        df = df.rename(columns={ts_col: self.hipe.timestamp_col})
+        return df
+
+    def _extract_device_name(self, fp: str) -> str:
+        base = os.path.basename(fp)
+        name = os.path.splitext(base)[0]
+        # 设备名模式 device_xxx
+        if name.startswith("device_"):
+            return name[len("device_"):]
+        return name
+
+    def _read_devices(self, fps: List[str]) -> Tuple[List[pd.DataFrame], List[str]]:
+        dev_dfs: List[pd.DataFrame] = []
+        dev_names: List[str] = []
+        for fp in fps:
+            df = pd.read_csv(fp)
+            ts_col = self.hipe.timestamp_col
+            if ts_col not in df.columns:
+                time_cols = [c for c in df.columns if "time" in c.lower()]
+                if time_cols:
+                    ts_col = time_cols[0]
+                else:
+                    raise ValueError(f"设备CSV缺少时间戳列: {self.hipe.timestamp_col}")
+            dt = pd.to_datetime(df[ts_col], errors='coerce', utc=True)
+            df[ts_col] = dt.dt.tz_localize(None)
+            df = df.dropna(subset=[ts_col]).copy()
+            df = df.sort_values(ts_col)
+            # 列映射
+            dev_map = self.hipe.device_cols or {}
+            rename_map = {}
+            for src, dst in dev_map.items():
+                if src in df.columns:
+                    rename_map[src] = src
+            for src, dst in dev_map.items():
+                if dst in df.columns and src not in df.columns:
+                    rename_map[dst] = src
+            if rename_map:
+                df = df.rename(columns=rename_map)
+            keep = [c for c in [ts_col, "P", "Q", "S"] if c in df.columns]
+            df = df[keep].copy()
+            df = df.rename(columns={ts_col: self.hipe.timestamp_col})
+            dev_dfs.append(df)
+            dev_names.append(self._extract_device_name(fp))
+        return dev_dfs, dev_names
+
+    def _resample_df(self, df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+        ts_col = self.hipe.timestamp_col
+        rule_seconds = int(self.hipe.resample_seconds)
+        # 可选使用 Polars 加速
+        if getattr(self, "use_polars", False):
+            try:
+                import polars as pl
+                # 只保留需要的列
+                keep_cols = [ts_col] + [c for c in cols if c in df.columns]
+                dfp = pl.from_pandas(df[keep_cols])
+                # 确保时间戳为 Datetime 并无时区
+                if dfp.schema.get(ts_col) != pl.Datetime:
+                    dfp = dfp.with_columns(pl.col(ts_col).str.strptime(pl.Datetime, strict=False))
+                dfp = dfp.with_columns(pl.col(ts_col).dt.replace_time_zone(None))
+                out = (
+                    dfp.group_by_dynamic(ts_col, every=f"{rule_seconds}s", closed="left")
+                    .agg([pl.col(c).mean().alias(c) for c in cols if c in dfp.columns])
+                    .sort(ts_col)
+                )
+                x = out.to_pandas()
+                x[ts_col] = pd.to_datetime(x[ts_col]).tz_localize(None)
+                return x
+            except Exception:
+                # 回退到 pandas
+                pass
+        # pandas 路径
+        x = df.copy()
+        x[ts_col] = pd.to_datetime(x[ts_col], errors="coerce", utc=True).dt.tz_localize(None)
+        x = x.dropna(subset=[ts_col])
+        x = x.set_index(x[ts_col])
+        x = x[[c for c in cols if c in x.columns]]
+        x = x.resample(f"{rule_seconds}S").mean()
+        x[ts_col] = x.index
+        x.reset_index(drop=True, inplace=True)
+        return x
+
+    def _resample_rename_device(self, df: pd.DataFrame, name: str) -> Optional[pd.DataFrame]:
+        ts_col = self.hipe.timestamp_col
+        cols = [c for c in ["P", "Q", "S"] if c in df.columns]
+        if not cols:
+            return None
+        dfr = self._resample_df(df, cols)
+        ren = {}
+        if "P" in dfr.columns:
+            ren["P"] = f"{name}_P_W"
+        if "Q" in dfr.columns:
+            ren["Q"] = f"{name}_Q_var"
+        if "S" in dfr.columns:
+            ren["S"] = f"{name}_S_VA"
+        dfr = dfr.rename(columns=ren)
+        return dfr
+
+    def _align_and_merge(self, df_main: pd.DataFrame, dev_dfs: List[pd.DataFrame], dev_names: List[str]) -> Tuple[pd.DataFrame, Dict[int, str]]:
+        ts_col = self.hipe.timestamp_col
+        # 主端重采样（保留扩展工业通道）
+        main_cols = [c for c in [
+            "P_kW", "Q_kvar", "S_kVA", "PF",
+            "F_Hz",
+            "U12_V", "U23_V", "U31_V",
+            "V1_V", "V2_V", "V3_V",
+            "I1_A", "I2_A", "I3_A", "IN_A",
+            "IAVR_A", "UAVR_V", "VAVR_V",
+            "E_PP_kWh", "E_QP_kvarh", "E_SP_kVAh",
+            "THD_U12_F", "THD_U23_F", "THD_U31_F",
+            "THD_V1_F", "THD_V2_F", "THD_V3_F",
+            "THD_I1_F", "THD_I2_F", "THD_I3_F"
+        ] if c in df_main.columns]
+        dfm = self._resample_df(df_main, main_cols)
+        # 合并为统一时间索引
+        base = dfm.copy()
+        # 并行处理设备重采样与重命名
+        futures = []
+        with ThreadPoolExecutor(max_workers=getattr(self, "n_jobs", 1)) as ex:
+            for df, name in zip(dev_dfs, dev_names):
+                futures.append(ex.submit(self._resample_rename_device, df, name))
+            for fut in futures:
+                dfr = fut.result()
+                if dfr is None:
+                    continue
+                base = pd.merge_asof(
+                    base.sort_values(ts_col),
+                    dfr.sort_values(ts_col),
+                    on=ts_col
+                )
+        base = base.sort_values(ts_col).reset_index(drop=True)
+        label_map = {i: name for i, name in enumerate(dev_names)}
+        return base, label_map
+
+    def _repair_small_gaps(self, df: pd.DataFrame) -> pd.DataFrame:
+        x = df.copy()
+        # 小缺口定义：连续 <=2 个步长
+        limit = 2
+        for c in x.columns:
+            if c == self.hipe.timestamp_col:
+                continue
+            ser = x[c]
+            if ser.dtype.kind in 'bif':
+                try:
+                    x[c] = ser.interpolate(limit=limit, limit_direction='both')
+                except Exception:
+                    pass
+        return x
+
+    def _build_mains_features(self, df: pd.DataFrame) -> np.ndarray:
+        T = len(df)
+        P = df["P_kW"].to_numpy(dtype=np.float32) if "P_kW" in df.columns else np.full(T, np.nan, dtype=np.float32)
+        Q = df["Q_kvar"].to_numpy(dtype=np.float32) if "Q_kvar" in df.columns else np.full(T, np.nan, dtype=np.float32)
+        S = df["S_kVA"].to_numpy(dtype=np.float32) if "S_kVA" in df.columns else np.full(T, np.nan, dtype=np.float32)
+        PF = df["PF"].to_numpy(dtype=np.float32) if "PF" in df.columns else np.full(T, np.nan, dtype=np.float32)
+        dP = np.concatenate([np.array([0.0], dtype=np.float32), np.diff(P).astype(np.float32)]) if T > 0 else np.empty(0, dtype=np.float32)
+        dQ = np.concatenate([np.array([0.0], dtype=np.float32), np.diff(Q).astype(np.float32)]) if T > 0 else np.empty(0, dtype=np.float32)
+        dS = np.concatenate([np.array([0.0], dtype=np.float32), np.diff(S).astype(np.float32)]) if T > 0 else np.empty(0, dtype=np.float32)
+        X = np.stack([P, Q, S, PF, dP, dQ, dS], axis=1)
+        return X.astype(np.float32)
+
+    def _build_targets(self, df: pd.DataFrame, dev_names: List[str], kind: str = "P") -> np.ndarray:
+        T = len(df)
+        mats = []
+        for name in dev_names:
+            col = f"{name}_P_W" if kind == "P" else f"{name}_Q_var" if kind == "Q" else f"{name}_S_VA"
+            if col in df.columns:
+                mats.append(df[col].to_numpy(dtype=np.float32))
+            else:
+                mats.append(np.full(T, np.nan, dtype=np.float32))
+        if mats:
+            Y = np.stack(mats, axis=1)
+        else:
+            Y = np.empty((T, 0), dtype=np.float32)
+        return Y
+
+    def _slide_window(self, X_full: np.ndarray, Y_full: np.ndarray, L: int, H: int, starts_override: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        T = X_full.shape[0]
+        if T == 0 or L <= 0:
+            return np.empty((0, 0, 0), dtype=np.float32), np.empty((0, 0, 0), dtype=np.float32), np.empty((0,), dtype=np.int64)
+        starts = starts_override if starts_override is not None else np.arange(0, max(0, T - L + 1), H, dtype=np.int64)
+        X_list = []
+        Y_list = []
+        for s in starts:
+            e = s + L
+            X_list.append(X_full[s:e, :])
+            Y_list.append(Y_full[s:e, :])
+        X_seq = np.stack(X_list, axis=0).astype(np.float32) if X_list else np.empty((0, L, X_full.shape[1]), dtype=np.float32)
+        Y_seq = np.stack(Y_list, axis=0).astype(np.float32) if Y_list else np.empty((0, L, Y_full.shape[1]), dtype=np.float32)
+        return X_seq, Y_seq, starts
+
+    def _valid_window_mask_by_ratio(self, Y_full: np.ndarray, starts: np.ndarray, L: int, min_ratio: float = 0.8) -> np.ndarray:
+        if Y_full.size == 0:
+            return np.ones_like(starts, dtype=bool)
+        K = Y_full.shape[1]
+        mask = np.zeros(len(starts), dtype=bool)
+        total = L * max(1, K)
+        for i, s in enumerate(starts):
+            e = s + L
+            win = Y_full[s:e, :]
+            valid = np.isfinite(win).sum()
+            ratio = float(valid) / float(total)
+            mask[i] = (ratio >= float(min_ratio))
+        return mask

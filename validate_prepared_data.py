@@ -2,11 +2,9 @@
 """
 验证准备好的数据
 """
-import numpy as np
-import pickle
 import json
 import os
-from src.data_preparation.pipeline import DataPreparationPipeline
+from src.data_preparation.hipe_pipeline import HIPEDataPreparationPipeline
 
 def validate_prepared_data():
     """验证准备好的数据"""
@@ -90,7 +88,7 @@ def validate_prepared_data():
         print("Fold数据验证")
         print("=" * 60)
         
-        pipeline = DataPreparationPipeline('config/prep_config.yaml')
+        pipeline = HIPEDataPreparationPipeline('config/prep_config.yaml')
         
         for i in range(len(fold_dirs)):
             try:

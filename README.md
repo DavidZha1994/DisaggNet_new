@@ -183,14 +183,7 @@ DisaggNet_new/
 │   └── optimized_stable.yaml          # 优化稳定训练配置
 ├── src/                              # 源代码目录
 │   ├── data/                         # 数据处理模块
-│   │   ├── hipe_loader.py           # 工业级数据加载器
-│   │   ├── data_contract.py         # 数据契约验证
-│   │   ├── time_alignment.py        # 时间对齐和重采样
-│   │   ├── missing_anomaly_handler.py # 缺测和异常值处理
-│   │   ├── consistency_checker.py   # 一致性检查
-│   │   ├── causal_windowing.py      # 因果窗口化
-│   │   ├── preprocess.py            # 特征工程和标签生成
-│   │   └── industrial_pipeline.py   # 完整流水线集成
+│   │   └── datamodule.py            # 数据模块和数据加载器
 │   ├── models/                       # 模型定义
 │   │   ├── fusion_transformer.py    # 融合Transformer模型
 │   │   └── conformal_wrapper.py     # 共形预测包装器
@@ -263,139 +256,14 @@ DisaggNet_new/
 
 ```
 src/data/
-├── data_contract.py           # 数据契约和验证
-├── time_alignment.py          # 时间对齐和重采样
-├── missing_anomaly_handler.py # 缺测和异常值处理
-├── consistency_checker.py     # 一致性检查
-├── causal_windowing.py        # 因果窗口化
-├── preprocess.py              # 特征工程和标签生成
-└── industrial_pipeline.py     # 完整流水线集成
+└── datamodule.py              # 数据模块和数据加载器
 ```
 
 ### 使用示例
 
 #### 基本使用
 
-```python
-from src.data.industrial_pipeline import run_industrial_pipeline, PipelineConfig
-
-# 创建配置
-config = PipelineConfig.create_default_config()
-
-# 准备数据
-mains_df = pd.DataFrame({
-    'timestamp': pd.date_range('2017-10-01', '2017-12-01', freq='5S', tz='UTC'),
-    'mains_P': np.random.normal(1000, 200, n_samples),
-    'mains_Q': np.random.normal(300, 50, n_samples),
-    'mains_S': np.random.normal(1100, 220, n_samples)
-})
-
-device_dfs = {
-    'dishwasher': pd.DataFrame({
-        'timestamp': time_range,
-        'dev:dishwasher:P': device_power_data
-    }),
-    # ... 其他设备
-}
-
-# 运行流水线
-result = run_industrial_pipeline(
-    mains_df=mains_df,
-    device_dfs=device_dfs,
-    config=config,
-    output_dir=Path('output/preprocessing')
-)
-
-# 获取处理结果
-datasets = result['datasets']
-train_dataset = datasets['train']
-val_dataset = datasets['val']
-test_dataset = datasets['test']
-```
-
-#### Walk-Forward验证
-
-```python
-# 配置Walk-Forward验证
-config['data']['split']['mode'] = 'walk_forward'
-config['data']['split']['walk_forward'] = {
-    'min_train_days': 21,
-    'val_days': 7,
-    'test_days': 7,
-    'step_days': 3
-}
-
-# 运行流水线
-result = run_industrial_pipeline(mains_df, device_dfs, config)
-
-# 获取多折数据集
-for fold_name, dataset in result['datasets'].items():
-    if 'fold' in fold_name:
-        print(f"{fold_name}: {len(dataset)} 窗口")
-```
-
-### 13步工业流程详解
-
-#### 步骤0: 数据契约验证
-```python
-from src.data.data_contract import validate_data_contract
-
-# 验证数据格式
-report = validate_data_contract(df)
-if not report['valid']:
-    print("数据不符合契约要求")
-    for error in report['errors']:
-        print(f"错误: {error}")
-```
-
-#### 步骤1: 时间对齐
-```python
-from src.data.time_alignment import TimeAligner
-
-aligner = TimeAligner()
-aligned_df = aligner.align_to_grid(mains_df, device_dfs)
-aligner.print_alignment_report()
-```
-
-#### 步骤2: 缺测和异常处理
-```python
-from src.data.missing_anomaly_handler import IntegratedDataCleaner
-
-cleaner = IntegratedDataCleaner()
-cleaned_df, stats = cleaner.clean_data(aligned_df, fit_mode=True)
-cleaner.print_cleaning_report()
-```
-
-#### 步骤3: 一致性检查
-```python
-from src.data.consistency_checker import ConsistencyChecker
-
-checker = ConsistencyChecker(mismatch_threshold=0.2)
-result = checker.check_consistency(cleaned_df)
-checker.print_consistency_report()
-```
-
-#### 步骤4: 严格时间切分
-```python
-from src.data.preprocess import TimeSeriesSplitter
-
-splitter = TimeSeriesSplitter(config)
-train_df, val_df, test_df = splitter.split(cleaned_df)
-
-# 验证无泄露
-is_valid = splitter.validate_no_leakage(train_df, val_df, test_df)
-```
-
-#### 步骤5-6: 因果窗口化
-```python
-from src.data.causal_windowing import create_causal_dataset
-
-# 创建因果数据集
-train_dataset = create_causal_dataset(
-    train_df, window_size=512, stride=256, 
-    causal_mode=True, device_names=device_names
-)
-```
+数据准备和模型训练的详细说明请参考项目中的实际配置文件和脚本。
 
 ## 🎯 训练稳定性优化
 

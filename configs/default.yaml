@@ -1,68 +1,105 @@
-# DisaggNet 默认配置
-# 继承基础配置，适用于快速实验和开发
+# DisaggNet 自包含默认训练配置
 
-defaults:
-  - base
+project_name: "DisaggNet"
 
 experiment:
   name: "baseline"
 
+reproducibility:
+  seed: 42
+  deterministic: false
+  benchmark: true
+
+paths:
+  output_dir: "outputs"
+  data_dir: "Data"
+  prepared_dir: "Data/prepared"
+
 logging:
+  save_dir: "logs/tensorboard"
   version: "v1"
 
-# 损失设置（统一损失函数配置）
-loss:
-  # 多任务损失权重 (推荐配置: 2*L_cls + 1*L_reg + 0.5*L_conservation + 1*L_consistency)
-  classification_weight: 2.0    # 分类损失权重
-  regression_weight: 1.0        # 回归损失权重  
-  conservation_weight: 0.5      # 能量守恒损失权重
-  consistency_weight: 1.0       # 一致性损失权重
-  
-  # Focal Loss参数
-  focal_alpha: 0.25            # Focal Loss alpha参数
-  focal_gamma: 2.0             # Focal Loss gamma参数
-  
-  # Huber Loss参数
-  huber_delta: 1.0             # Huber Loss delta参数
+data:
+  batch_size: 512
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: false
+  prefetch_factor: 2
+  device_names: ["device_1"]
+  window_size: 256
 
-# 评估与策略（见文件末尾统一定义）
-
-# 模型配置
 model:
-  freq_encoder:
-    enable: true
-  fusion:
-    type: "cross_attention"
-  # 多任务头配置
-  heads:
-    classification:
-      # 分类头初始化先验概率 (将在训练时自动注入数据统计先验)
-      init_p: null  # 自动从数据统计计算
-    regression:
-      # 回归头配置
-      dropout: 0.1
-  
-  # 校准配置
+  d_model: 256
+  n_heads: 8
+  num_layers: 6
+  dropout: 0.1
   calibration:
     enable: true
     temperature_init: 1.0
+  time_encoder:
+    d_model: 256
+    n_heads: 8
+    num_layers: 6
+    dropout: 0.1
+    input_conv_embed: false
+    causal_mask: true
+  freq_encoder:
+    enable: true
+    proj_dim: 128
+    conv1d_kernel: 3
+    small_transformer_layers: 0
+    dropout: 0.1
+  fusion:
+    type: "cross_attention"
+    gated: true
+  aux_encoder:
+    enable: false
+    hidden: 128
+    dropout: 0.1
+  heads:
+    regression:
+      hidden: 96
+      dropout: 0.1
+    classification:
+      init_p: null
 
-# 训练策略配置
 training:
   max_epochs: 100
-  patience: 15
-  min_delta: 0.001
-  
-  # 学习率调度
-  lr_scheduler:
-    name: "cosine"
-    warmup_epochs: 5
-    eta_min: 1e-6
-  
-  # 优化器配置
+  min_epochs: 1
+  precision: "bf16-mixed"
+  log_every_n_steps: 10
+  gradient_clip_val: 0.5
+  accumulate_grad_batches: 1
+  check_val_every_n_epoch: 1
+  accelerator: "auto"
+  devices: auto
+  monitor_device_stats: false
+  visualization:
+    enable: false
+    plot_event_only: true
+    max_plots_per_epoch: 0
   optimizer:
     name: "adamw"
-    lr: 1e-3
+    lr: 0.001
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  scheduler:
+    name: "cosine"
+    warmup_steps: 500
+    T_max: 100
+    eta_min: 1e-6
+  checkpoint:
+    dirpath: "outputs/checkpoints"
+    filename: "epochepoch={epoch:02d}-v{version}"
+    monitor: "val/score"
+    mode: "max"
+    save_top_k: 1
+  early_stopping:
+    enable: true
+    monitor: "val/score"
+    patience: 15
+    mode: "max"
+    min_delta: 0.001
   masking:
     window_strategy: "none"
     min_valid_ratio_time: 0.5
@@ -70,22 +107,50 @@ training:
     combine_modalities: "min"
     downweight_power: 1.0
     epsilon: 0.0
-  
-  # 事件关注配置（用于训练期提升含事件样本的权重）
   event_focus:
     enable: true
     weight: 2.0
-  
-  # 训练期可视化设置（仅绘制含事件窗口以便快速对齐）
-  visualization:
-    plot_event_only: true
-    max_plots_per_epoch: 16
 
-# 不平衡处理（数据模块读取）
+loss:
+  classification_weight: 2.0
+  regression_weight: 1.0
+  conservation_weight: 0.5
+  consistency_weight: 1.0
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  huber_delta: 1.0
+  # 兼容旧版嵌套权重结构（若其他模块读取）
+  weights:
+    regression: 1.0
+    classification: 2.0
+    consistency_schedule:
+      type: "linear"
+      initial: 1.0
+      final: 1.0
+      warmup_epochs: 0
+  regression:
+    type: "mse"
+    huber_delta: 1.0
+    quantiles: [0.1, 0.5, 0.9]
+  classification:
+    type: "bce"
+    pos_weight:
+      enable: false
+    focal_alpha: 0.25
+    focal_gamma: 2.0
+  priors:
+    enable: false
+
+evaluation:
+  threshold_method: "optimal"
+  zero_window_weight: 0.2
+  test_after_training: false
+
 imbalance_handling:
+  use_weighted_sampling: true
+  pos_weight_auto: true
   sampling_strategy: "mixed"
 
-# Walk-Forward 交叉验证（与 walk_forward.py 对齐）
 walk_forward:
   n_folds: 3
   purge_gap_minutes: 10
@@ -96,38 +161,25 @@ walk_forward:
   holdout_test: true
   time_based_split: true
 
-# 数据准备设置（基础版本）
-data_preparation:
-  window_size: 256
-  stride: 128
-  feature_engineering:
-    enable_advanced: false
-    statistical_windows: [6, 12, 24]
+windowing:
+  window_size: 1024
+  stride: 512
+  overlap: 0.5
 
-# 稳定性设置（基础版本）
+conformal_prediction:
+  enabled: false
+  alpha: 0.1
+  regression_method: "quantile"
+  classification_method: "adaptive"
+
 stability:
   numerical:
     detect_anomaly: false
-    gradient_clip_val: 0.5
   reproducibility:
     deterministic: false
     benchmark: true
 
-# 保留的配置项（避免重复）
-conformal_prediction:
-  enable: false
-  alpha: 0.1
-  regression_method: "quantile"
-  classification_method: "logits"
-
-# 复现实验设置（供 main.py 使用）
-reproducibility:
-  seed: 42
-  deterministic: false
-  benchmark: true
-
-# 评估与策略
-evaluation:
-  threshold_method: "optimal"
-  # 降低全零窗口在指标计算中的权重（0~1）
-  zero_window_weight: 0.2
+debug:
+  track_grad_norm: 0
+  strict_validation: false
+  log_model_graph: false

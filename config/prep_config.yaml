@@ -1,316 +1,284 @@
-# 时序数据准备与交叉验证配置文件
-# Time Series Data Preparation and Cross-Validation Configuration
-
-# 数据分段配置 (Data Segmentation)
+compute:
+  chunk_size: 10000
+  memory_limit_gb: 8
+  n_jobs: -1
+  use_polars: true
+cross_validation:
+  holdout_test: false
+  min_train_days: 7.0
+  n_folds: 3
+  purge_gap_minutes: 10
+  segment_isolation: false
+  test_span_days: 3.0
+  time_based_split: true
+  val_span_days: 3.0
+data_storage:
+  compression: snappy
+  format: pickle
+  output_directory: Data/prepared
+  segments_meta_file: segments_meta.csv
+  version_control: true
+evaluation:
+  event_level_evaluation: true
+  metrics:
+  - pr_auc
+  - f1
+  - f0.5
+  - f2
+  - recall_at_k
+  - precision
+  - recall
+  per_device_evaluation: true
+  probability_calibration: true
+  threshold_tuning: true
+  visualization:
+    dpi: 300
+    enabled: true
+    plots:
+    - confusion_matrix
+    - roc_curve
+    - pr_curve
+    - calibration_curve
+    - prediction_timeline
+    save_format: png
+feature_engineering:
+  derived_features:
+    cross_correlations: false
+    interaction_terms: false
+    polynomial_features: false
+    power_ratios: true
+  feature_selection:
+    enabled: true
+    k_best: 30
+    method: mutual_info
+    variance_threshold: 0.01
+  normalization:
+    enabled: true
+    method: robust
+    per_device: true
+    per_segment: false
+  statistical_features:
+    change_rate: true
+    energy_integral: true
+    harmonic_ratios: true
+    rolling_mean:
+    - 5
+    - 10
+    - 20
+    rolling_min_max:
+    - 10
+    - 20
+    rolling_std:
+    - 5
+    - 10
+    - 20
+  time_features:
+    day_of_week: true
+    hour_of_day: true
+    is_holiday: false
+    is_weekend: true
+frequency:
+  hop_length: 64
+  magnitude: true
+  n_fft: 256
+  signal: P_kW
+  win_length: 256
 hipe:
-  enable: true
-  timestamp_col: "datetime"
-  mains_file: "MainTerminal*_PhaseCount_*.csv"
-  device_pattern: "*_PhaseCount_*.csv"
-  resample_seconds: 5
-  window_length: 256
-  step_size: 128   # 恢复50%重叠，保证上下文（不要减少窗口数量）
-  mains_cols:
-    P_kW: "P_total_W"
-    Q_kvar: "Q_total_var"
-    S_kVA: "S_total_VA"
-    PF: "PF_total"
   device_cols:
-    P: "P_W"
-    Q: "Q_var"
-    S: "S_VA"
+    P: P_kW
+    Q: Q_kvar
+    S: S_kVA
+  device_pattern: '*_PhaseCount_*.csv'
+  enable: true
+  label_mode: regression
+  mains_cols:
+    PF: L_F
+    P_kW: P_kW
+    Q_kvar: Q_kvar
+    S_kVA: S_kVA
+  mains_file: MainTerminal*_PhaseCount_*.csv
+  on_power_threshold_w: 0.5
+  on_ratio_threshold: 0.5
+  resample_seconds: 5
+  step_size: 128
   stft:
+    hop_length: 64
     n_fft: 256
     win_length: 256
-    hop_length: 64  # 与窗口长度一致时每窗1帧，沿用默认
-    window: "hann"
-  # 新增：HIPE标签生成模式与阈值（用于 labels.pkl）
-  label_mode: "regression"      # "classification" 或 "regression"
-  on_power_threshold_w: 0.5          # 设备“开”功率阈值（单位W）
-  on_ratio_threshold: 0.5            # 窗口内“开”占比阈值
-
-segmentation:
-  gap_threshold_seconds: 300  # 大间隔阈值(秒)，超过此值将数据切分为不同段
-  min_segment_length: 100     # 最小段长度(数据点)，短于此长度的段将被丢弃
-  fill_small_gaps: true       # 是否填充小间隔
-  small_gap_threshold: 30     # 小间隔阈值(秒)，小于此值的间隔将被填充
-  fill_method: "forward"      # 填充方法: "forward", "backward", "interpolate"
-  max_segment_hours: 24       # 新增：最大段时长上限，避免超长段导致内存膨胀
-
-# 窗口化配置 (Windowing)
-windowing:
-  window_lengths: [256]             # 窗口长度选项(数据点) - 进一步减少
-  step_sizes: [128]                 # 步长选项(数据点) - 增加步长减少重叠
-  default_window_length: 256        # 默认窗口长度
-  default_step_size: 128            # 默认步长
-  max_filled_ratio: 0.3             # 窗口内填充数据的最大比例
-  overlap_within_set: true          # 同一集合内是否允许窗口重叠
-  overlap_across_sets: false        # 跨集合是否允许窗口重叠
-  max_windows_per_segment: 500      # 每个段的最大窗口数 - 提高上限以覆盖更长时间
-
-# 标签与事件定义 (Labels and Events)
+    window: hann
+  timestamp_col: datetime
+  window_length: 256
+imbalance_handling:
+  class_weight_auto: true
+  focal_loss_gamma: 2.0
+  loss_weighting: true
+  sampling_strategy: mixed
+  segment_sampling_weight: 2.0
+  window_sampling_ratio: 0.3
 labels:
   event_definitions:
-    - event_type: "power_on"
-      feature_column: "power"
-      threshold: 100.0
-      direction: "up"
-      min_duration: 5
-      max_gap: 3
-    - event_type: "power_off"
-      feature_column: "power"
-      threshold: 50.0
-      direction: "down"
-      min_duration: 5
-      max_gap: 3
-    - event_type: "state_change"
-      feature_column: "switch_state"
-      threshold: 0.5
-      direction: "both"
-      min_duration: 1
-      max_gap: 1
-  
-  label_config:
-    horizon: 3                    # 预测视野(步数)
-    label_type: "binary"          # 标签类型: "binary", "multiclass", "regression"
-    aggregation: "any"            # 聚合方法: "any", "count", "max", "mean"
-    causality_check: true         # 是否使用因果窗口(不使用未来信息)
-  onoff:
-    enabled: true                 # 是否启用基于开关状态的标签生成
-    feature_column: "P_kW"        # 观测列（功率/电压/电流）
-    method: "absolute"            # 绝对阈值 | delta 跃变 | hybrid 混合
-    on_threshold: 0.5             # 上电阈值（单位与列一致）
-    off_threshold: 0.3            # 断电阈值
-    hysteresis_margin: 0.1        # 迟滞边界增强，避免抖动
-    min_on_duration: 5            # 判定开启的最小连续样本数
-    min_off_duration: 5           # 判定关闭的最小连续样本数
-    on_ratio_threshold: 0.5       # 窗口内开启占比达到此阈值即标1
-    smooth_window: 3              # 简单移动平均平滑窗口
-    per_device:                   # 每设备阈值与方法覆盖（由评估脚本自动生成）
-      ChipPress:
-        method: "absolute"
-        smooth_window: 9
-        median_window: 5
-        min_on_duration: 67
-        min_off_duration: 67
-        on_threshold: 12.079923
-        off_threshold: 12.079921
-        hysteresis_margin: 0.000001
-        mad: 0.000001
-      ChipSaw:
-        method: "absolute"
-        smooth_window: 9
-        median_window: 5
-        min_on_duration: 96
-        min_off_duration: 96
-        on_threshold: 0.010665
-        off_threshold: 0.010663
-        hysteresis_margin: 0.000001
-        mad: 0.000001
-      HighTemperatureOven:
-        method: "absolute"
-        smooth_window: 5
-        median_window: 3
-        min_on_duration: 96
-        min_off_duration: 96
-        on_threshold: 2.008030
-        off_threshold: 2.008029
-        hysteresis_margin: 0.000001
-        mad: 0.000001
-      # MainTerminal 主表不参与开关检测（评估脚本也已跳过写入）
-      PickAndPlaceUnit:
-        method: "absolute"
-        smooth_window: 9
-        median_window: 5
-        min_on_duration: 96
-        min_off_duration: 96
-        on_threshold: -0.002382
-        off_threshold: -0.002384
-        hysteresis_margin: 0.000001
-        mad: 0.000001
-      ScreenPrinter:
-        method: "absolute"
-        smooth_window: 9
-        median_window: 5
-        min_on_duration: 96
-        min_off_duration: 96
-        on_threshold: 0.009875
-        off_threshold: 0.009873
-        hysteresis_margin: 0.000001
-        mad: 0.000001
-      SolderingOven:
-        method: "absolute"
-        smooth_window: 5
-        median_window: 3
-        min_on_duration: 96
-        min_off_duration: 96
-        on_threshold: 2.709597
-        off_threshold: 2.709596
-        hysteresis_margin: 0.000001
-        mad: 0.000001
-      VacuumOven:
-        method: "absolute"
-        smooth_window: 5
-        median_window: 3
-        min_on_duration: 59
-        min_off_duration: 59
-        on_threshold: 0.720183
-        off_threshold: 0.720182
-        hysteresis_margin: 0.000001
-        mad: 0.000001
-      VacuumPump1:
-        method: "absolute"
-        smooth_window: 9
-        median_window: 5
-        min_on_duration: 96
-        min_off_duration: 96
-        on_threshold: 0.012579
-        off_threshold: 0.012577
-        hysteresis_margin: 0.000001
-        mad: 0.000001
-      VacuumPump2:
-        method: "absolute"
-        smooth_window: 5
-        median_window: 3
-        min_on_duration: 96
-        min_off_duration: 96
-        on_threshold: 0.017275
-        off_threshold: 0.017274
-        hysteresis_margin: 0.000001
-        mad: 0.000001
-      WashingMachine:
-        method: "delta"
-        smooth_window: 5
-        median_window: 3
-        min_on_duration: 96
-        min_off_duration: 96
-        delta_k: 3.0
-        delta_threshold: 0.000003
-        mad_diff: 0.000001
-  
+  - direction: up
+    event_type: power_on
+    feature_column: power
+    max_gap: 3
+    min_duration: 5
+    threshold: 100.0
+  - direction: down
+    event_type: power_off
+    feature_column: power
+    max_gap: 3
+    min_duration: 5
+    threshold: 50.0
+  - direction: both
+    event_type: state_change
+    feature_column: switch_state
+    max_gap: 1
+    min_duration: 1
+    threshold: 0.5
+  event_detection_threshold: 0.1
   imbalance_handling:
-    enabled: true                 # 启用不平衡标签采样处理
-    strategy: "mixed"             # 采样策略: "oversample", "undersample", "mixed"
-    target_ratio: 0.3             # 目标事件比例
-    
-  sampling_strategy: "mixed"      # 采样策略
-  event_detection_threshold: 0.1  # 事件检测阈值
-
-# Walk-forward交叉验证配置 (Walk-forward Cross-Validation)
-cross_validation:
-  n_folds: 3                    # 交叉验证折数
-  purge_gap_minutes: 10         # 净化间隔(分钟)
-  val_span_days: 3.0            # 验证集时间跨度(天)
-  test_span_days: 3.0           # 测试集时间跨度(天)
-  min_train_days: 7.0           # 最小训练集天数(天)
-  segment_isolation: false      # 关闭段级隔离，数据太少
-  holdout_test: true            # 是否保留测试集
-  time_based_split: true        # 是否基于时间分割
-
-# 不平衡标签处理 (Imbalanced Label Handling)
-imbalance_handling:
-  sampling_strategy: "mixed"    # 采样策略: "oversample", "undersample", "mixed"
-  segment_sampling_weight: 2.0  # 事件密集段的采样权重
-  window_sampling_ratio: 0.3    # 事件窗口的采样比例
-  loss_weighting: true          # 是否使用损失加权
-  focal_loss_gamma: 2.0         # Focal Loss的gamma参数
-  class_weight_auto: true       # 是否自动计算类别权重
-
-# 特征工程配置 (Feature Engineering)
-feature_engineering:
-  normalization:
-    enabled: true               # 是否启用归一化
-    method: "robust"            # 归一化方法: "standard", "minmax", "robust"
-    per_device: true            # 是否按设备归一化
-    per_segment: false          # 是否按段归一化
-  
-  time_features:
-    hour_of_day: true           # 小时特征
-    day_of_week: true           # 星期特征
-    is_weekend: true            # 是否周末
-    is_holiday: false           # 是否节假日(需要节假日数据)
-  
-  statistical_features:
-    rolling_mean: [5, 10, 20]   # 滚动均值窗口
-    rolling_std: [5, 10, 20]    # 滚动标准差窗口
-    rolling_min_max: [10, 20]   # 滚动最值窗口
-    change_rate: true           # 变化率特征
-    energy_integral: true       # 能量积分特征
-    harmonic_ratios: true       # 谐波比值特征（仅使用2/3相信号计算）
-  
-  derived_features:
-    power_ratios: true          # 功率比值特征
-    cross_correlations: false   # 交叉相关特征(计算密集，先关闭)
-    interaction_terms: false    # 交互项特征(可能导致特征爆炸)
-    polynomial_features: false  # 多项式特征
-  
-  # 频域特征统一由顶层 frequency 控制（已简化为 STFT）
-    
-  feature_selection:
-    enabled: true               # 是否启用特征选择
-    method: "mutual_info"       # 特征选择方法: "mutual_info", "f_score", "chi2"
-    k_best: 30                  # 选择前k个特征(减少特征数量)
-    variance_threshold: 0.01    # 方差阈值
-
-# 顶层频域配置 (Frequency Domain Extraction)
-# 说明：数据准备管线从此块读取频域模式与参数，而非 feature_engineering.frequency_domain。
-# 如需切换为 FFT 或 STFT，请在此处设置。
-frequency:
-  # 统一最佳实践：使用 STFT，不再区分 summary/fft
-  signal: "P_kW"         # 优先信号列: P_kW | V2_V | I2_A | Q_kvar
-  n_fft: 256              # FFT 点数（建议与窗口长度一致）
-  win_length: 256         # STFT窗口长度
-  hop_length: 64          # STFT步长（通常 win_length/4）
-  magnitude: true         # 返回幅度谱（true）或复谱（false）
-
-# 评估配置 (Evaluation)
-evaluation:
-  metrics:
-    - "pr_auc"          # PR-AUC
-    - "f1"              # F1分数
-    - "f0.5"            # F0.5分数
-    - "f2"              # F2分数
-    - "recall_at_k"     # Recall@K
-    - "precision"       # 精确率
-    - "recall"          # 召回率
-  
-  threshold_tuning: true        # 是否进行阈值调优
-  probability_calibration: true # 是否进行概率校准
-  event_level_evaluation: true  # 是否进行事件级评估
-  per_device_evaluation: true   # 是否按设备评估
-  
-  visualization:
-    enabled: true               # 是否启用可视化
-    plots:
-      - "confusion_matrix"      # 混淆矩阵
-      - "roc_curve"            # ROC曲线
-      - "pr_curve"             # PR曲线
-      - "calibration_curve"    # 校准曲线
-      - "prediction_timeline"  # 预测时间线
-    save_format: "png"          # 图片保存格式
-    dpi: 300                    # 图片分辨率
-
-# 数据存储配置 (Data Storage)
-data_storage:
-  output_directory: "Data/prepared"     # 输出目录
-  segments_meta_file: "segments_meta.csv"  # 段元数据文件
-  format: "pickle"                      # 存储格式: "csv", "parquet", "pickle"
-  compression: "snappy"                 # 压缩方式
-  version_control: true                 # 是否版本控制
-
-# 随机性控制 (Randomness Control)
-random:
-  seed: 42                      # 随机种子
-  deterministic: true           # 是否确定性运行
-
-# 计算资源配置 (Computational Resources)
-compute:
-  n_jobs: -1                    # 并行作业数(-1表示使用所有CPU)
-  chunk_size: 10000             # 数据块大小
-  memory_limit_gb: 8            # 内存限制(GB)
-
-# 日志配置 (Logging)
+    enabled: true
+    strategy: mixed
+    target_ratio: 0.3
+  label_config:
+    aggregation: any
+    causality_check: true
+    horizon: 3
+    label_type: binary
+  onoff:
+    enabled: true
+    feature_column: P_kW
+    hysteresis_margin: 0.1
+    method: absolute
+    min_off_duration: 5
+    min_on_duration: 5
+    off_threshold: 0.3
+    on_ratio_threshold: 0.5
+    on_threshold: 0.5
+    per_device:
+      ChipPress:
+        hysteresis_margin: 1.0e-06
+        mad: 1.0e-06
+        median_window: 5
+        method: absolute
+        min_off_duration: 67
+        min_on_duration: 67
+        off_threshold: 12.079921
+        on_threshold: 12.079923
+        smooth_window: 9
+      ChipSaw:
+        hysteresis_margin: 1.0e-06
+        mad: 1.0e-06
+        median_window: 5
+        method: absolute
+        min_off_duration: 96
+        min_on_duration: 96
+        off_threshold: 0.010663
+        on_threshold: 0.010665
+        smooth_window: 9
+      HighTemperatureOven:
+        hysteresis_margin: 1.0e-06
+        mad: 1.0e-06
+        median_window: 3
+        method: absolute
+        min_off_duration: 96
+        min_on_duration: 96
+        off_threshold: 2.008029
+        on_threshold: 2.00803
+        smooth_window: 5
+      PickAndPlaceUnit:
+        hysteresis_margin: 1.0e-06
+        mad: 1.0e-06
+        median_window: 5
+        method: absolute
+        min_off_duration: 96
+        min_on_duration: 96
+        off_threshold: -0.002384
+        on_threshold: -0.002382
+        smooth_window: 9
+      ScreenPrinter:
+        hysteresis_margin: 1.0e-06
+        mad: 1.0e-06
+        median_window: 5
+        method: absolute
+        min_off_duration: 96
+        min_on_duration: 96
+        off_threshold: 0.009873
+        on_threshold: 0.009875
+        smooth_window: 9
+      SolderingOven:
+        hysteresis_margin: 1.0e-06
+        mad: 1.0e-06
+        median_window: 3
+        method: absolute
+        min_off_duration: 96
+        min_on_duration: 96
+        off_threshold: 2.709596
+        on_threshold: 2.709597
+        smooth_window: 5
+      VacuumOven:
+        hysteresis_margin: 1.0e-06
+        mad: 1.0e-06
+        median_window: 3
+        method: absolute
+        min_off_duration: 59
+        min_on_duration: 59
+        off_threshold: 0.720182
+        on_threshold: 0.720183
+        smooth_window: 5
+      VacuumPump1:
+        hysteresis_margin: 1.0e-06
+        mad: 1.0e-06
+        median_window: 5
+        method: absolute
+        min_off_duration: 96
+        min_on_duration: 96
+        off_threshold: 0.012577
+        on_threshold: 0.012579
+        smooth_window: 9
+      VacuumPump2:
+        hysteresis_margin: 1.0e-06
+        mad: 1.0e-06
+        median_window: 3
+        method: absolute
+        min_off_duration: 96
+        min_on_duration: 96
+        off_threshold: 0.017274
+        on_threshold: 0.017275
+        smooth_window: 5
+      WashingMachine:
+        delta_k: 3.0
+        delta_threshold: 3.0e-06
+        mad_diff: 1.0e-06
+        median_window: 3
+        method: delta
+        min_off_duration: 96
+        min_on_duration: 96
+        smooth_window: 5
+    smooth_window: 3
+  sampling_strategy: mixed
 logging:
-  level: "INFO"                 # 日志级别
-  file: "logs/data_prep.log"    # 日志文件
-  console: true                 # 是否输出到控制台
+  console: true
+  file: logs/data_prep.log
+  level: INFO
+random:
+  deterministic: true
+  seed: 42
+segmentation:
+  fill_method: forward
+  fill_small_gaps: true
+  gap_threshold_seconds: 300
+  max_segment_hours: 24
+  min_segment_length: 100
+  small_gap_threshold: 30
+windowing:
+  default_step_size: 128
+  default_window_length: 256
+  max_filled_ratio: 0.3
+  max_windows_per_segment: 500
+  overlap_across_sets: false
+  overlap_within_set: true
+  step_sizes:
+  - 128
+  window_lengths:
+  - 256

@@ -83,19 +83,27 @@ class WalkForwardCV:
         folds = []
         
         for fold_id in range(self.n_folds):
-            # 计算验证集时间窗口
-            val_end = global_start + (fold_id + 1) * fold_span
-            val_start = val_end - val_span_seconds
-            
-            # 计算训练集时间窗口
+            # 扩展式时间窗口：每次使用从 global_start 到当前折终点的全部数据
+            used_span = cv_span * (fold_id + 1) // self.n_folds
+            fold_end = global_start + used_span
+            if fold_id == self.n_folds - 1:
+                fold_end = cv_end
+
+            # 80/20 时间比例，验证集为末尾20%（相对于当前使用的总跨度）
+            total_used_span = fold_end - global_start
+            val_span_seconds_ratio = max(int(total_used_span * 0.2), 1)
+            val_end = fold_end
+            val_start = val_end - val_span_seconds_ratio
+
+            # 训练集为前80%，并与验证集之间留 purge gap；训练起点固定为 global_start，实现滚动扩展
+            train_start = global_start
             train_end = val_start - self.purge_gap_seconds
-            train_start = max(global_start, train_end - min_train_seconds * (fold_id + 1))
-            
+
             # 确保训练集足够长
             if train_end - train_start < min_train_seconds:
                 logger.warning(f"折 {fold_id} 训练集时间不足，跳过")
                 continue
-            
+
             # 创建CV折
             fold = CVFold(
                 fold_id=fold_id,

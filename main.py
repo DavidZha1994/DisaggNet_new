@@ -29,9 +29,23 @@ from typing import Optional, Dict, Any
 import yaml
 import platform
 
-# macOS: 预先设置 OpenMP 运行时重复加载的进程级容忍，避免导入期崩溃
-if platform.system() == "Darwin" and "KMP_DUPLICATE_LIB_OK" not in os.environ:
-    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+# 强制 UTF-8 输出，修复 Windows 控制台中文乱码
+import locale
+os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
+os.environ.setdefault('PYTHONUTF8', '1')
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+# Windows 控制台切换到 UTF-8 代码页
+if os.name == 'nt':
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+        ctypes.windll.kernel32.SetConsoleCP(65001)
+    except Exception:
+        pass
 
 import torch
 import pytorch_lightning as pl
@@ -45,7 +59,6 @@ sys.path.insert(0, str(project_root / "src"))
 # 导入项目模块
 from src.train import main as train_main
 from src.eval import main as eval_main
-from src.infer import main as infer_main
 from src.walk_forward import run_walk_forward_validation as walk_forward_main
 # 延迟导入 HPO 组件，避免在未使用时因可选依赖报错
 optuna_main = None
@@ -53,7 +66,8 @@ optuna_main = None
 # 设置日志
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    encoding='utf-8'
 )
 logger = logging.getLogger(__name__)
 
@@ -71,19 +85,27 @@ class UnifiedTrainingSystem:
         self.checkpoints_dir.mkdir(exist_ok=True)
         self.logs_dir.mkdir(exist_ok=True)
     
-    def setup_environment(self, config_name: str = "optimized_stable") -> DictConfig:
-        """设置训练环境（合并 base 与目标配置）"""
-        # 加载配置
-        config_path = self.configs_dir / f"{config_name}.yaml"
-        if not config_path.exists():
-            logger.warning(f"配置文件 {config_path} 不存在，使用默认配置")
-            config_path = self.configs_dir / "default.yaml"
-
-        # 手工合并 base.yaml 与目标配置，避免仅 OmegaConf.load 无法解析 Hydra defaults
-        base_config_path = self.configs_dir / "base.yaml"
-        base_cfg = OmegaConf.load(base_config_path) if base_config_path.exists() else OmegaConf.create({})
-        user_cfg = OmegaConf.load(config_path)
-        config = OmegaConf.merge(base_cfg, user_cfg)
+    def setup_environment(self, config_ref: str = "configs/default.yaml") -> DictConfig:
+        """设置训练环境（仅加载单一配置文件；支持路径或名称）"""
+        # 解析配置引用：支持绝对/相对路径或简短名称
+        cfg_path: Path
+        try:
+            is_path_like = (config_ref.endswith('.yaml') or os.sep in config_ref or '/' in config_ref)
+        except Exception:
+            is_path_like = False
+        if is_path_like:
+            cfg_path = Path(config_ref)
+            if not cfg_path.is_absolute():
+                cfg_path = self.project_root / cfg_path
+        else:
+            cfg_path = self.configs_dir / f"{config_ref}.yaml"
+        
+        if not cfg_path.exists():
+            logger.warning(f"配置文件 {cfg_path} 不存在，使用默认配置")
+            cfg_path = self.configs_dir / "default.yaml"
+        
+        # 仅加载单一配置文件（不再合并 base.yaml）
+        config = OmegaConf.load(cfg_path)
         
         # 设置随机种子（优先使用 reproducibility.seed，其次回退到顶层 seed，再默认 42）
         if hasattr(config, 'reproducibility') and hasattr(config.reproducibility, 'seed'):
@@ -105,15 +127,15 @@ class UnifiedTrainingSystem:
                 torch.autograd.set_detect_anomaly(True)
                 logger.info("已启用PyTorch异常检测")
         
-        logger.info(f"环境设置完成，使用配置: {config_name}")
+        logger.info(f"环境设置完成，使用配置: {cfg_path}")
         return config
     
-    def train_basic(self, config_name: str = "optimized_stable", **kwargs) -> None:
-        """基础训练"""
-        logger.info(f"开始基础训练，配置: {config_name}")
+    def train_basic(self, config_ref: str = "configs/default.yaml", **kwargs) -> None:
+        """训练"""
+        logger.info(f"开始训练，配置: {config_ref}")
         
         try:
-            config = self.setup_environment(config_name)
+            config = self.setup_environment(config_ref)
             
             # 更新配置参数（支持嵌套项覆盖）
             for key, value in kwargs.items():
@@ -140,10 +162,10 @@ class UnifiedTrainingSystem:
             
             # 调用训练函数
             train_main(config)
-            logger.info("基础训练完成")
+            logger.info("训练完成")
             
         except Exception as e:
-            logger.error(f"基础训练失败: {e}")
+            logger.error(f"训练失败: {e}")
             raise
     
     def optimize_hyperparameters(self, 
@@ -238,6 +260,9 @@ class UnifiedTrainingSystem:
             else:
                 output_path = Path(config.paths.output_dir) / "inference"
             
+            # 延迟导入推理模块，避免非推理路径导入失败
+            from src.infer import main as infer_main
+            
             # 调用推理函数
             results = infer_main(config, checkpoint_path, data_path, output_path)
             logger.info("模型推理完成")
@@ -320,7 +345,7 @@ def create_parser() -> argparse.ArgumentParser:
     
     # 基础训练
     train_parser = subparsers.add_parser("train", help="基础训练")
-    train_parser.add_argument("--config", default="optimized_stable", help="配置文件名")
+    train_parser.add_argument("--config", default="configs/default.yaml", help="配置文件路径或名称")
     train_parser.add_argument("--epochs", type=int, help="训练轮数")
     train_parser.add_argument("--batch-size", type=int, help="批次大小")
     train_parser.add_argument("--lr", type=float, help="学习率")

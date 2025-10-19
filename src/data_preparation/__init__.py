@@ -9,7 +9,7 @@ Data Preparation Module
 - 特征工程 (FeatureEngineer)
 - 标签处理 (LabelHandler)
 - 评估系统 (EventEvaluator)
-- 主流程 (DataPreparationPipeline)
+- HIPE数据准备流程 (HIPEDataPreparationPipeline)
 """
 
 from .segmentation import DataSegmenter
@@ -18,7 +18,6 @@ from .cross_validation import WalkForwardCV
 from .feature_engineering import FeatureEngineer
 from .label_handling import LabelHandler
 from .evaluation import EventEvaluator
-from .pipeline import DataPreparationPipeline
 from .hipe_pipeline import HIPEDataPreparationPipeline
 
 __all__ = [
@@ -28,6 +27,5 @@ __all__ = [
     'FeatureEngineer',
     'LabelHandler',
     'EventEvaluator',
-    'DataPreparationPipeline',
     'HIPEDataPreparationPipeline'
 ]
