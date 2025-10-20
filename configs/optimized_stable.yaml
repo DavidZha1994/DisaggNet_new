@@ -1,53 +1,130 @@
-# DisaggNet 稳定优化配置
-# 继承基础配置，针对稳定性和性能进行优化
+# DisaggNet 稳定优化配置（自包含，适配当前训练流水线）
 
-defaults:
-  - base
+project_name: "DisaggNet"
 
 experiment:
   name: "optimized_stable"
 
+# 复现与稳定性
+reproducibility:
+  seed: 42
+  deterministic: true
+  benchmark: false
+
+paths:
+  output_dir: "outputs"
+  data_dir: "Data"
+  prepared_dir: "Data/prepared"
+
 logging:
+  save_dir: "logs/tensorboard"
   version: "stable"
 
-# 优化的数据设置
+# 数据设置（稳定版）
 data:
   batch_size: 64
   num_workers: 8
+  pin_memory: true
+  persistent_workers: false
+  prefetch_factor: 2
   device_names: ["device"]
+  window_size: 1024
 
-# 优化的模型设置
+# 模型设置（融合Transformer）
 model:
+  d_model: 256
+  n_heads: 8
   num_layers: 8
   dropout: 0.2
   calibration:
     enable: true
+  time_encoder:
+    d_model: 256
+    n_heads: 8
+    num_layers: 8
+    dropout: 0.2
+    input_conv_embed: false
+    causal_mask: true
+  freq_encoder:
+    enable: true
+    proj_dim: 128
+    conv1d_kernel: 3
+    small_transformer_layers: 0
+    dropout: 0.1
+  fusion:
+    type: "cross_attention"
+    gated: true
+  aux_encoder:
+    enable: false
+    hidden: 128
+    dropout: 0.1
   heads:
+    regression:
+      hidden: 96
+      dropout: 0.1
     classification:
       init_p: [0.1]
 
-# 优化的训练设置
+# 训练设置（稳定优化）
 training:
   max_epochs: 100
+  min_epochs: 1
+  precision: "32"
+  log_every_n_steps: 10
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  check_val_every_n_epoch: 1
+  accelerator: "auto"
   devices: auto
+  monitor_device_stats: false
+  visualization:
+    enable: false
+    plot_event_only: true
+    max_plots_per_epoch: 8
   optimizer:
+    name: "adamw"
     lr: 0.0005
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
   scheduler:
+    name: "cosine"
     warmup_steps: 1000
     T_max: 200
-  
-  # 事件关注配置（稳定版：适度提升事件样本权重）
+    eta_min: 1e-6
+  checkpoint:
+    dirpath: "outputs/checkpoints"
+    filename: "epochepoch={epoch:02d}-v{version}"
+    monitor: "val/loss"
+    mode: "min"
+    save_top_k: 1
+  early_stopping:
+    enable: true
+    monitor: "val/loss"
+    patience: 15
+    mode: "min"
+    min_delta: 0.001
+  masking:
+    window_strategy: "none"
+    min_valid_ratio_time: 0.5
+    min_valid_ratio_freq: 0.5
+    combine_modalities: "min"
+    downweight_power: 1.0
+    epsilon: 0.0
   event_focus:
     enable: true
     weight: 1.5
-  
-  # 训练期可视化设置（减少绘图数量以提升训练稳定性）
-  visualization:
-    plot_event_only: true
-    max_plots_per_epoch: 8
 
-# 损失设置（优化版本）
+# 损失设置（优化版，含兼容字段）
 loss:
+  # 顶层权重（兼容旧读取路径）
+  classification_weight: 1.0
+  regression_weight: 1.0
+  conservation_weight: 0.5
+  consistency_weight: 1.0
+  focal_alpha: 1.0
+  focal_gamma: 2.0
+  huber_delta: 1.0
+  # 嵌套权重结构（新版本）
   weights:
     regression: 1.0
     classification: 1.0
@@ -74,11 +151,13 @@ loss:
 # 评估设置
 evaluation:
   threshold_method: "optimal"
-  # 降低全零窗口在指标计算中的权重（0~1）
   zero_window_weight: 0.1
+  test_after_training: false
 
 # 不平衡处理
 imbalance_handling:
+  use_weighted_sampling: true
+  pos_weight_auto: true
   sampling_strategy: "mixed"
 
 # Walk-Forward 交叉验证（优化版本）
@@ -92,25 +171,29 @@ walk_forward:
   holdout_test: true
   time_based_split: true
 
+# 窗口设置（数据准备参考）
+windowing:
+  window_size: 1024
+  stride: 512
+  overlap: 0.5
+
+# 共形预测（默认关闭）
+conformal_prediction:
+  enabled: false
+  alpha: 0.1
+  regression_method: "quantile"
+  classification_method: "adaptive"
+
 # 稳定性设置
 stability:
   numerical:
     detect_anomaly: true
-    gradient_clip_val: 1.0
   reproducibility:
     deterministic: true
     benchmark: false
 
-# 数据准备设置（优化版本）
-data_preparation:
-  window_size: 1024
-  stride: 512
-  feature_engineering:
-    enable_advanced: true
-    statistical_windows: [12, 24, 48]
-
-# 复现实验设置（供 main.py 使用）
-reproducibility:
-  seed: 42
-  deterministic: true
-  benchmark: false
+# 调试
+debug:
+  track_grad_norm: 0
+  strict_validation: false
+  log_model_graph: false

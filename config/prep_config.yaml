@@ -96,7 +96,7 @@ hipe:
     P_kW: P_kW
     Q_kvar: Q_kvar
     S_kVA: S_kVA
-  mains_file: MainTerminal*_PhaseCount_*.csv
+  mains_file: MainTerminal_PhaseCount_3_geq_2017-10-01_lt_2018-01-01.csv
   on_power_threshold_w: 0.5
   on_ratio_threshold: 0.5
   resample_seconds: 5

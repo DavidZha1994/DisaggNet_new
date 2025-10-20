@@ -31,15 +31,16 @@ class PositionalEncoding(nn.Module):
 
 
 class CausalMultiHeadAttention(nn.Module):
-    """因果多头注意力"""
+    """因果/通用多头注意力（在MPS上禁用SDPA，使用安全实现）"""
     
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, causal: bool = True):
         super().__init__()
         assert d_model % n_heads == 0
         
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
+        self.causal = causal
         
         self.w_q = nn.Linear(d_model, d_model)
         self.w_k = nn.Linear(d_model, d_model)
@@ -49,57 +50,59 @@ class CausalMultiHeadAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.scale = math.sqrt(self.d_k)
         
-        # 注册因果mask
+        # 注册因果mask（仅当causal为True时使用）
         self.register_buffer('causal_mask', None)
-    
+
     def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        if self.causal_mask is None or self.causal_mask.size(0) < seq_len:
+        if self.causal_mask is None or self.causal_mask.size(0) != seq_len:
             mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1)
-            mask = mask.masked_fill(mask == 1, float('-inf'))
             self.causal_mask = mask
-        return self.causal_mask[:seq_len, :seq_len]
-    
+        return self.causal_mask
+
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, 
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        batch_size, seq_len, _ = query.size()
+        batch_size, q_len, _ = query.size()
+        k_len = key.size(1)
         
         # Linear projections
-        Q = self.w_q(query).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
-        K = self.w_k(key).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
-        V = self.w_v(value).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        Q = self.w_q(query).view(batch_size, q_len, self.n_heads, self.d_k).transpose(1, 2)
+        K = self.w_k(key).view(batch_size, k_len, self.n_heads, self.d_k).transpose(1, 2)
+        V = self.w_v(value).view(batch_size, k_len, self.n_heads, self.d_k).transpose(1, 2)
         
-        # 构建因果mask
-        causal_mask = self._get_causal_mask(seq_len, query.device)
-        attn_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, self.n_heads, -1, -1)
+        # 构建注意力mask
+        attn_mask = None
+        if self.causal:
+            causal_mask = self._get_causal_mask(q_len, query.device)
+            attn_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, self.n_heads, -1, -1)
         
-        # Apply additional mask if provided
         if mask is not None:
-            additional_mask = mask.unsqueeze(1).unsqueeze(1).expand(-1, self.n_heads, seq_len, -1)
-            attn_mask = attn_mask.masked_fill(additional_mask == 0, float('-inf'))
+            # 扩展到多头维度，屏蔽无效位置（key维度）
+            additional_mask = mask.unsqueeze(1).unsqueeze(1).expand(-1, self.n_heads, q_len, -1)
+            attn_mask = additional_mask if attn_mask is None else attn_mask.masked_fill(additional_mask == 0, float('-inf'))
         
-        # 使用fused scaled_dot_product_attention（PyTorch 2.0+）
-        try:
+        # 在MPS上禁用F.scaled_dot_product_attention以避免NDArray断言错误
+        use_fused_sdpa = hasattr(F, 'scaled_dot_product_attention') and not torch.backends.mps.is_available()
+        
+        if use_fused_sdpa:
             context = F.scaled_dot_product_attention(
-                Q, K, V, 
+                Q, K, V,
                 attn_mask=attn_mask,
                 dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=False  # 我们已经提供了mask
+                is_causal=False
             )
-        except AttributeError:
-            # 回退到手动实现（PyTorch < 2.0）
-            scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
-            scores = scores + attn_mask
-            scores = scores.clamp(min=-50.0, max=50.0)  # 数值保护
-            attn_weights = F.softmax(scores, dim=-1)
-            attn_weights = self.dropout(attn_weights)
-            context = torch.matmul(attn_weights, V)
+        else:
+            # 安全实现（手动softmax路径），兼容MPS
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # (B, H, q_len, k_len)
+            if attn_mask is not None:
+                scores = scores.masked_fill(attn_mask == float('-inf'), float('-inf'))
+                scores = scores.masked_fill(attn_mask == 0, float('-inf'))
+            attn = torch.softmax(scores, dim=-1)
+            attn = self.dropout(attn)
+            context = torch.matmul(attn, V)  # (B, H, q_len, d_k)
         
-        # 重塑输出
-        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
-        
-        # Output projection
-        output = self.w_o(context)
-        return output
+        # 合并头
+        context = context.transpose(1, 2).contiguous().view(batch_size, q_len, self.d_model)
+        return self.w_o(context)
 
 
 class TransformerBlock(nn.Module):
@@ -108,10 +111,8 @@ class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1, causal: bool = True):
         super().__init__()
         
-        if causal:
-            self.attention = CausalMultiHeadAttention(d_model, n_heads, dropout)
-        else:
-            self.attention = nn.MultiheadAttention(d_model, n_heads, dropout, batch_first=True)
+        # 统一使用安全注意力实现（在MPS上禁用SDPA）
+        self.attention = CausalMultiHeadAttention(d_model, n_heads, dropout, causal=causal)
         
         self.feed_forward = nn.Sequential(
             nn.Linear(d_model, d_ff),
@@ -127,15 +128,9 @@ class TransformerBlock(nn.Module):
         self.causal = causal
     
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # Pre-LN 自注意力
         x_norm = self.norm1(x)
-        if self.causal:
-            attn_output = self.attention(x_norm, x_norm, x_norm, mask)
-        else:
-            attn_output, _ = self.attention(x_norm, x_norm, x_norm, key_padding_mask=mask)
+        attn_output = self.attention(x_norm, x_norm, x_norm, mask)
         x = x + self.dropout(attn_output)
-        
-        # Pre-LN 前馈
         x_ff = self.feed_forward(self.norm2(x))
         x = x + self.dropout(x_ff)
         return x
@@ -338,7 +333,7 @@ class AuxEncoder(nn.Module):
 
 
 class CrossAttentionFusion(nn.Module):
-    """交叉注意力融合（注册频域投射层）"""
+    """交叉注意力融合（在MPS上使用安全注意力实现）"""
     
     def __init__(self, d_model: int, n_heads: int = 8, dropout: float = 0.1, gated: bool = True, freq_proj_in: Optional[int] = None, bidirectional: bool = False):
         super().__init__()
@@ -347,20 +342,17 @@ class CrossAttentionFusion(nn.Module):
         self.gated = gated
         self.bidirectional = bidirectional
         
-        # 交叉注意力：时域作为Query，频域作为Key/Value
-        self.cross_attention = nn.MultiheadAttention(d_model, n_heads, dropout, batch_first=True)
+        # 交叉注意力：时域作为Query，频域作为Key/Value（非因果）
+        self.cross_attention = CausalMultiHeadAttention(d_model, n_heads, dropout, causal=False)
         
-        # 双向交叉注意力（可选）
         if bidirectional:
-            self.reverse_cross_attention = nn.MultiheadAttention(d_model, n_heads, dropout, batch_first=True)
+            self.reverse_cross_attention = CausalMultiHeadAttention(d_model, n_heads, dropout, causal=False)
         
-        # 频域到时域维度投射（已注册参数）
         if freq_proj_in is not None and freq_proj_in != d_model:
             self.freq_proj = nn.Linear(freq_proj_in, d_model)
         else:
             self.freq_proj = None
         
-        # 门控机制
         if gated:
             fusion_input_dim = d_model * 3 if bidirectional else d_model * 2
             self.gate = nn.Sequential(
@@ -370,11 +362,9 @@ class CrossAttentionFusion(nn.Module):
         
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-    
+
     def forward(self, time_repr: torch.Tensor, freq_repr: torch.Tensor) -> torch.Tensor:
-        # time_repr: (batch_size, seq_len, d_model)
-        # freq_repr: (batch_size, proj_dim) -> 需要扩展到seq_len
-        
+        # time_repr: (B, T, D), freq_repr: (B, D) 或 (B, T, D)
         if freq_repr is None:
             return time_repr
         
@@ -382,18 +372,18 @@ class CrossAttentionFusion(nn.Module):
         
         # 将频域表示扩展到序列长度
         if freq_repr.dim() == 2:
-            freq_repr = freq_repr.unsqueeze(1).expand(-1, seq_len, -1)  # (batch_size, seq_len, proj_dim)
+            freq_repr = freq_repr.unsqueeze(1).expand(-1, seq_len, -1)
         
-        # 确保维度匹配（使用已注册层）
+        # 维度投射（如需要）
         if self.freq_proj is not None:
             freq_repr = self.freq_proj(freq_repr)
         
         # 交叉注意力：时域->频域
-        attn_output, _ = self.cross_attention(time_repr, freq_repr, freq_repr)
+        attn_output = self.cross_attention(time_repr, freq_repr, freq_repr)
         
         # 双向交叉注意力（可选）
         if self.bidirectional:
-            reverse_attn_output, _ = self.reverse_cross_attention(freq_repr, time_repr, time_repr)
+            reverse_attn_output = self.reverse_cross_attention(freq_repr, time_repr, time_repr)
         
         # 门控融合
         if self.gated:
@@ -414,12 +404,11 @@ class CrossAttentionFusion(nn.Module):
         
         # 残差连接和层归一化
         output = self.norm(fused_repr + self.dropout(attn_output))
-        
         return output
 
 
 class MultiTaskHead(nn.Module):
-    """多任务预测头（回归+分类），可选 Unknown/Residual 回归头"""
+    """多任务预测头（回归+分类），使用安全注意力池化避免MPS崩溃"""
     
     def __init__(self, d_model: int, n_devices: int, hidden_dim: int = 128, 
                  init_p: Optional[float] = None, enable_film: bool = False, 
@@ -432,39 +421,33 @@ class MultiTaskHead(nn.Module):
         self.enable_routing = enable_routing
         self.include_unknown = include_unknown
         
-        # 注意力池化层
-        self.attention_pooling = nn.MultiheadAttention(d_model, num_heads=8, batch_first=True)
+        # 使用安全注意力池化（非因果）
+        self.attention_pooling = CausalMultiHeadAttention(d_model, n_heads=8, dropout=0.1, causal=False)
         
-        # 设备嵌入移到输出层作为可学习向量，避免特征泄漏
-        # 每个设备头都有独立的可学习嵌入向量
         self.device_embeddings = nn.Embedding(n_devices, d_model)
         
-        # FiLM条件化层（可选）
         if enable_film:
             self.film_gamma = nn.Linear(d_model, d_model)
             self.film_beta = nn.Linear(d_model, d_model)
         
-        # 轻量级路由机制（可选）
         if enable_routing:
             self.routing_gate = nn.Sequential(
-                nn.Linear(d_model * 2, d_model),  # 融合特征 + 设备嵌入
+                nn.Linear(d_model * 2, d_model),
                 nn.Tanh(),
                 nn.Linear(d_model, n_devices),
                 nn.Softmax(dim=-1)
             )
         
-        # 回归头（功率预测）
         self.regression_heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(d_model, hidden_dim),
                 nn.ReLU(),
                 nn.Dropout(0.1),
                 nn.Linear(hidden_dim, 1),
-                nn.ReLU()  # 确保功率非负
+                nn.ReLU()
             ) for _ in range(n_devices)
         ])
         
-        # Unknown / Residual 回归头（全局能量未归属部分，非负）
         if self.include_unknown:
             self.unknown_regression_head = nn.Sequential(
                 nn.Linear(d_model, hidden_dim),
@@ -476,7 +459,6 @@ class MultiTaskHead(nn.Module):
         else:
             self.unknown_regression_head = None
         
-        # 分类头（开关状态）
         self.classification_heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(d_model, hidden_dim),
@@ -487,14 +469,12 @@ class MultiTaskHead(nn.Module):
             ) for _ in range(n_devices)
         ])
         
-        # 初始化分类头偏置
         if init_p is not None:
-            # 支持标量或按设备列表
             if isinstance(init_p, (list, tuple)) or isinstance(init_p, ListConfig):
                 for i, head in enumerate(self.classification_heads):
                     p = float(init_p[i]) if i < len(init_p) else float(init_p[-1])
                     p = max(min(p, 1 - 1e-6), 1e-6)
-                    final_layer = head[-2]  # Sigmoid前的Linear层
+                    final_layer = head[-2]
                     nn.init.constant_(final_layer.bias, math.log(p / (1 - p)))
             else:
                 p = float(init_p)
@@ -502,75 +482,46 @@ class MultiTaskHead(nn.Module):
                 for head in self.classification_heads:
                     final_layer = head[-2]
                     nn.init.constant_(final_layer.bias, math.log(p / (1 - p)))
-    
 
-    
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """
-        前向传播
-        Args:
-            x: 输入特征 (batch_size, seq_len, d_model)
-        Returns:
-            regression_pred: 回归预测 (batch_size, n_devices)
-            classification_pred: 分类预测 (batch_size, n_devices)
-            unknown_pred: Unknown 回归预测 (batch_size, 1) 或 None
-        """
         batch_size = x.size(0)
         
-        # 注意力池化得到全局表示
-        pooled_x, _ = self.attention_pooling(x, x, x)  # (batch_size, seq_len, d_model)
-        global_repr = pooled_x.mean(dim=1)  # (batch_size, d_model)
+        pooled_x = self.attention_pooling(x, x, x)  # (batch_size, seq_len, d_model)
+        global_repr = pooled_x.mean(dim=1)
         
-        # 获取所有设备的嵌入向量
         device_ids = torch.arange(self.n_devices, device=x.device)
-        device_embeds = self.device_embeddings(device_ids)  # (n_devices, d_model)
+        device_embeds = self.device_embeddings(device_ids)
         
-        # 扩展全局表示以匹配设备数量
-        global_repr_expanded = global_repr.unsqueeze(1).expand(-1, self.n_devices, -1)  # (batch_size, n_devices, d_model)
-        device_embeds_expanded = device_embeds.unsqueeze(0).expand(batch_size, -1, -1)  # (batch_size, n_devices, d_model)
+        global_repr_expanded = global_repr.unsqueeze(1).expand(-1, self.n_devices, -1)
+        device_embeds_expanded = device_embeds.unsqueeze(0).expand(batch_size, -1, -1)
         
-        # 融合全局特征和设备嵌入
         if self.enable_routing:
-            # 轻量级路由：基于全局特征和设备嵌入计算路由权重
             routing_input = torch.cat([global_repr_expanded, device_embeds_expanded], dim=-1)
-            routing_weights = self.routing_gate(routing_input)  # (batch_size, n_devices, n_devices)
-            
-            # 应用路由权重
-            device_repr = torch.bmm(routing_weights, device_embeds_expanded)  # (batch_size, n_devices, d_model)
+            routing_weights = self.routing_gate(routing_input)
+            device_repr = torch.bmm(routing_weights, device_embeds_expanded)
             combined_repr = global_repr_expanded + device_repr
         else:
-            # 简单加法融合
             combined_repr = global_repr_expanded + device_embeds_expanded
         
-        # FiLM条件化（可选）
         if self.enable_film:
             gamma = self.film_gamma(device_embeds_expanded)
             beta = self.film_beta(device_embeds_expanded)
             combined_repr = gamma * combined_repr + beta
         
-        # 多任务预测
         regression_preds = []
         classification_preds = []
-        
         for i in range(self.n_devices):
-            device_features = combined_repr[:, i, :]  # (batch_size, d_model)
-            
-            # 回归预测（功率）
-            reg_pred = self.regression_heads[i](device_features)  # (batch_size, 1)
+            device_features = combined_repr[:, i, :]
+            reg_pred = self.regression_heads[i](device_features)
             regression_preds.append(reg_pred)
-            
-            # 分类预测（开关状态）
-            cls_pred = self.classification_heads[i](device_features)  # (batch_size, 1)
+            cls_pred = self.classification_heads[i](device_features)
             classification_preds.append(cls_pred)
         
-        # 拼接所有设备的预测结果
-        regression_pred = torch.cat(regression_preds, dim=1)  # (batch_size, n_devices)
-        classification_pred = torch.cat(classification_preds, dim=1)  # (batch_size, n_devices)
+        regression_pred = torch.cat(regression_preds, dim=1)
+        classification_pred = torch.cat(classification_preds, dim=1)
         
-        # Unknown / Residual 回归
-        unknown_pred: Optional[torch.Tensor]
         if self.unknown_regression_head is not None:
-            unknown_pred = self.unknown_regression_head(global_repr)  # (batch_size, 1)
+            unknown_pred = self.unknown_regression_head(global_repr)
         else:
             unknown_pred = None
         

@@ -85,12 +85,14 @@ class NILMLightningModule(pl.LightningModule):
         
         # 当前仅做seq2seq功率回归，强制关闭分类相关学习
         self.loss_fn.classification_weight = 0.0
+        # 明确暴露分类开关属性以配合测试和下游逻辑
+        self.classification_enabled = False
 
         # 训练期度量学习（蒸馏/对比学习）开关与组件，仅训练使用
         ml_conf = getattr(getattr(config, 'aux_training', None), 'metric_learning', None)
         self.metric_learning_enable = bool(getattr(ml_conf, 'enable', False))
-        self.metric_margin = float(getattr(ml_conf, 'margin', 0.2) if ml_conf is not None else 0.2)
-        self.metric_weight = float(getattr(ml_conf, 'weight', 0.2) if ml_conf is not None else 0.2)
+        self.metric_margin = max(0.0, float(getattr(ml_conf, 'margin', 0.2) if ml_conf is not None else 0.2))
+        self.metric_weight = max(0.0, float(getattr(ml_conf, 'weight', 0.2) if ml_conf is not None else 0.2))
         self.metric_use_power = bool(getattr(ml_conf, 'use_power', False) if ml_conf is not None else False)
         if self.metric_learning_enable:
             embed_dim = int(getattr(getattr(config.model.time_encoder, 'd_model', None), 'value', config.model.time_encoder.d_model)) if hasattr(config.model.time_encoder, 'd_model') else config.model.time_encoder.d_model
@@ -109,9 +111,13 @@ class NILMLightningModule(pl.LightningModule):
         self.conformal_predictor = None
         self.conformal_evaluator = None
         
-        # 验证集最佳指标
-        self.best_val_score = 0.0
-        
+        # 验证集最佳指标（与ModelCheckpoint的模式对齐）
+        ckpt_cfg = getattr(getattr(config, 'training', None), 'checkpoint', None)
+        mode = str(getattr(ckpt_cfg, 'mode', 'max')).lower() if ckpt_cfg is not None else 'max'
+        self.best_val_score = float('-inf') if mode == 'max' else float('inf')
+        # 兼容下游摘要与推理：在仅序列回归场景下也提供阈值占位
+        self.best_thresholds = {}
+
         # 训练状态
         self.automatic_optimization = True
 
@@ -158,9 +164,40 @@ class NILMLightningModule(pl.LightningModule):
         out = self.model.forward_with_embeddings(time_features, freq_features, time_positional, aux_features, time_valid_mask=batch.get('time_valid_mask', None), freq_valid_mask=batch.get('freq_valid_mask', None))
         return out
     
-    def _compute_metrics(self, batch: Dict[str, torch.Tensor], stage: str = 'val') -> Dict[str, float]:
-        """仅计算序列级指标（MAE/RMSE/DTW），不再涉及窗口/平均功率相关逻辑。"""
+    def _compute_metrics(self, batch: Dict[str, torch.Tensor], preds: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, stage: str = 'val') -> Dict[str, float]:
+        """计算评估指标。
+
+        - 若提供 `preds=(pred_power, pred_states)`，计算窗口级 NILM 指标（MAE/NDE/SAE/TECA），并根据 `classification_enabled` 决定是否计算分类指标。
+        - 若未提供，则计算序列级指标（MAE/RMSE/DTW），与当前 seq2seq 训练保持一致。
+        """
         metrics: Dict[str, float] = {}
+
+        # 分支A：窗口级 NILM 指标（测试/旧逻辑兼容）
+        if preds is not None and isinstance(preds, tuple) and len(preds) >= 2:
+            try:
+                pred_power, pred_states = preds[0], preds[1]
+                y_true_power = batch.get('target_power', None)
+                y_true_states = batch.get('target_states', None)
+                if y_true_power is None or y_true_states is None:
+                    metrics.setdefault('score', float('nan'))
+                    return metrics
+                from src.utils.metrics import NILMMetrics
+                nilm = NILMMetrics(self.device_names)
+                nilm_results = nilm.compute_all_metrics(
+                    pred_power, pred_states, y_true_power, y_true_states,
+                    optimize_thresholds=False,
+                    classification_enabled=bool(getattr(self, 'classification_enabled', False))
+                )
+                metrics.update(nilm_results)
+                # 安全记录一个通用分数
+                if 'score' in metrics:
+                    self._safe_log(f'{stage}/score', metrics['score'], on_epoch=True, on_step=False, prog_bar=True, sync_dist=True)
+                return metrics
+            except Exception:
+                # 回退到序列指标
+                pass
+
+        # 分支B：序列级指标（默认）
         target_seq = batch.get('target_seq', None)
         if target_seq is None:
             metrics.setdefault('score', float('nan'))
@@ -176,10 +213,28 @@ class NILMLightningModule(pl.LightningModule):
                     freq_valid_mask=batch.get('freq_valid_mask')
                 )
             pred_seq = seq_out[0] if isinstance(seq_out, tuple) else seq_out
-            # MAE/RMSE（按 B、T、K 汇总）
-            seq_mae = torch.nanmean(torch.abs(pred_seq - target_seq)).item()
-            seq_rmse = torch.sqrt(torch.nanmean((pred_seq - target_seq) ** 2)).item()
-            
+            # MAE/RMSE（按 B、T、K 汇总，使用有效掩码）
+            valid = torch.isfinite(pred_seq) & torch.isfinite(target_seq)
+            vm = batch.get('target_seq_valid_mask', None)
+            try:
+                if isinstance(vm, torch.Tensor):
+                    if vm.dim() == pred_seq.dim():
+                        valid = valid & (vm > 0)
+                    elif vm.dim() + 1 == pred_seq.dim():
+                        valid = valid & (vm.unsqueeze(-1) > 0)
+            except Exception:
+                pass
+
+            element_mae = torch.abs(pred_seq - target_seq)
+            element_mse = (pred_seq - target_seq) ** 2
+            denom = valid.float().sum().clamp_min(1.0)
+            element_mae_masked = torch.where(valid, element_mae, torch.zeros_like(element_mae))
+            element_mse_masked = torch.where(valid, element_mse, torch.zeros_like(element_mse))
+            seq_mae = element_mae_masked.sum() / denom
+            seq_rmse = torch.sqrt(element_mse_masked.sum() / denom)
+            seq_mae = float(seq_mae.item())
+            seq_rmse = float(seq_rmse.item())
+
             # DTW：对每个样本/设备计算 L1 代价的DTW并取平均；为稳健性做下采样
             import numpy as np
             def _downsample_np(x: np.ndarray, max_len: int = 256) -> np.ndarray:
@@ -210,17 +265,20 @@ class NILMLightningModule(pl.LightningModule):
                 for k in range(K):
                     p = pred_np[b, :, k] if K > 1 else (pred_np[b, :, 0] if pred_np.ndim == 3 else pred_np[b, :])
                     t = target_np[b, :, k] if K > 1 else (target_np[b, :, 0] if target_np.ndim == 3 else target_np[b, :])
+                    # 替换无效值以保证DTW稳健
+                    p = np.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
+                    t = np.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
                     p = _downsample_np(p)
                     t = _downsample_np(t)
                     dtw_vals.append(_dtw_l1(p, t))
             seq_dtw = float(np.mean(dtw_vals)) if dtw_vals else float('nan')
-            
+
             # 记录与返回
             self._safe_log(f'{stage}/metrics/sequence/mae', seq_mae, on_epoch=True, sync_dist=True)
             self._safe_log(f'{stage}/metrics/sequence/rmse', seq_rmse, on_epoch=True, sync_dist=True)
             self._safe_log(f'{stage}/metrics/sequence/dtw', seq_dtw, on_epoch=True, sync_dist=True)
             metrics.update({'seq_mae': seq_mae, 'seq_rmse': seq_rmse, 'seq_dtw': seq_dtw})
-            
+
             # 通用 score（以 -MAE 表示，值越高越好）
             if np.isfinite(seq_mae):
                 metrics['score'] = -float(seq_mae)
@@ -229,10 +287,17 @@ class NILMLightningModule(pl.LightningModule):
                     on_epoch=True, on_step=False,
                     prog_bar=True, sync_dist=True
                 )
+            else:
+                metrics['score'] = float('nan')
+                self._safe_log(
+                    f'{stage}/score', float('nan'),
+                    on_epoch=True, on_step=False,
+                    prog_bar=True, sync_dist=True
+                )
         except Exception:
             # 若序列前向或计算失败，不阻断整体评估
             metrics.setdefault('score', float('nan'))
-        
+
         return metrics
     
     def _collect_sequence_examples(self, pred_seq: torch.Tensor, target_seq: torch.Tensor, batch: Dict[str, torch.Tensor], stage: str = 'val') -> None:
@@ -314,12 +379,31 @@ class NILMLightningModule(pl.LightningModule):
             self._safe_log('train/loss/sequence', float('nan'), on_step=True, on_epoch=True, prog_bar=True)
             return torch.tensor(0.0, device=dev)
 
-        # 计算序列平滑L1损失，屏蔽无效元素
+        # 计算序列平滑L1损失，屏蔽无效元素（含标签有效掩码）
         valid = torch.isfinite(pred_seq) & torch.isfinite(target_seq)
+        vm = batch.get('target_seq_valid_mask', None)
+        try:
+            if isinstance(vm, torch.Tensor):
+                if vm.dim() == pred_seq.dim():
+                    valid = valid & (vm > 0)
+                elif vm.dim() + 1 == pred_seq.dim():
+                    valid = valid & (vm.unsqueeze(-1) > 0)
+        except Exception:
+            pass
         element_loss = torch.nn.functional.smooth_l1_loss(pred_seq, target_seq, reduction='none')
         element_loss = torch.where(valid, element_loss, torch.zeros_like(element_loss))
         denom = valid.float().sum().clamp_min(1.0)
         seq_loss = element_loss.sum() / denom
+        # 逐设备序列损失（按epoch记录）
+        try:
+            per_dev_denom = valid.float().sum(dim=(0,1)).clamp_min(1.0)
+            per_dev_sum = element_loss.sum(dim=(0,1))
+            per_dev_loss = per_dev_sum / per_dev_denom
+            for i, d_loss in enumerate(per_dev_loss):
+                name = self.device_names[i] if i < len(self.device_names) else f'device_{i+1}'
+                self._safe_log(f'train/loss/sequence/device/{name}', d_loss, on_step=False, on_epoch=True)
+        except Exception:
+            pass
 
         total_loss = seq_loss
 
@@ -352,7 +436,7 @@ class NILMLightningModule(pl.LightningModule):
         # 每隔一定步数记录训练指标与梯度范数
         if batch_idx % self.config.training.log_every_n_steps == 0:
             with torch.no_grad():
-                _ = self._compute_metrics(batch, 'train')
+                _ = self._compute_metrics(batch, stage='train')
                 if self.config.debug.track_grad_norm > 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=float('inf'))
                     self._safe_log('train/metrics/optimization/grad_norm', grad_norm, on_step=False, on_epoch=True)
@@ -418,10 +502,10 @@ class NILMLightningModule(pl.LightningModule):
             target_states
         )  # (B, N, D)
 
-        # 归一化后的余弦相似度
-        pred = pred_embeddings  # (B, N, D)
-        pred = torch.nn.functional.normalize(pred, dim=-1)
-        pos_sim = (pred * prototypes).sum(dim=-1)  # (B, N)
+        # 归一化原型与预测嵌入，确保余弦相似度在[-1,1]
+        pred = torch.nn.functional.normalize(pred_embeddings, dim=-1)
+        prototypes = torch.nn.functional.normalize(prototypes, dim=-1)
+        pos_sim = torch.clamp((pred * prototypes).sum(dim=-1), min=-1.0, max=1.0)  # (B, N)
 
         # 正样本损失：maximizing similarity -> minimize (1 - sim)
         pos_mask = (target_states > 0).float()
@@ -469,13 +553,42 @@ class NILMLightningModule(pl.LightningModule):
         pred_seq = seq_out[0] if isinstance(seq_out, tuple) else seq_out
         target_seq = batch.get('target_seq', None)
 
-        # 计算序列损失（若提供标签）
+        # 计算序列损失（若提供标签），应用标签有效掩码
         if target_seq is not None:
             valid = torch.isfinite(pred_seq) & torch.isfinite(target_seq)
+            vm = batch.get('target_seq_valid_mask', None)
+            try:
+                if isinstance(vm, torch.Tensor):
+                    if vm.dim() == pred_seq.dim():
+                        valid = valid & (vm > 0)
+                    elif vm.dim() + 1 == pred_seq.dim():
+                        valid = valid & (vm.unsqueeze(-1) > 0)
+            except Exception:
+                pass
             element_loss = torch.nn.functional.smooth_l1_loss(pred_seq, target_seq, reduction='none')
             element_loss = torch.where(valid, element_loss, torch.zeros_like(element_loss))
             denom = valid.float().sum().clamp_min(1.0)
             seq_loss = element_loss.sum() / denom
+            # 逐设备序列损失（按epoch记录）
+            try:
+                per_dev_denom = valid.float().sum(dim=(0,1)).clamp_min(1.0)
+                per_dev_sum = element_loss.sum(dim=(0,1))
+                per_dev_loss = per_dev_sum / per_dev_denom
+                for i, d_loss in enumerate(per_dev_loss):
+                    name = self.device_names[i] if i < len(self.device_names) else f'device_{i+1}'
+                    self._safe_log(f'test/loss/sequence/device/{name}', d_loss, on_step=False, on_epoch=True)
+            except Exception:
+                pass
+            # 逐设备序列损失（按epoch记录）
+            try:
+                per_dev_denom = valid.float().sum(dim=(0,1)).clamp_min(1.0)
+                per_dev_sum = element_loss.sum(dim=(0,1))
+                per_dev_loss = per_dev_sum / per_dev_denom
+                for i, d_loss in enumerate(per_dev_loss):
+                    name = self.device_names[i] if i < len(self.device_names) else f'device_{i+1}'
+                    self._safe_log(f'val/loss/sequence/device/{name}', d_loss, on_step=False, on_epoch=True)
+            except Exception:
+                pass
             self._safe_log('val/loss/sequence', seq_loss, on_step=False, on_epoch=True)
         else:
             seq_loss = torch.tensor(0.0, device=pred_seq.device)
@@ -486,7 +599,7 @@ class NILMLightningModule(pl.LightningModule):
                 self._collect_sequence_examples(pred_seq, target_seq, batch, stage='val')
         except Exception:
             pass
-        metrics = self._compute_metrics(batch, 'val')
+        metrics = self._compute_metrics(batch, stage='val')
 
         # 明确记录验证损失与分数（按 epoch）
         self._safe_log('val/loss', seq_loss, on_step=False, on_epoch=True, prog_bar=True)
@@ -516,17 +629,36 @@ class NILMLightningModule(pl.LightningModule):
         pred_seq = seq_out[0] if isinstance(seq_out, tuple) else seq_out
         target_seq = batch.get('target_seq', None)
 
-        # 计算序列损失（若提供标签）
+        # 计算序列损失（若提供标签），应用标签有效掩码
         if target_seq is not None:
             valid = torch.isfinite(pred_seq) & torch.isfinite(target_seq)
+            vm = batch.get('target_seq_valid_mask', None)
+            try:
+                if isinstance(vm, torch.Tensor):
+                    if vm.dim() == pred_seq.dim():
+                        valid = valid & (vm > 0)
+                    elif vm.dim() + 1 == pred_seq.dim():
+                        valid = valid & (vm.unsqueeze(-1) > 0)
+            except Exception:
+                pass
             element_loss = torch.nn.functional.smooth_l1_loss(pred_seq, target_seq, reduction='none')
             element_loss = torch.where(valid, element_loss, torch.zeros_like(element_loss))
             denom = valid.float().sum().clamp_min(1.0)
             seq_loss = element_loss.sum() / denom
+            # 逐设备序列损失（按epoch记录）
+            try:
+                per_dev_denom = valid.float().sum(dim=(0,1)).clamp_min(1.0)
+                per_dev_sum = element_loss.sum(dim=(0,1))
+                per_dev_loss = per_dev_sum / per_dev_denom
+                for i, d_loss in enumerate(per_dev_loss):
+                    name = self.device_names[i] if i < len(self.device_names) else f'device_{i+1}'
+                    self._safe_log(f'test/loss/sequence/device/{name}', d_loss, on_step=False, on_epoch=True)
+            except Exception:
+                pass
         else:
             seq_loss = torch.tensor(0.0, device=pred_seq.device)
 
-        metrics = self._compute_metrics(batch, 'test')
+        metrics = self._compute_metrics(batch, stage='test')
 
         # 显式按 epoch 记录测试损失与分数
         self._safe_log('test/loss/total', seq_loss, on_step=False, on_epoch=True)
@@ -592,9 +724,7 @@ class NILMLightningModule(pl.LightningModule):
     
     def on_validation_epoch_end(self) -> None:
         """验证轮次结束"""
-        # 若未启用可视化，则直接跳过
-        if not getattr(self, 'enable_visualization', False):
-            return
+        # 若未启用可视化，仅跳过可视化，不影响指标更新
         # 序列对比可视化：绘制预测 vs 标签，并叠加主表原始波形
         try:
             if getattr(self, 'logger', None) is not None and len(self._sequence_examples) > 0:
@@ -633,24 +763,36 @@ class NILMLightningModule(pl.LightningModule):
                 self._sequence_examples.clear()
         except Exception as e:
             print(f"sequence visualization failed: {e}")
-        # 获取当前验证分数（兼容旧键名）
-        current_score = self.trainer.callback_metrics.get('val/score', None)
-        if current_score is None:
-            current_score = self.trainer.callback_metrics.get('val_score', 0.0)
+        # 获取当前验证监控值（根据配置兼容不同键）
+        ckpt_monitor = getattr(self.config.training.checkpoint, 'monitor', 'val/score')
+        if ckpt_monitor == 'val_score':
+            ckpt_monitor = 'val/score'
+        current_val = self.trainer.callback_metrics.get(ckpt_monitor, None)
+        if current_val is None:
+            # 回退（优先val/loss）
+            current_val = self.trainer.callback_metrics.get('val/loss', None)
+        if current_val is None:
+            current_val = self.trainer.callback_metrics.get('val/score', 0.0)
         # 将 Tensor 转为 float，避免后续配置或日志处理中出现 OmegaConf 类型不支持
         try:
-            if hasattr(current_score, 'item'):
-                current_score = float(current_score.item())
+            if hasattr(current_val, 'item'):
+                current_val = float(current_val.item())
             else:
-                current_score = float(current_score)
+                current_val = float(current_val)
         except Exception:
-            current_score = 0.0
+            current_val = float('nan')
         
-        # 更新最佳分数
-        if current_score > float(self.best_val_score):
-            self.best_val_score = float(current_score)
-            # 记录最佳验证分数（层级命名，在无 Trainer 时安全跳过）
-            self._safe_log('val/best_score', self.best_val_score, on_epoch=True)
+        # 根据模式更新最佳值（支持min/max）
+        mode = str(getattr(self.config.training.checkpoint, 'mode', 'max')).lower()
+        if np.isfinite(current_val):
+            if mode == 'min':
+                is_better = current_val < float(self.best_val_score)
+            else:
+                is_better = current_val > float(self.best_val_score)
+            if is_better:
+                self.best_val_score = float(current_val)
+                # 记录最佳验证分数（层级命名，在无 Trainer 时安全跳过）
+                self._safe_log('val/best_score', self.best_val_score, on_epoch=True)
         
         # 记录最佳验证分数（归入验证命名空间，安全记录）
         self._safe_log('val/best_score', self.best_val_score, on_epoch=True)
@@ -703,18 +845,24 @@ class NILMLightningModule(pl.LightningModule):
                 }
             }
         elif scheduler_config.name == 'reduce_on_plateau':
+            # 让调度器监控与回调一致的指标与模式
+            es_cfg = getattr(self.config.training, 'early_stopping', None)
+            ckpt_cfg = getattr(self.config.training, 'checkpoint', None)
+            monitor_key = str(getattr(es_cfg, 'monitor', None) or getattr(ckpt_cfg, 'monitor', 'val/loss'))
+            monitor_key = 'val/score' if monitor_key == 'val_score' else monitor_key
+            monitor_mode = str(getattr(es_cfg, 'mode', None) or getattr(ckpt_cfg, 'mode', 'min')).lower()
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
-                mode='max',
-                factor=max(scheduler_config.factor, 0.3),  # 更大的衰减因子
-                patience=min(scheduler_config.patience, 3),  # 更短的耐心
+                mode=monitor_mode,
+                factor=max(getattr(scheduler_config, 'factor', 0.3), 0.3),  # 更大的衰减因子
+                patience=min(getattr(scheduler_config, 'patience', 3), 3),  # 更短的耐心
                 min_lr=1e-7  # 最小学习率
             )
             return {
                 'optimizer': optimizer,
                 'lr_scheduler': {
                     'scheduler': scheduler,
-                    'monitor': 'val/score',
+                    'monitor': monitor_key,
                     'interval': 'epoch',
                     'frequency': 1
                 }

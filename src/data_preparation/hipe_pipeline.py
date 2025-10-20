@@ -119,13 +119,15 @@ class HIPEDataPreparationPipeline:
         df_main = self._read_mains(mains_fp)
         dev_dfs, dev_names = self._read_devices(device_fps)
         df_merged, label_map = self._align_and_merge(df_main, dev_dfs, dev_names)
+        # 仅使用成功合并的设备名称
+        eff_dev_names = [label_map[i] for i in sorted(label_map.keys())]
 
         # 3) 连续性修复：填短缺口、保留长缺口为 NaN
         df_merged = self._repair_small_gaps(df_merged)
 
         # 4) 特征与目标
         X_full = self._build_mains_features(df_merged)
-        Yp_full = self._build_targets(df_merged, dev_names, kind="P")
+        Yp_full = self._build_targets(df_merged, eff_dev_names, kind="P")
         # 切窗（保留窗口，按设备有效比例过滤）
         L = self.hipe.window_length
         H = self.hipe.step_size
@@ -134,6 +136,8 @@ class HIPEDataPreparationPipeline:
         valid_mask = self._valid_window_mask_by_ratio(Yp_full, starts_all, L, min_ratio=min_ratio)
         starts = starts_all[valid_mask]
         X_seq, Yp_seq, _ = self._slide_window(X_full, Yp_full, L=L, H=H, starts_override=starts)
+        # 保持目标序列的 NaN（由下游 mask 处理），仅确保 dtype
+        Yp_seq = Yp_seq.astype(np.float32)
         # 频域与辅助特征
         freq_feats = self._window_stft_frames(X_seq)
         aux_feats, aux_names = self._aggregate_aux_features(X_seq, df_merged, starts)
@@ -187,7 +191,7 @@ class HIPEDataPreparationPipeline:
                 train_idx_bal.sort()
             fold_key = f"fold_{fold.fold_id}"
             splits[fold_key] = {"train_indices": train_idx_bal, "val_indices": val_idx}
-        device_name_to_id = {name: i for i, name in enumerate(dev_names)}
+        device_name_to_id = {name: i for i, name in enumerate(eff_dev_names)}
         self._save_outputs(
             df_merged=df_merged,
             X_seq=X_seq,
@@ -210,7 +214,7 @@ class HIPEDataPreparationPipeline:
             "n_windows": n,
             "window_length": int(L),
             "step_size": int(H),
-            "n_devices": len(dev_names),
+            "n_devices": len(eff_dev_names),
             "channels": ["P_kW", "Q_kvar", "S_kVA", "PF", "dP", "dQ", "dS"],
             "freq_repr": {"type": "stft", "frames": Tf, "bins": Ff, "n_fft": self.hipe.stft_n_fft, "hop": self.hipe.stft_hop},
             "aux_features_count": int(aux_feats.shape[1]),
@@ -704,6 +708,10 @@ class HIPEDataPreparationPipeline:
     def _find_device_files(self, data_path: str) -> List[str]:
         pattern = os.path.join(data_path, self.hipe.device_pattern)
         files = sorted(glob.glob(pattern))
+        # 排除主表文件（如果匹配到device_pattern）
+        mains_fp = self._find_mains_file(data_path)
+        if mains_fp:
+            files = [fp for fp in files if os.path.abspath(fp) != os.path.abspath(mains_fp)]
         return files
 
     def _read_mains(self, fp: str) -> pd.DataFrame:
@@ -754,11 +762,14 @@ class HIPEDataPreparationPipeline:
 
     def _extract_device_name(self, fp: str) -> str:
         base = os.path.basename(fp)
-        name = os.path.splitext(base)[0]
-        # 设备名模式 device_xxx
-        if name.startswith("device_"):
-            return name[len("device_"):]
-        return name
+        stem = os.path.splitext(base)[0]
+        # 优先去掉 PhaseCount 后缀，以得到纯设备名
+        if "_PhaseCount_" in stem:
+            return stem.split("_PhaseCount_")[0]
+        # 兼容 device_ 前缀
+        if stem.startswith("device_"):
+            return stem[len("device_"):]
+        return stem
 
     def _read_devices(self, fps: List[str]) -> Tuple[List[pd.DataFrame], List[str]]:
         dev_dfs: List[pd.DataFrame] = []
@@ -864,22 +875,26 @@ class HIPEDataPreparationPipeline:
         dfm = self._resample_df(df_main, main_cols)
         # 合并为统一时间索引
         base = dfm.copy()
-        # 并行处理设备重采样与重命名
+        # 并行处理设备重采样与重命名（仅保留成功生成数据的设备）
+        merged_names: List[str] = []
         futures = []
         with ThreadPoolExecutor(max_workers=getattr(self, "n_jobs", 1)) as ex:
             for df, name in zip(dev_dfs, dev_names):
-                futures.append(ex.submit(self._resample_rename_device, df, name))
-            for fut in futures:
+                futures.append((name, ex.submit(self._resample_rename_device, df, name)))
+            for name, fut in futures:
                 dfr = fut.result()
                 if dfr is None:
+                    # 跳过没有 P/Q/S 数据的设备
                     continue
                 base = pd.merge_asof(
                     base.sort_values(ts_col),
                     dfr.sort_values(ts_col),
                     on=ts_col
                 )
+                merged_names.append(name)
         base = base.sort_values(ts_col).reset_index(drop=True)
-        label_map = {i: name for i, name in enumerate(dev_names)}
+        # 仅对成功合并的设备建立标签映射
+        label_map = {i: name for i, name in enumerate(merged_names)}
         return base, label_map
 
     def _repair_small_gaps(self, df: pd.DataFrame) -> pd.DataFrame:
