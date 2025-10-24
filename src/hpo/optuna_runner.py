@@ -28,7 +28,7 @@ from src.data.datamodule import NILMDataModule
 class OptunaPruningCallback(PyTorchLightningPruningCallback):
     """自定义Optuna剪枝回调"""
     
-    def __init__(self, trial: optuna.trial.Trial, monitor: str = 'val_score'):
+    def __init__(self, trial: optuna.trial.Trial, monitor: str = 'val/loss'):
         super().__init__(trial, monitor)
         self.trial = trial
         self.monitor = monitor
@@ -37,7 +37,15 @@ class OptunaPruningCallback(PyTorchLightningPruningCallback):
         """验证结束时检查是否需要剪枝"""
         current_score = trainer.callback_metrics.get(self.monitor)
         if current_score is not None:
-            self.trial.report(current_score, step=trainer.current_epoch)
+            # 将可能的Tensor安全转换为float
+            try:
+                if hasattr(current_score, 'item'):
+                    value = float(current_score.item())
+                else:
+                    value = float(current_score)
+            except Exception:
+                value = float('inf')
+            self.trial.report(value, step=trainer.current_epoch)
             if self.trial.should_prune():
                 message = f"Trial was pruned at epoch {trainer.current_epoch}."
                 raise optuna.TrialPruned(message)
@@ -225,7 +233,7 @@ class OptunaObjective:
             callbacks = []
             
             # Optuna剪枝回调
-            pruning_callback = OptunaPruningCallback(trial, monitor='val_score')
+            pruning_callback = OptunaPruningCallback(trial, monitor='val/loss')
             callbacks.append(pruning_callback)
             
             # 早停回调（使用配置文件中的设置）
@@ -271,13 +279,13 @@ class OptunaObjective:
             # 训练模型
             trainer.fit(model, datamodule)
             
-            # 获取最佳验证分数
-            best_score = model.best_val_score
+            # 获取最佳验证损失
+            best_loss = float(getattr(model, 'best_val_loss', float('inf')))
             
             # 保存试验结果
             trial_results = {
                 'trial_number': trial.number,
-                'best_score': best_score,
+                'best_loss': best_loss,
                 'best_thresholds': model.best_thresholds,
                 'hyperparameters': trial.params,
                 'config': OmegaConf.to_container(trial_config, resolve=True)
@@ -287,7 +295,7 @@ class OptunaObjective:
             with open(results_path, 'w') as f:
                 json.dump(trial_results, f, indent=2, default=str)
             
-            return best_score
+            return best_loss
             
         except optuna.TrialPruned:
             # 试验被剪枝
@@ -333,7 +341,7 @@ def create_study(config: DictConfig, study_name: str, storage_url: Optional[str]
     study = optuna.create_study(
         study_name=study_name,
         storage=storage_url,
-        direction='maximize',  # 最大化验证分数
+        direction='minimize',  # 最小化验证损失
         sampler=sampler,
         pruner=pruner,
         load_if_exists=True
@@ -380,7 +388,7 @@ def run_optimization(config: DictConfig, output_dir: Path) -> optuna.Study:
     # 保存结果
     print("\n=== 优化完成 ===")
     print(f"最佳试验: {study.best_trial.number}")
-    print(f"最佳分数: {study.best_value:.4f}")
+    print(f"最佳损失: {study.best_value:.4f}")
     print("最佳超参数:")
     for key, value in study.best_params.items():
         print(f"  {key}: {value}")

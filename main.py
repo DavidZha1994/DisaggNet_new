@@ -29,6 +29,10 @@ from typing import Optional, Dict, Any
 import yaml
 import platform
 
+# macOS: 统一 OpenMP 运行时，避免重复初始化错误
+if sys.platform == 'darwin':
+    os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
+
 # 强制 UTF-8 输出，修复 Windows 控制台中文乱码
 import locale
 os.environ.setdefault('PYTHONIOENCODING', 'utf-8')

@@ -172,3 +172,4 @@ optimized_config.yaml
 mlruns/
 wandb/
 tensorboard_logs/
+reports/debug_manual/

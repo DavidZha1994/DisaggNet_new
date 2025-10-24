@@ -35,11 +35,7 @@ torch.set_float32_matmul_precision("high")
 
 from src.data.datamodule import NILMDataModule  # 使用新的工业级数据模块
 from src.models.fusion_transformer import FusionTransformer
-from src.models.submeter_encoder import SubmeterEncoder
 from src.losses.losses import create_loss_function, RECOMMENDED_LOSS_CONFIGS
-
-from src.models.priors import PriorKnowledgeIntegrator
-from src.utils.prototypes import PrototypeLibrary
 
 
 class NILMLightningModule(pl.LightningModule):
@@ -85,54 +81,32 @@ class NILMLightningModule(pl.LightningModule):
         
         # 当前仅做seq2seq功率回归，强制关闭分类相关学习
         self.loss_fn.classification_weight = 0.0
-        # 明确暴露分类开关属性以配合测试和下游逻辑
-        self.classification_enabled = False
 
-        # 训练期度量学习（蒸馏/对比学习）开关与组件，仅训练使用
-        ml_conf = getattr(getattr(config, 'aux_training', None), 'metric_learning', None)
-        self.metric_learning_enable = bool(getattr(ml_conf, 'enable', False))
-        self.metric_margin = max(0.0, float(getattr(ml_conf, 'margin', 0.2) if ml_conf is not None else 0.2))
-        self.metric_weight = max(0.0, float(getattr(ml_conf, 'weight', 0.2) if ml_conf is not None else 0.2))
-        self.metric_use_power = bool(getattr(ml_conf, 'use_power', False) if ml_conf is not None else False)
-        if self.metric_learning_enable:
-            embed_dim = int(getattr(getattr(config.model.time_encoder, 'd_model', None), 'value', config.model.time_encoder.d_model)) if hasattr(config.model.time_encoder, 'd_model') else config.model.time_encoder.d_model
-            self.submeter_encoder = SubmeterEncoder(n_devices=self.n_devices, embed_dim=embed_dim, hidden_dim=64)
-            # 原型库：用于流式统计设备嵌入的均值/协方差并计算 Mahalanobis 距离
-            self.prototype_library = PrototypeLibrary(n_devices=self.n_devices, embed_dim=embed_dim)
-            # 训练期每设备距离日志缓冲，用于 epoch 末统计与可视化
-            from collections import deque
-            self._distance_log_buffer = [deque(maxlen=5000) for _ in range(self.n_devices)]
-        else:
-            self.submeter_encoder = None
-            self.prototype_library = None
-            self._distance_log_buffer = None
-        
-        # Conformal Prediction 标定器（序列回归不使用）
-        self.conformal_predictor = None
-        self.conformal_evaluator = None
-        
-        # 验证集最佳指标（与ModelCheckpoint的模式对齐）
-        ckpt_cfg = getattr(getattr(config, 'training', None), 'checkpoint', None)
-        mode = str(getattr(ckpt_cfg, 'mode', 'max')).lower() if ckpt_cfg is not None else 'max'
-        self.best_val_score = float('-inf') if mode == 'max' else float('inf')
-        # 兼容下游摘要与推理：在仅序列回归场景下也提供阈值占位
+        # 归一化损失配置（按设备相对刻度）
+        loss_cfg = getattr(self.config, 'loss', None)
+        self.normalize_per_device: bool = bool(getattr(loss_cfg, 'normalize_per_device', True)) if loss_cfg is not None else True
+        # Huber 相对转折点（相对满量程）
+        self.huber_beta_rel: float = float(getattr(loss_cfg, 'huber_beta_rel', 0.05)) if loss_cfg is not None else 0.05
+        # 相对误差项系数与稳定项 epsilon
+        self.rel_loss_weight: float = float(getattr(loss_cfg, 'rel_loss_weight', 0.5)) if loss_cfg is not None else 0.5
+        self.rel_eps: float = float(getattr(loss_cfg, 'rel_eps', 0.05)) if loss_cfg is not None else 0.05
+        # 仅在激活时刻加相对误差：用相对阈值（推荐等于 rel_eps）
+        self.active_threshold_rel: float = float(getattr(loss_cfg, 'active_threshold_rel', self.rel_eps)) if loss_cfg is not None else self.rel_eps
+        # 每设备尺度（训练集 P95），由 DataModule 提供
+        self.power_scale: Optional[torch.Tensor] = None
+
+        # 校验/可视化与训练状态初始化
         self.best_thresholds = {}
-
-        # 训练状态
+        self.best_val_loss = float('inf')
         self.automatic_optimization = True
-
-        # 新增：事件关注与可视化配置，以及序列例子缓冲
-        ev_cfg = getattr(getattr(config, 'training', None), 'event_focus', None)
-        self.event_focus_enable = bool(getattr(ev_cfg, 'enable', True) if ev_cfg is not None else True)
-        self.event_weight_factor = float(getattr(ev_cfg, 'weight', 2.0) if ev_cfg is not None else 2.0)
         vis_cfg = getattr(getattr(config, 'training', None), 'visualization', None)
-        self.plot_event_only = bool(getattr(vis_cfg, 'plot_event_only', True) if vis_cfg is not None else True)
-        self.max_plots_per_epoch = int(getattr(vis_cfg, 'max_plots_per_epoch', 16) if vis_cfg is not None else 16)
-        # 新增：绘图总开关（默认禁用），避免 Windows 上阻塞
         self.enable_visualization = bool(getattr(vis_cfg, 'enable', False) if vis_cfg is not None else False)
-        # 指标零窗口权重（降低全零窗口影响）
-        eval_cfg = getattr(getattr(config, 'evaluation', None), 'zero_window_weight', None)
-        self.metrics_zero_weight = float(eval_cfg if eval_cfg is not None else 0.2)
+        self.max_plots_per_epoch = int(getattr(vis_cfg, 'max_plots_per_epoch', 8) if vis_cfg is not None else 8)
+        # 新增：事件筛选与保存目录
+        self.plot_event_only = bool(getattr(vis_cfg, 'plot_event_only', False) if vis_cfg is not None else False)
+        self.active_threshold_kw = float(getattr(vis_cfg, 'active_threshold_kw', 0.1) if vis_cfg is not None else 0.1)
+        from pathlib import Path as _P
+        self.vis_output_dir = str(getattr(vis_cfg, 'save_dir', _P('reports') / 'viz')) if vis_cfg is not None else str(_P('reports') / 'viz')
         self._sequence_examples: List[Dict[str, Any]] = []
 
     def _safe_log(self, name: str, value: Any, **kwargs) -> None:
@@ -146,6 +120,17 @@ class NILMLightningModule(pl.LightningModule):
             except Exception:
                 pass
         
+    def _isfinite(self, x: torch.Tensor) -> torch.Tensor:
+        """设备安全有限性检查：在 MPS 上转 CPU 计算避免后端崩溃"""
+        if not isinstance(x, torch.Tensor):
+            raise TypeError("_isfinite 只接受 torch.Tensor")
+        if x.device.type == 'mps':
+            return torch.isfinite(x.detach().to('cpu')).to(x.device)
+        try:
+            return torch.isfinite(x)
+        except Exception:
+            return torch.isfinite(x.detach().to('cpu')).to(x.device)
+        
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """前向传播"""
         time_features = batch['time_features']  # (batch_size, window_size, n_time_features)
@@ -153,54 +138,134 @@ class NILMLightningModule(pl.LightningModule):
         time_positional = batch.get('time_positional', None)  # (batch_size, window_size, time_dim)
         aux_features = batch.get('aux_features', None)  # (batch_size, n_aux_features)
         
-        return self.model(time_features, freq_features, time_positional, aux_features=aux_features, time_valid_mask=batch.get('time_valid_mask', None), freq_valid_mask=batch.get('freq_valid_mask', None))
+        return self.model(time_features, freq_features, time_positional, aux_features=aux_features, time_valid_mask=batch.get('time_valid_mask', None), freq_valid_mask=batch.get('freq_valid_mask', None), aux_valid_mask=batch.get('aux_valid_mask', None))
 
-    def forward_with_embeddings(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-        """前向传播（返回设备嵌入）。仅在模型支持时使用。"""
-        time_features = batch['time_features']
-        freq_features = batch.get('freq_features', None)
-        time_positional = batch.get('time_positional', None)
-        aux_features = batch.get('aux_features', None)
-        out = self.model.forward_with_embeddings(time_features, freq_features, time_positional, aux_features, time_valid_mask=batch.get('time_valid_mask', None), freq_valid_mask=batch.get('freq_valid_mask', None))
-        return out
-    
-    def _compute_metrics(self, batch: Dict[str, torch.Tensor], preds: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, stage: str = 'val') -> Dict[str, float]:
-        """计算评估指标。
-
-        - 若提供 `preds=(pred_power, pred_states)`，计算窗口级 NILM 指标（MAE/NDE/SAE/TECA），并根据 `classification_enabled` 决定是否计算分类指标。
-        - 若未提供，则计算序列级指标（MAE/RMSE/DTW），与当前 seq2seq 训练保持一致。
-        """
-        metrics: Dict[str, float] = {}
-
-        # 分支A：窗口级 NILM 指标（测试/旧逻辑兼容）
-        if preds is not None and isinstance(preds, tuple) and len(preds) >= 2:
+    # --- 新增：按设备尺度工具 ---
+    def _ensure_power_scale(self, device: torch.device, k: int) -> torch.Tensor:
+        """获取形状 (1,1,K) 的尺度张量；从 datamodule 复制或用单位尺度回退。"""
+        if (self.power_scale is None) or (self.power_scale.numel() != k):
+            # 从 DataModule 获取
             try:
-                pred_power, pred_states = preds[0], preds[1]
-                y_true_power = batch.get('target_power', None)
-                y_true_states = batch.get('target_states', None)
-                if y_true_power is None or y_true_states is None:
-                    metrics.setdefault('score', float('nan'))
-                    return metrics
-                from src.utils.metrics import NILMMetrics
-                nilm = NILMMetrics(self.device_names)
-                nilm_results = nilm.compute_all_metrics(
-                    pred_power, pred_states, y_true_power, y_true_states,
-                    optimize_thresholds=False,
-                    classification_enabled=bool(getattr(self, 'classification_enabled', False))
-                )
-                metrics.update(nilm_results)
-                # 安全记录一个通用分数
-                if 'score' in metrics:
-                    self._safe_log(f'{stage}/score', metrics['score'], on_epoch=True, on_step=False, prog_bar=True, sync_dist=True)
-                return metrics
+                dm = getattr(self.trainer, 'datamodule', None)
+                if dm is not None and hasattr(dm, 'power_scale_vec') and isinstance(dm.power_scale_vec, torch.Tensor):
+                    self.power_scale = dm.power_scale_vec.detach().clone().float()
+                else:
+                    self.power_scale = torch.ones(k, dtype=torch.float32)
             except Exception:
-                # 回退到序列指标
-                pass
+                self.power_scale = torch.ones(k, dtype=torch.float32)
+        # 安全下限，避免除零
+        scale = torch.clamp(self.power_scale, min=1e-6).to(device)
+        return scale.view(1, 1, -1)
 
-        # 分支B：序列级指标（默认）
+    def on_fit_start(self) -> None:
+        """在训练开始时，从 DataModule 读取 per-device 尺度。"""
+        try:
+            dm = getattr(self.trainer, 'datamodule', None)
+            if dm is not None and hasattr(dm, 'power_scale_vec') and isinstance(dm.power_scale_vec, torch.Tensor):
+                self.power_scale = dm.power_scale_vec.detach().clone().float()
+                print(f"[信息] 已载入每设备 P95 尺度：{self.power_scale.tolist()}")
+            else:
+                print("[警告] DataModule 未提供 power_scale_vec，回退为单位尺度。")
+                self.power_scale = None
+        except Exception as e:
+            print(f"[警告] 读取 power_scale 失败：{e}")
+            self.power_scale = None
+
+    def _compute_normalized_seq_loss(self, pred_seq: torch.Tensor, target_seq: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        """在相对刻度(0-1)上计算 Huber(beta=0.05) + 相对误差项。"""
+        B, L, K = pred_seq.size(0), pred_seq.size(1), pred_seq.size(2)
+        scale = self._ensure_power_scale(pred_seq.device, K)  # (1,1,K)
+        # 归一化
+        pred_n = pred_seq / scale
+        target_n = target_seq / scale
+        # Huber（SmoothL1）在相对刻度
+        beta = float(self.huber_beta_rel)
+        resid = torch.abs(pred_n - target_n)
+        huber_el = torch.where(
+            resid < beta,
+            0.5 * resid ** 2 / beta,  # 常见定义 variant：确保在 resid==beta 处一阶连续
+            resid - 0.5 * beta
+        )
+        huber_el = torch.where(valid, huber_el, torch.zeros_like(huber_el))
+        huber_loss = huber_el.sum() / valid.float().sum().clamp_min(1.0)
+        # 相对误差项（仅在激活时刻）
+        act_mask = (target_n > float(self.active_threshold_rel))
+        act_mask = act_mask & valid
+        denom_rel = (target_n + float(self.rel_eps))
+        rel_err = torch.abs(pred_n - target_n) / denom_rel
+        rel_err = torch.where(act_mask, rel_err, torch.zeros_like(rel_err))
+        rel_loss = rel_err.sum() / act_mask.float().sum().clamp_min(1.0)
+        return huber_loss + float(self.rel_loss_weight) * rel_loss
+
+    def _forward_and_compute_loss(self, batch: Dict[str, torch.Tensor], stage: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        """通用的前向传播和损失计算"""
+        # 序列前向
+        seq_out = self.model.forward_seq(
+            batch.get('time_features'),
+            batch.get('freq_features'),
+            batch.get('time_positional'),
+            batch.get('aux_features'),
+            time_valid_mask=batch.get('time_valid_mask'),
+            freq_valid_mask=batch.get('freq_valid_mask'),
+            aux_valid_mask=batch.get('aux_valid_mask')
+        )
+        pred_seq = seq_out[0] if isinstance(seq_out, tuple) else seq_out
+        
+        # 可选的预测清理
+        if os.environ.get('DISAGGNET_SANITIZE_PRED', '0') == '1':
+            pred_seq = torch.nan_to_num(pred_seq, nan=0.0, posinf=0.0, neginf=0.0)
+        
         target_seq = batch.get('target_seq', None)
         if target_seq is None:
-            metrics.setdefault('score', float('nan'))
+            return pred_seq, torch.tensor(0.0, device=pred_seq.device)
+        
+        # 有效掩码
+        valid = self._isfinite(pred_seq) & self._isfinite(target_seq)
+        vm = batch.get('target_seq_valid_mask', None)
+        if isinstance(vm, torch.Tensor):
+            if vm.dim() + 1 == pred_seq.dim():
+                vm = vm.unsqueeze(-1)
+            mask_vm = (vm > 0)
+            if os.environ.get('DISAGGNET_MASK_RELAX', '0') == '1':
+                valid = mask_vm
+            else:
+                valid = valid & mask_vm
+        # 若无有效点，尝试放宽到仅使用标签掩码，并清理预测
+        try:
+            valid_count = int(valid.float().sum().item())
+            if valid_count == 0 and isinstance(vm, torch.Tensor):
+                if vm.dim() + 1 == pred_seq.dim():
+                    vm = vm.unsqueeze(-1)
+                valid = (vm > 0)
+                # 清理预测，防止非有限值导致后续全部无效
+                pred_seq = torch.nan_to_num(pred_seq, nan=0.0, posinf=0.0, neginf=0.0)
+                self._safe_log(f'{stage}/debug/mask_fallback', 1.0, on_step=True, on_epoch=False)
+        except Exception:
+            pass
+        
+        # 使用相对刻度损失
+        if self.normalize_per_device:
+            seq_loss = self._compute_normalized_seq_loss(pred_seq, target_seq, valid)
+        else:
+            # 回退：原始 kW 域 Huber
+            delta = getattr(self.loss_fn.huber_loss, 'delta', 1.0) if hasattr(self.loss_fn, 'huber_loss') else 1.0
+            residual = torch.abs(pred_seq - target_seq)
+            element_loss = torch.where(
+                residual < delta,
+                0.5 * residual ** 2,
+                delta * (residual - 0.5 * delta)
+            )
+            element_loss = torch.where(valid, element_loss, torch.zeros_like(element_loss))
+            seq_loss = element_loss.sum() / valid.float().sum().clamp_min(1.0)
+        
+        return pred_seq, seq_loss
+
+    def _compute_metrics(self, batch: Dict[str, torch.Tensor], stage: str = 'val') -> Dict[str, float]:
+        """计算序列级评估指标（MAE/RMSE），默认在 kW 域；若启用归一化，额外记录相对指标。"""
+        metrics: Dict[str, float] = {}
+        target_seq = batch.get('target_seq', None)
+        if target_seq is None:
+            metrics['score'] = float('nan')
             return metrics
         try:
             with torch.no_grad():
@@ -212,144 +277,121 @@ class NILMLightningModule(pl.LightningModule):
                     time_valid_mask=batch.get('time_valid_mask'),
                     freq_valid_mask=batch.get('freq_valid_mask')
                 )
-            pred_seq = seq_out[0] if isinstance(seq_out, tuple) else seq_out
-            # MAE/RMSE（按 B、T、K 汇总，使用有效掩码）
-            valid = torch.isfinite(pred_seq) & torch.isfinite(target_seq)
-            vm = batch.get('target_seq_valid_mask', None)
-            try:
+                pred_seq = seq_out[0] if isinstance(seq_out, tuple) else seq_out
+                pred_seq = torch.nan_to_num(pred_seq, nan=0.0, posinf=0.0, neginf=0.0)
+
+                valid = self._isfinite(pred_seq) & self._isfinite(target_seq)
+                vm = batch.get('target_seq_valid_mask', None)
                 if isinstance(vm, torch.Tensor):
-                    if vm.dim() == pred_seq.dim():
-                        valid = valid & (vm > 0)
-                    elif vm.dim() + 1 == pred_seq.dim():
-                        valid = valid & (vm.unsqueeze(-1) > 0)
-            except Exception:
-                pass
+                    if vm.dim() + 1 == pred_seq.dim():
+                        vm = vm.unsqueeze(-1)
+                    valid = valid & (vm > 0)
 
-            element_mae = torch.abs(pred_seq - target_seq)
-            element_mse = (pred_seq - target_seq) ** 2
-            denom = valid.float().sum().clamp_min(1.0)
-            element_mae_masked = torch.where(valid, element_mae, torch.zeros_like(element_mae))
-            element_mse_masked = torch.where(valid, element_mse, torch.zeros_like(element_mse))
-            seq_mae = element_mae_masked.sum() / denom
-            seq_rmse = torch.sqrt(element_mse_masked.sum() / denom)
-            seq_mae = float(seq_mae.item())
-            seq_rmse = float(seq_rmse.item())
+                denom = valid.float().sum().clamp_min(1.0)
+                mae_el = torch.abs(pred_seq - target_seq)
+                mse_el = (pred_seq - target_seq) ** 2
+                mae = torch.where(valid, mae_el, torch.zeros_like(mae_el)).sum() / denom
+                rmse = torch.sqrt(torch.where(valid, mse_el, torch.zeros_like(mse_el)).sum() / denom)
 
-            # DTW：对每个样本/设备计算 L1 代价的DTW并取平均；为稳健性做下采样
-            import numpy as np
-            def _downsample_np(x: np.ndarray, max_len: int = 256) -> np.ndarray:
-                T = x.shape[0]
-                if T <= max_len:
-                    return x
-                stride = int(np.ceil(T / max_len))
-                return x[::stride]
-            def _dtw_l1(a: np.ndarray, b: np.ndarray) -> float:
-                a = a.astype(np.float64)
-                b = b.astype(np.float64)
-                m, n = len(a), len(b)
-                cost = np.full((m + 1, n + 1), np.inf, dtype=np.float64)
-                cost[0, 0] = 0.0
-                for i in range(1, m + 1):
-                    ai = a[i - 1]
-                    for j in range(1, n + 1):
-                        bj = b[j - 1]
-                        d = abs(ai - bj)
-                        cost[i, j] = d + min(cost[i - 1, j], cost[i, j - 1], cost[i - 1, j - 1])
-                return float(cost[m, n])
-            pred_np = pred_seq.detach().cpu().numpy()
-            target_np = target_seq.detach().cpu().numpy()
-            B = pred_np.shape[0]
-            K = pred_np.shape[2] if pred_np.ndim == 3 else 1
-            dtw_vals = []
-            for b in range(B):
-                for k in range(K):
-                    p = pred_np[b, :, k] if K > 1 else (pred_np[b, :, 0] if pred_np.ndim == 3 else pred_np[b, :])
-                    t = target_np[b, :, k] if K > 1 else (target_np[b, :, 0] if target_np.ndim == 3 else target_np[b, :])
-                    # 替换无效值以保证DTW稳健
-                    p = np.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
-                    t = np.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
-                    p = _downsample_np(p)
-                    t = _downsample_np(t)
-                    dtw_vals.append(_dtw_l1(p, t))
-            seq_dtw = float(np.mean(dtw_vals)) if dtw_vals else float('nan')
+                self._safe_log(f'{stage}/metrics/sequence/mae', mae, on_epoch=True, sync_dist=True)
+                self._safe_log(f'{stage}/metrics/sequence/rmse', rmse, on_epoch=True, sync_dist=True)
+                metrics['seq_mae'] = float(mae.item())
+                metrics['seq_rmse'] = float(rmse.item())
 
-            # 记录与返回
-            self._safe_log(f'{stage}/metrics/sequence/mae', seq_mae, on_epoch=True, sync_dist=True)
-            self._safe_log(f'{stage}/metrics/sequence/rmse', seq_rmse, on_epoch=True, sync_dist=True)
-            self._safe_log(f'{stage}/metrics/sequence/dtw', seq_dtw, on_epoch=True, sync_dist=True)
-            metrics.update({'seq_mae': seq_mae, 'seq_rmse': seq_rmse, 'seq_dtw': seq_dtw})
+                # 若启用归一化，同时记录相对指标
+                if self.normalize_per_device:
+                    K = pred_seq.size(2)
+                    scale = self._ensure_power_scale(pred_seq.device, K)
+                    pred_n = pred_seq / scale
+                    target_n = target_seq / scale
+                    denom_n = valid.float().sum().clamp_min(1.0)
+                    mae_n = torch.where(valid, torch.abs(pred_n - target_n), torch.zeros_like(pred_n)).sum() / denom_n
+                    rmse_n = torch.sqrt(torch.where(valid, (pred_n - target_n)**2, torch.zeros_like(pred_n)).sum() / denom_n)
+                    self._safe_log(f'{stage}/metrics/sequence/mae_rel', mae_n, on_epoch=True, sync_dist=True)
+                    self._safe_log(f'{stage}/metrics/sequence/rmse_rel', rmse_n, on_epoch=True, sync_dist=True)
 
-            # 通用 score（以 -MAE 表示，值越高越好）
-            if np.isfinite(seq_mae):
-                metrics['score'] = -float(seq_mae)
-                self._safe_log(
-                    f'{stage}/score', metrics['score'],
-                    on_epoch=True, on_step=False,
-                    prog_bar=True, sync_dist=True
-                )
-            else:
-                metrics['score'] = float('nan')
-                self._safe_log(
-                    f'{stage}/score', float('nan'),
-                    on_epoch=True, on_step=False,
-                    prog_bar=True, sync_dist=True
-                )
+                # 评分：-MAE（kW 域），越大越好
+                metrics['score'] = -metrics['seq_mae']
         except Exception:
-            # 若序列前向或计算失败，不阻断整体评估
             metrics.setdefault('score', float('nan'))
-
         return metrics
-    
-    def _collect_sequence_examples(self, pred_seq: torch.Tensor, target_seq: torch.Tensor, batch: Dict[str, torch.Tensor], stage: str = 'val') -> None:
-        """收集用于可视化的序列样本，支持仅包含事件窗口，并加入主表原始波形。"""
+
+    def _collect_sequence_examples(self, pred_seq: torch.Tensor, target_seq: torch.Tensor, batch: Dict[str, torch.Tensor]) -> None:
+        """收集用于可视化的序列样本"""
         try:
-            if not isinstance(pred_seq, torch.Tensor) or not isinstance(target_seq, torch.Tensor):
+            if not self.enable_visualization or len(self._sequence_examples) >= self.max_plots_per_epoch:
                 return
+            
             B = pred_seq.size(0)
-            import numpy as np
-            if self.plot_event_only and ('has_events' in batch):
-                mask = batch['has_events'].detach().cpu().numpy().astype(bool)
-            else:
-                mask = np.ones(B, dtype=bool)
-            for i in range(B):
-                if len(self._sequence_examples) >= self.max_plots_per_epoch:
-                    break
-                if not mask[i]:
-                    continue
-                ts = batch.get('timestamps', None)
-                # 构造时间戳，仅在长度与序列长度一致时保留，否则置为 None
-                timestamps = None
+            for i in range(min(B, self.max_plots_per_epoch - len(self._sequence_examples))):
+                # 使用联合掩码：isfinite(pred) & isfinite(target) 与 target_seq_valid_mask
+                p = pred_seq[i].detach().cpu().float()
+                t = target_seq[i].detach().cpu().float()
+                valid = self._isfinite(p) & self._isfinite(t)
+                vm = batch.get('target_seq_valid_mask', None)
+                if isinstance(vm, torch.Tensor):
+                    vm_i = vm[i]
+                    if vm_i.dim() + 1 == p.dim():
+                        vm_i = vm_i.unsqueeze(-1)
+                    valid = (vm_i > 0)
+                    mask_vm = (vm_i > 0)
+                    if os.environ.get('DISAGGNET_MASK_RELAX', '0') == '1':
+                        valid = mask_vm
+                    else:
+                        valid = valid & mask_vm
+                # 若无有效点，回退到仅使用标签掩码
                 try:
-                    if isinstance(ts, torch.Tensor):
-                        ts_i = ts[i].detach().cpu().to(torch.float64)
-                        if ts_i.dim() == 0:
-                            ts_i = ts_i.view(1)
-                        L_i = pred_seq[i].size(0)
-                        if int(ts_i.numel()) == int(L_i):
-                            timestamps = ts_i
+                    if int(valid.float().sum().item()) == 0 and isinstance(vm, torch.Tensor):
+                        vm_i2 = vm[i]
+                        if vm_i2.dim() + 1 == p.dim():
+                            vm_i2 = vm_i2.unsqueeze(-1)
+                        valid = (vm_i2 > 0)
                 except Exception:
-                    timestamps = None
-                # 清理 NaN/Inf，保证绘图可见
-                p = pred_seq[i].detach().cpu().to(torch.float32)
-                t = target_seq[i].detach().cpu().to(torch.float32)
-                p = torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
-                t = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
-                # 主表原始波形（来自 datamodule 提供的 mains_seq）
-                m = None
+                    pass
+                # 事件筛选：仅在存在事件时收集
                 try:
-                    ms = batch.get('mains_seq', None)
-                    if isinstance(ms, torch.Tensor):
-                        mi = ms[i].detach().cpu().to(torch.float32)
-                        if mi.dim() == 1 and int(mi.numel()) == int(p.size(0)):
-                            m = torch.nan_to_num(mi, nan=0.0, posinf=0.0, neginf=0.0)
+                    event_present = True
+                    if self.plot_event_only:
+                        # 基于相对刻度的事件阈值（优先使用每设备尺度）
+                        if isinstance(self.power_scale, torch.Tensor):
+                            scale = self.power_scale.detach().cpu().float().view(1, 1, -1)  # (1,1,K)
+                            t_n = t / scale
+                            event_present = bool((t_n > float(self.active_threshold_rel)).any().item())
+                        else:
+                            # 回退：使用绝对kW阈值
+                            event_present = bool((t > float(self.active_threshold_kw)).any().item())
+                    if not event_present:
+                        continue
                 except Exception:
-                    m = None
-                example = {
-                    'pred': p,
-                    'target': t,
-                    'timestamps': timestamps,
-                    'mains': m,
-                }
+                    pass
+                # 对无效位置置为 NaN，避免零线伪象
+                p = p.clone(); t = t.clone()
+                p[~valid] = torch.nan
+                t[~valid] = torch.nan
+                
+                # 可选：采集总功率（mains）曲线（若存在）
+                mains_curve = None
+                tf = batch.get('time_features', None)
+                if isinstance(tf, torch.Tensor):
+                    tf_i = tf[i].detach().cpu().float()  # (L, C)
+                    mains_idx = None
+                    try:
+                        dm = getattr(self.trainer, 'datamodule', None)
+                        feat_names = getattr(dm, 'feature_names', []) if dm is not None else []
+                        if isinstance(feat_names, list) and feat_names:
+                            for cand in ['P_kW', 'P_active', 'P']:  # 常见有功功率命名
+                                if cand in feat_names:
+                                    mains_idx = feat_names.index(cand)
+                                    break
+                        # 回退：若未知，尝试使用第0列作为mains
+                        if mains_idx is None and tf_i.size(1) > 0:
+                            mains_idx = 0
+                    except Exception:
+                        mains_idx = 0 if tf_i.size(1) > 0 else None
+                    if mains_idx is not None and mains_idx < tf_i.size(1):
+                        mains_curve = tf_i[:, mains_idx]
+                
+                example = {'pred': p, 'target': t, 'valid': valid, 'mains': mains_curve}
                 self._sequence_examples.append(example)
         except Exception:
             pass
@@ -369,6 +411,11 @@ class NILMLightningModule(pl.LightningModule):
             freq_valid_mask=batch.get('freq_valid_mask')
         )
         pred_seq = seq_out[0] if isinstance(seq_out, tuple) else seq_out
+        if os.environ.get('DISAGGNET_SANITIZE_PRED', '0') == '1':
+            try:
+                pred_seq = torch.nan_to_num(pred_seq, nan=0.0, posinf=0.0, neginf=0.0)
+            except Exception:
+                pass
         target_seq = batch.get('target_seq', None)
         if target_seq is None:
             # 缺少监督时，返回0损失以避免中断（同时记录）
@@ -379,59 +426,123 @@ class NILMLightningModule(pl.LightningModule):
             self._safe_log('train/loss/sequence', float('nan'), on_step=True, on_epoch=True, prog_bar=True)
             return torch.tensor(0.0, device=dev)
 
-        # 计算序列平滑L1损失，屏蔽无效元素（含标签有效掩码）
-        valid = torch.isfinite(pred_seq) & torch.isfinite(target_seq)
+        # 计算掩码
+        valid = self._isfinite(pred_seq) & self._isfinite(target_seq)
         vm = batch.get('target_seq_valid_mask', None)
         try:
             if isinstance(vm, torch.Tensor):
-                if vm.dim() == pred_seq.dim():
-                    valid = valid & (vm > 0)
-                elif vm.dim() + 1 == pred_seq.dim():
-                    valid = valid & (vm.unsqueeze(-1) > 0)
+                if vm.dim() + 1 == pred_seq.dim():
+                    vm = vm.unsqueeze(-1)
+                mask_vm = (vm > 0)
+                # 环境变量可放宽掩码，仅使用标签掩码
+                if os.environ.get('DISAGGNET_MASK_RELAX', '0') == '1':
+                    valid = mask_vm
+                else:
+                    valid = valid & mask_vm
         except Exception:
             pass
-        element_loss = torch.nn.functional.smooth_l1_loss(pred_seq, target_seq, reduction='none')
-        element_loss = torch.where(valid, element_loss, torch.zeros_like(element_loss))
-        denom = valid.float().sum().clamp_min(1.0)
-        seq_loss = element_loss.sum() / denom
-        # 逐设备序列损失（按epoch记录）
+        # 调试：统计有效元素数量
+        valid_count = int(valid.float().sum().item())
+        self._safe_log('train/debug/valid_count', float(valid_count), on_step=True, on_epoch=False)
+        # 若无有效点，回退到仅使用标签掩码，并清理预测
         try:
-            per_dev_denom = valid.float().sum(dim=(0,1)).clamp_min(1.0)
-            per_dev_sum = element_loss.sum(dim=(0,1))
-            per_dev_loss = per_dev_sum / per_dev_denom
-            for i, d_loss in enumerate(per_dev_loss):
-                name = self.device_names[i] if i < len(self.device_names) else f'device_{i+1}'
-                self._safe_log(f'train/loss/sequence/device/{name}', d_loss, on_step=False, on_epoch=True)
+            if valid_count == 0:
+                vm2 = batch.get('target_seq_valid_mask', None)
+                if isinstance(vm2, torch.Tensor):
+                    if vm2.dim() + 1 == pred_seq.dim():
+                        vm2 = vm2.unsqueeze(-1)
+                    valid = (vm2 > 0)
+                    pred_seq = torch.nan_to_num(pred_seq, nan=0.0, posinf=0.0, neginf=0.0)
+                    self._safe_log('train/debug/mask_fallback', 1.0, on_step=True, on_epoch=False)
         except Exception:
             pass
+
+        # 序列损失：相对刻度 + 相对误差项
+        if self.normalize_per_device:
+            seq_loss = self._compute_normalized_seq_loss(pred_seq, target_seq, valid)
+            # 逐设备（按相对刻度）
+            try:
+                B, L, K = pred_seq.size(0), pred_seq.size(1), pred_seq.size(2)
+                scale = self._ensure_power_scale(pred_seq.device, K)
+                pred_n = pred_seq / scale
+                target_n = target_seq / scale
+                beta = float(self.huber_beta_rel)
+                resid = torch.abs(pred_n - target_n)
+                el = torch.where(resid < beta, 0.5 * resid ** 2 / beta, resid - 0.5 * beta)
+                el = torch.where(valid, el, torch.zeros_like(el))
+                per_dev_denom = valid.float().sum(dim=(0,1)).clamp_min(1.0)
+                per_dev_sum = el.sum(dim=(0,1))
+                per_dev_loss = per_dev_sum / per_dev_denom
+                for i, d_loss in enumerate(per_dev_loss):
+                    name = self.device_names[i] if i < len(self.device_names) else f'device_{i+1}'
+                    self._safe_log(f'train/loss/sequence/device/{name}', d_loss, on_step=False, on_epoch=True)
+            except Exception:
+                pass
+        else:
+            # 回退：原始 kW 域 Huber
+            delta = getattr(self.loss_fn.huber_loss, 'delta', 1.0) if hasattr(self.loss_fn, 'huber_loss') else 1.0
+            residual = torch.abs(pred_seq - target_seq)
+            element_loss = torch.where(
+                residual < delta,
+                0.5 * residual ** 2,
+                delta * (residual - 0.5 * delta)
+            )
+            element_loss = torch.where(valid, element_loss, torch.zeros_like(element_loss))
+            denom = valid.float().sum().clamp_min(1.0)
+            seq_loss = element_loss.sum() / denom
+            # 逐设备记录
+            try:
+                per_dev_denom = valid.float().sum(dim=(0,1)).clamp_min(1.0)
+                per_dev_sum = element_loss.sum(dim=(0,1))
+                per_dev_loss = per_dev_sum / per_dev_denom
+                for i, d_loss in enumerate(per_dev_loss):
+                    name = self.device_names[i] if i < len(self.device_names) else f'device_{i+1}'
+                    self._safe_log(f'train/loss/sequence/device/{name}', d_loss, on_step=False, on_epoch=True)
+            except Exception:
+                pass
 
         total_loss = seq_loss
 
-        # 辅助损失：原型度量（可选）
-        if getattr(self, 'metric_learning_enable', False):
-            try:
-                # 获取设备嵌入（注意：会再次执行编码与融合，但改动最小，后续可合并）
-                reg, cls, unk, pred_embeddings = self.forward_with_embeddings(batch)
-                aux_loss = self._compute_aux_metric_loss(batch, pred_embeddings)
-                self._safe_log('train/loss/metric', aux_loss, on_step=True, on_epoch=True, prog_bar=False)
-                # 在线更新原型库并记录距离摘要
-                self._update_prototypes_and_log(pred_embeddings, batch.get('target_states', None))
-                # 总损失融合
-                total_loss = total_loss + self.metric_weight * aux_loss
-            except Exception as e:
-                print(f"metric learning skipped at step {batch_idx}: {e}")
+        # 能量守恒损失（窗口级）：设备总和应接近总功率（仍在 kW 域）
+        try:
+            total_power = batch.get('total_power', None)
+            if isinstance(total_power, torch.Tensor) and total_power.dim() == 2 and total_power.size(1) == 1:
+                sum_per_t = pred_seq.sum(dim=2)  # (B, L)
+                pred_total_mean = sum_per_t.mean(dim=1, keepdim=True)  # (B, 1)
+                # 掩蔽无效项，避免 NaN/Inf 传播
+                valid_total = self._isfinite(pred_total_mean) & self._isfinite(total_power)
+                rel_err = torch.where(
+                    valid_total,
+                    torch.abs(pred_total_mean - total_power) / (total_power.abs() + 1e-6),
+                    torch.zeros_like(total_power)
+                )
+                # 对有效样本做平均
+                denom = valid_total.float().sum().clamp_min(1.0)
+                conservation_loss = rel_err.sum() / denom
+                self._safe_log('train/loss/conservation', conservation_loss, on_step=True, on_epoch=True)
+                # 使用损失配置中的权重（若可用），默认0
+                cons_w = float(getattr(self.loss_fn, 'conservation_weight', 0.0))
+                total_loss = total_loss + cons_w * conservation_loss
+        except Exception:
+            pass
 
         losses = {'seq_regression': seq_loss, 'total': total_loss}
         self._validate_losses(losses, 'train', batch_idx)
 
-        # 记录学习率（按 epoch），在未附加 Trainer 的单元测试场景下跳过
+        # 记录学习率（按 epoch）
         if getattr(self, '_trainer', None) is not None and getattr(self._trainer, 'optimizers', None):
             self._safe_log('train/metrics/optimization/lr', self._trainer.optimizers[0].param_groups[0]['lr'], on_step=False, on_epoch=True)
 
         # 记录损失
         self._safe_log('train/loss/sequence', seq_loss, on_step=True, on_epoch=True, prog_bar=True)
-        if getattr(self, 'metric_learning_enable', False):
-            self._safe_log('train/loss/total', total_loss, on_step=True, on_epoch=True, prog_bar=False)
+        self._safe_log('train/loss/total', total_loss, on_step=True, on_epoch=True, prog_bar=False)
+
+        # 收集训练可视化样本（事件筛选在收集函数中控制）
+        try:
+            if batch.get('target_seq', None) is not None:
+                self._collect_sequence_examples(pred_seq, batch.get('target_seq'), batch)
+        except Exception:
+            pass
 
         # 每隔一定步数记录训练指标与梯度范数
         if batch_idx % self.config.training.log_every_n_steps == 0:
@@ -446,333 +557,70 @@ class NILMLightningModule(pl.LightningModule):
 
         return losses['total']
 
-    @torch.no_grad()
-    def _update_prototypes_and_log(self, pred_embeddings: torch.Tensor, target_states: Optional[torch.Tensor]) -> None:
-        """更新原型统计并记录 Mahalanobis 距离摘要。
 
-        - 更新：仅在设备处于开启状态时统计（若提供 target_states）。
-        - 日志：当某设备样本数达到阈值后，记录距离的均值与最大值（epoch 级）。
-        """
-        if self.prototype_library is None:
-            return
-        # 更新原型统计
-        self.prototype_library.update(pred_embeddings, states=target_states)
-
-        # 计算距离并记录摘要（按 epoch）
-        distances = self.prototype_library.mahalanobis(pred_embeddings)  # (B, N)
-        if distances is None:
-            return
-        # 只统计已就绪设备的距离（min_count 达到阈值）
-        ready_mask = torch.tensor([
-            self.prototype_library.is_ready(i) for i in range(self.n_devices)
-        ], device=distances.device)
-        if ready_mask.any():
-            # 选择已就绪列
-            sel = distances[:, ready_mask]
-            mean_d = sel.mean()
-            max_d = sel.max()
-            self._safe_log('train/mahalanobis_mean', mean_d, on_step=False, on_epoch=True, sync_dist=True)
-            self._safe_log('train/mahalanobis_max', max_d, on_step=False, on_epoch=True, sync_dist=True)
-
-        # 累积每设备距离样本用于 epoch 末统计与可视化
-        if self._distance_log_buffer is not None:
-            with torch.no_grad():
-                B, N = distances.shape
-                for i in range(N):
-                    if self.prototype_library.is_ready(i):
-                        vals = distances[:, i].detach().cpu().tolist()
-                        buf = self._distance_log_buffer[i]
-                        for v in vals:
-                            buf.append(v)
-
-    def _compute_aux_metric_loss(self, batch: Dict[str, torch.Tensor], pred_embeddings: torch.Tensor) -> torch.Tensor:
-        """计算度量学习辅助损失，使主干设备头嵌入接近对应分表原型。
-
-        - 正样本：设备开启 (y_on=1) 时，预测嵌入与其原型的余弦距离最小化。
-        - 负样本：与其他设备原型的相似度低于 margin（hinge）。
-        """
-        assert self.submeter_encoder is not None, "SubmeterEncoder is required when metric learning is enabled"
-
-        target_states: torch.Tensor = batch['target_states']  # (B, N)
-        target_power: torch.Tensor = batch.get('target_power', None)  # (B, N) or None
-
-        # 原型编码（训练期）
-        prototypes = self.submeter_encoder(
-            target_power if self.metric_use_power else None,
-            target_states
-        )  # (B, N, D)
-
-        # 归一化原型与预测嵌入，确保余弦相似度在[-1,1]
-        pred = torch.nn.functional.normalize(pred_embeddings, dim=-1)
-        prototypes = torch.nn.functional.normalize(prototypes, dim=-1)
-        pos_sim = torch.clamp((pred * prototypes).sum(dim=-1), min=-1.0, max=1.0)  # (B, N)
-
-        # 正样本损失：maximizing similarity -> minimize (1 - sim)
-        pos_mask = (target_states > 0).float()
-        pos_loss = ((1.0 - pos_sim) * pos_mask).sum() / (pos_mask.sum() + 1e-6)
-
-        # 负样本：与其他设备原型相似度不应高于 margin
-        B, N, D = pred.size()
-        # 扩展计算 (B, N, N) 相似度矩阵：pred_i · proto_j
-        pred_exp = pred.unsqueeze(2).expand(B, N, N, D)
-        proto_exp = prototypes.unsqueeze(1).expand(B, N, N, D)
-        sim_matrix = (pred_exp * proto_exp).sum(dim=-1)  # (B, N, N)
-
-        # 屏蔽对角（自身设备）
-        eye = torch.eye(N, device=sim_matrix.device).unsqueeze(0)
-        neg_sim = sim_matrix * (1.0 - eye)
-
-        # 仅在设备开启时应用负样本约束
-        pos_mask_exp = pos_mask.unsqueeze(2).expand(B, N, N)
-        # hinge: relu(sim - margin)
-        neg_margin = torch.relu(neg_sim - self.metric_margin) * pos_mask_exp
-        neg_loss = neg_margin.sum() / (pos_mask_exp.sum() + 1e-6)
-
-        aux_loss = pos_loss + neg_loss
-        # 记录到日志（未加权，在无 Trainer 时安全跳过）
-        self._safe_log('train/aux_metric_pos', pos_loss, on_step=False, on_epoch=True)
-        self._safe_log('train/aux_metric_neg', neg_loss, on_step=False, on_epoch=True)
-        self._safe_log('train/aux_metric_total', aux_loss, on_step=False, on_epoch=True)
-
-        return aux_loss
     
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, torch.Tensor]:
-        """验证步骤（纯 seq2seq）：仅进行序列前向、序列损失与序列指标。"""
-        # 数据验证和NaN检测
+        """验证步骤"""
         self._validate_batch_data(batch, 'val', batch_idx)
-
-        # 序列前向
-        seq_out = self.model.forward_seq(
-            batch.get('time_features'),
-            batch.get('freq_features'),
-            batch.get('time_positional'),
-            batch.get('aux_features'),
-            time_valid_mask=batch.get('time_valid_mask'),
-            freq_valid_mask=batch.get('freq_valid_mask')
-        )
-        pred_seq = seq_out[0] if isinstance(seq_out, tuple) else seq_out
+        
+        pred_seq, seq_loss = self._forward_and_compute_loss(batch, 'val')
         target_seq = batch.get('target_seq', None)
-
-        # 计算序列损失（若提供标签），应用标签有效掩码
+        
+        # 可视化样本收集
         if target_seq is not None:
-            valid = torch.isfinite(pred_seq) & torch.isfinite(target_seq)
-            vm = batch.get('target_seq_valid_mask', None)
-            try:
-                if isinstance(vm, torch.Tensor):
-                    if vm.dim() == pred_seq.dim():
-                        valid = valid & (vm > 0)
-                    elif vm.dim() + 1 == pred_seq.dim():
-                        valid = valid & (vm.unsqueeze(-1) > 0)
-            except Exception:
-                pass
-            element_loss = torch.nn.functional.smooth_l1_loss(pred_seq, target_seq, reduction='none')
-            element_loss = torch.where(valid, element_loss, torch.zeros_like(element_loss))
-            denom = valid.float().sum().clamp_min(1.0)
-            seq_loss = element_loss.sum() / denom
-            # 逐设备序列损失（按epoch记录）
-            try:
-                per_dev_denom = valid.float().sum(dim=(0,1)).clamp_min(1.0)
-                per_dev_sum = element_loss.sum(dim=(0,1))
-                per_dev_loss = per_dev_sum / per_dev_denom
-                for i, d_loss in enumerate(per_dev_loss):
-                    name = self.device_names[i] if i < len(self.device_names) else f'device_{i+1}'
-                    self._safe_log(f'test/loss/sequence/device/{name}', d_loss, on_step=False, on_epoch=True)
-            except Exception:
-                pass
-            # 逐设备序列损失（按epoch记录）
-            try:
-                per_dev_denom = valid.float().sum(dim=(0,1)).clamp_min(1.0)
-                per_dev_sum = element_loss.sum(dim=(0,1))
-                per_dev_loss = per_dev_sum / per_dev_denom
-                for i, d_loss in enumerate(per_dev_loss):
-                    name = self.device_names[i] if i < len(self.device_names) else f'device_{i+1}'
-                    self._safe_log(f'val/loss/sequence/device/{name}', d_loss, on_step=False, on_epoch=True)
-            except Exception:
-                pass
-            self._safe_log('val/loss/sequence', seq_loss, on_step=False, on_epoch=True)
-        else:
-            seq_loss = torch.tensor(0.0, device=pred_seq.device)
-
-        # 指标与可视化样本收集
-        try:
-            if target_seq is not None:
-                self._collect_sequence_examples(pred_seq, target_seq, batch, stage='val')
-        except Exception:
-            pass
+            self._collect_sequence_examples(pred_seq, target_seq, batch)
+        
+        # 计算指标
         metrics = self._compute_metrics(batch, stage='val')
-
-        # 明确记录验证损失与分数（按 epoch）
+        
+        # 记录损失
         self._safe_log('val/loss', seq_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self._safe_log('val/score', metrics['score'], on_step=False, on_epoch=True, prog_bar=True)
-
+        
         return {
             'val_loss': seq_loss,
-            'val_score': metrics['score'],
             'predictions': pred_seq,
-            'targets': batch.get('target_seq', None)
+            'targets': target_seq
         }
     
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, torch.Tensor]:
-        """测试步骤（纯 seq2seq）：仅进行序列前向、序列损失与序列指标。"""
-        # 数据验证和NaN检测
+        """测试步骤"""
         self._validate_batch_data(batch, 'test', batch_idx)
-
-        # 序列前向
-        seq_out = self.model.forward_seq(
-            batch.get('time_features'),
-            batch.get('freq_features'),
-            batch.get('time_positional'),
-            batch.get('aux_features'),
-            time_valid_mask=batch.get('time_valid_mask'),
-            freq_valid_mask=batch.get('freq_valid_mask')
-        )
-        pred_seq = seq_out[0] if isinstance(seq_out, tuple) else seq_out
+        
+        pred_seq, seq_loss = self._forward_and_compute_loss(batch, 'test')
         target_seq = batch.get('target_seq', None)
-
-        # 计算序列损失（若提供标签），应用标签有效掩码
-        if target_seq is not None:
-            valid = torch.isfinite(pred_seq) & torch.isfinite(target_seq)
-            vm = batch.get('target_seq_valid_mask', None)
-            try:
-                if isinstance(vm, torch.Tensor):
-                    if vm.dim() == pred_seq.dim():
-                        valid = valid & (vm > 0)
-                    elif vm.dim() + 1 == pred_seq.dim():
-                        valid = valid & (vm.unsqueeze(-1) > 0)
-            except Exception:
-                pass
-            element_loss = torch.nn.functional.smooth_l1_loss(pred_seq, target_seq, reduction='none')
-            element_loss = torch.where(valid, element_loss, torch.zeros_like(element_loss))
-            denom = valid.float().sum().clamp_min(1.0)
-            seq_loss = element_loss.sum() / denom
-            # 逐设备序列损失（按epoch记录）
-            try:
-                per_dev_denom = valid.float().sum(dim=(0,1)).clamp_min(1.0)
-                per_dev_sum = element_loss.sum(dim=(0,1))
-                per_dev_loss = per_dev_sum / per_dev_denom
-                for i, d_loss in enumerate(per_dev_loss):
-                    name = self.device_names[i] if i < len(self.device_names) else f'device_{i+1}'
-                    self._safe_log(f'test/loss/sequence/device/{name}', d_loss, on_step=False, on_epoch=True)
-            except Exception:
-                pass
-        else:
-            seq_loss = torch.tensor(0.0, device=pred_seq.device)
-
+        
+        # 计算指标
         metrics = self._compute_metrics(batch, stage='test')
-
-        # 显式按 epoch 记录测试损失与分数
-        self._safe_log('test/loss/total', seq_loss, on_step=False, on_epoch=True)
+        
+        # 记录损失和分数
         self._safe_log('test/loss', seq_loss, on_step=False, on_epoch=True)
-        self._safe_log('test/metrics/score', metrics['score'], on_step=False, on_epoch=True)
         self._safe_log('test/score', metrics['score'], on_step=False, on_epoch=True)
-
+        
         return {
             'test_loss': seq_loss,
             'test_score': metrics['score'],
             'predictions': pred_seq,
-            'targets': batch.get('target_seq', None)
+            'targets': target_seq
         }
 
-    def on_train_epoch_end(self) -> None:
-        """训练轮次结束：记录每设备原型样本数与距离分布统计，并进行可视化。"""
-        if self.prototype_library is None or self._distance_log_buffer is None or getattr(self, 'logger', None) is None:
-            return
-        try:
-            import numpy as np
-            for i, device_name in enumerate(self.device_names):
-                c = int(self.prototype_library.count[i].item())
-                self._safe_log(f'train/prototype_count/{device_name}', c, on_step=False, on_epoch=True)
-                vals = list(self._distance_log_buffer[i])
-                if len(vals) == 0:
-                    continue
-                arr = np.array(vals, dtype=np.float32)
-                mean_v = float(arr.mean())
-                p50 = float(np.percentile(arr, 50))
-                p90 = float(np.percentile(arr, 90))
-                p95 = float(np.percentile(arr, 95))
-                self._safe_log(f'train/distance_mean/{device_name}', mean_v, on_step=False, on_epoch=True)
-                self._safe_log(f'train/distance_p50/{device_name}', p50, on_step=False, on_epoch=True)
-                self._safe_log(f'train/distance_p90/{device_name}', p90, on_step=False, on_epoch=True)
-                self._safe_log(f'train/distance_p95/{device_name}', p95, on_step=False, on_epoch=True)
-                # 可视化直方图
-                try:
-                    self.logger.experiment.add_histogram(f'train/distance_hist/{device_name}', torch.tensor(arr), self.current_epoch)
-                except Exception:
-                    pass
-            # 清空缓冲以便下一轮
-            for buf in self._distance_log_buffer:
-                buf.clear()
-        except Exception as e:
-            print(f"on_train_epoch_end distance logging failed: {e}")
 
-    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        """保存检查点时持久化原型库状态。"""
-        try:
-            if self.prototype_library is not None:
-                checkpoint['prototype_library_state'] = self.prototype_library.state_dict()
-        except Exception as e:
-            print(f"保存原型库状态失败: {e}")
-
-    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        """加载检查点时恢复原型库状态。"""
-        try:
-            state = checkpoint.get('prototype_library_state', None)
-            if state is not None and self.prototype_library is not None:
-                self.prototype_library.load_state_dict(state)
-        except Exception as e:
-            print(f"加载原型库状态失败: {e}")
     
     def on_validation_epoch_end(self) -> None:
         """验证轮次结束"""
-        # 若未启用可视化，仅跳过可视化，不影响指标更新
-        # 序列对比可视化：绘制预测 vs 标签，并叠加主表原始波形
-        try:
-            if getattr(self, 'logger', None) is not None and len(self._sequence_examples) > 0:
-                import matplotlib.pyplot as plt
-                import numpy as np
-                from datetime import datetime
-                import matplotlib.dates as mdates
-                for idx, ex in enumerate(self._sequence_examples[:self.max_plots_per_epoch]):
-                    pred = ex['pred']
-                    target = ex['target']
-                    L = pred.size(0)
-                    K = pred.size(1) if pred.dim() == 2 else 1
-                    fig = plt.figure(figsize=(12, 3 + 1.5*K))
-                    for k in range(K):
-                        ax = fig.add_subplot(K, 1, k+1)
-                        ts = ex.get('timestamps', None)
-                        if ts is not None and hasattr(ts, 'numel') and int(ts.numel()) == int(L):
-                            ts_np = ts.view(-1).detach().cpu().numpy()
-                            x = [datetime.fromtimestamp(float(v)) for v in ts_np]
-                            ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=5, maxticks=10))
-                            ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
-                        else:
-                            x = np.arange(L)
-                        y_pred = pred[:, k].numpy() if K > 1 else (pred[:, 0].numpy() if pred.dim() == 2 else pred.numpy())
-                        y_true = target[:, k].numpy() if K > 1 else (target[:, 0].numpy() if target.dim() == 2 else target.numpy())
-                        mains = ex.get('mains', None)
-                        if mains is not None and int(mains.numel()) == int(L):
-                            ax.plot(x, mains.numpy(), label='mains', color='tab:orange', linewidth=1.0, alpha=0.6)
-                        ax.plot(x, y_true, label='label', color='black', linewidth=1.2)
-                        ax.plot(x, y_pred, label='pred', color='tab:blue', linewidth=1.2, alpha=0.8)
-                        ax.set_title(f'Device {k}')
-                        ax.legend(loc='upper right')
-                    fig.autofmt_xdate()
-                    self.logger.experiment.add_figure(f'val/visualization/sequence/sample_{idx}', fig, self.current_epoch)
-                    plt.close(fig)
+        # 简单的可视化：保存到文件而不是TensorBoard
+        if self.enable_visualization and len(self._sequence_examples) > 0:
+            try:
+                self._save_sequence_examples('val')
                 self._sequence_examples.clear()
-        except Exception as e:
-            print(f"sequence visualization failed: {e}")
-        # 获取当前验证监控值（根据配置兼容不同键）
-        ckpt_monitor = getattr(self.config.training.checkpoint, 'monitor', 'val/score')
-        if ckpt_monitor == 'val_score':
-            ckpt_monitor = 'val/score'
-        current_val = self.trainer.callback_metrics.get(ckpt_monitor, None)
+            except Exception as e:
+                try:
+                    print(f"Visualization failed: {e}")
+                except Exception:
+                    pass
+        # 获取当前验证监控值（统一为 val/loss，兼容旧键）
+        current_val = self.trainer.callback_metrics.get('val/loss', None)
         if current_val is None:
-            # 回退（优先val/loss）
-            current_val = self.trainer.callback_metrics.get('val/loss', None)
-        if current_val is None:
-            current_val = self.trainer.callback_metrics.get('val/score', 0.0)
+            current_val = float('inf')
         # 将 Tensor 转为 float，避免后续配置或日志处理中出现 OmegaConf 类型不支持
         try:
             if hasattr(current_val, 'item'):
@@ -780,22 +628,23 @@ class NILMLightningModule(pl.LightningModule):
             else:
                 current_val = float(current_val)
         except Exception:
-            current_val = float('nan')
+            current_val = float('inf')
         
-        # 根据模式更新最佳值（支持min/max）
-        mode = str(getattr(self.config.training.checkpoint, 'mode', 'max')).lower()
+        # 若当前值非有限，安全回退为 +inf（与最小化目标一致）
+        if not np.isfinite(current_val):
+            current_val = float('inf')
+        
+        # 更新最佳验证损失（min 模式）
+        mode = str(getattr(self.config.training.checkpoint, 'mode', 'min')).lower()
         if np.isfinite(current_val):
-            if mode == 'min':
-                is_better = current_val < float(self.best_val_score)
-            else:
-                is_better = current_val > float(self.best_val_score)
+            is_better = current_val < float(getattr(self, 'best_val_loss', float('inf')))
             if is_better:
-                self.best_val_score = float(current_val)
-                # 记录最佳验证分数（层级命名，在无 Trainer 时安全跳过）
-                self._safe_log('val/best_score', self.best_val_score, on_epoch=True)
+                self.best_val_loss = float(current_val)
+                # 记录最佳验证损失（层级命名，在无 Trainer 时安全跳过）
+                self._safe_log('val/best_loss', self.best_val_loss, on_epoch=True)
         
-        # 记录最佳验证分数（归入验证命名空间，安全记录）
-        self._safe_log('val/best_score', self.best_val_score, on_epoch=True)
+        # 记录最佳验证损失（归入验证命名空间，安全记录）
+        self._safe_log('val/best_loss', getattr(self, 'best_val_loss', float('inf')), on_epoch=True)
         
         # 记录模型参数统计
         for name, param in self.named_parameters():
@@ -805,6 +654,65 @@ class NILMLightningModule(pl.LightningModule):
         
         # 更新损失函数的epoch
         self.loss_fn.update_epoch(self.current_epoch)
+
+    def on_train_epoch_end(self) -> None:
+        """训练轮次结束：保存可视化样本到文件"""
+        try:
+            if self.enable_visualization and len(self._sequence_examples) > 0:
+                self._save_sequence_examples('train')
+                self._sequence_examples.clear()
+        except Exception:
+            pass
+
+    def _save_sequence_examples(self, stage: str) -> None:
+        """将收集的样本保存为PNG到指定目录"""
+        try:
+            import matplotlib.pyplot as plt
+            from pathlib import Path
+            base_dir = Path(self.vis_output_dir) / stage / f"epoch_{self.current_epoch:02d}"
+            base_dir.mkdir(parents=True, exist_ok=True)
+            for idx, ex in enumerate(self._sequence_examples[:self.max_plots_per_epoch]):
+                pred = ex.get('pred'); target = ex.get('target'); valid = ex.get('valid'); mains = ex.get('mains', None)
+                if valid is None:
+                    valid = self._isfinite(pred) & self._isfinite(target)
+                # 图1：设备预测 vs 目标（按设备维）
+                fig1, ax1 = plt.subplots(figsize=(10, 4))
+                try:
+                    p_np = pred.clone(); t_np = target.clone()
+                    mask = ~valid if isinstance(valid, torch.Tensor) else ~torch.tensor(valid, dtype=torch.bool)
+                    p_np[mask] = torch.nan; t_np[mask] = torch.nan
+                    # 将(K设备)在时间维上叠加或分别作图：这里叠加对比更直观
+                    ax1.plot(t_np.numpy(), label='target')
+                    ax1.plot(p_np.numpy(), label='pred')
+                    ax1.set_title(f'{stage} sample {idx} devices')
+                    ax1.legend()
+                    fig1.tight_layout()
+                    fig1.savefig(base_dir / f'sample_{idx}_devices.png')
+                finally:
+                    plt.close(fig1)
+                # 图2：总功率对比（若有mains）
+                if mains is not None:
+                    fig2, ax2 = plt.subplots(figsize=(10, 4))
+                    try:
+                        # 预测总和：按设备求和
+                        pred_total = pred.sum(dim=1) if pred.dim() == 2 else pred
+                        true_total = target.sum(dim=1) if target.dim() == 2 else target
+                        ax2.plot(true_total.numpy(), label='true_total')
+                        ax2.plot(pred_total.numpy(), label='pred_total')
+                        ax2.plot(mains.numpy(), label='mains')
+                        ax2.set_title(f'{stage} sample {idx} total power')
+                        ax2.legend()
+                        fig2.tight_layout()
+                        fig2.savefig(base_dir / f'sample_{idx}_total.png')
+                    finally:
+                        plt.close(fig2)
+        except Exception as e:
+            try:
+                print(f"[Viz Save] failed: {e}")
+            except Exception:
+                pass
+
+
     
     def configure_optimizers(self) -> Dict[str, Any]:
         """配置优化器和学习率调度器"""
@@ -848,9 +756,8 @@ class NILMLightningModule(pl.LightningModule):
             # 让调度器监控与回调一致的指标与模式
             es_cfg = getattr(self.config.training, 'early_stopping', None)
             ckpt_cfg = getattr(self.config.training, 'checkpoint', None)
-            monitor_key = str(getattr(es_cfg, 'monitor', None) or getattr(ckpt_cfg, 'monitor', 'val/loss'))
-            monitor_key = 'val/score' if monitor_key == 'val_score' else monitor_key
-            monitor_mode = str(getattr(es_cfg, 'mode', None) or getattr(ckpt_cfg, 'mode', 'min')).lower()
+            monitor_key = 'val/loss'
+            monitor_mode = 'min'
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
                 mode=monitor_mode,
@@ -871,34 +778,139 @@ class NILMLightningModule(pl.LightningModule):
             return optimizer
     
     def _validate_batch_data(self, batch: Dict[str, torch.Tensor], stage: str, batch_idx: int) -> None:
-        """验证批次数据的有效性"""
+        """验证批次数据的有效性，并智能清理辅助特征的 NaN/Inf"""
         suppress_invalid = getattr(getattr(self.config, 'debug', {}), 'suppress_invalid_warnings', True)
+        
         for key, tensor in batch.items():
             # 只对tensor类型的数据进行验证
-            if isinstance(tensor, torch.Tensor) and not torch.isfinite(tensor).all():
-                nan_count = torch.isnan(tensor).sum().item()
-                inf_count = torch.isinf(tensor).sum().item()
-                self._safe_log(f'{stage}/data_nan_count/{key}', float(nan_count), on_step=True, on_epoch=False)
-                self._safe_log(f'{stage}/data_inf_count/{key}', float(inf_count), on_step=True, on_epoch=False)
-
-                # 若是已掩蔽的目标字段，则在非严格模式下抑制告警输出（仍记录到 TensorBoard）
-                masked = False
-                if key == 'target_seq' and isinstance(batch.get('target_seq_valid_mask'), torch.Tensor):
-                    masked = True
+            if not isinstance(tensor, torch.Tensor):
+                continue
                 
-                if self.config.debug.strict_validation:
-                    raise ValueError(f"发现无效数据在 {stage} batch {batch_idx}, key '{key}': "
-                                   f"NaN: {nan_count}, Inf: {inf_count}")
-                else:
-                    if masked and suppress_invalid:
-                        # 跳过打印，避免训练日志噪声
-                        continue
-                    print(f"警告: {stage} batch {batch_idx} 中 '{key}' 包含无效值: NaN: {nan_count}, Inf: {inf_count}")
+            # 检查是否有无效值
+            finite_mask = self._isfinite(tensor)
+            if finite_mask.all():
+                continue
+                
+            nan_count = torch.isnan(tensor).sum().item()
+            inf_count = torch.isinf(tensor).sum().item()
+            total_elements = tensor.numel()
+            invalid_ratio = (nan_count + inf_count) / total_elements
+            
+            # 记录统计信息
+            self._safe_log(f'{stage}/data_quality/{key}_nan_count', float(nan_count), on_step=True, on_epoch=False)
+            self._safe_log(f'{stage}/data_quality/{key}_inf_count', float(inf_count), on_step=True, on_epoch=False)
+            self._safe_log(f'{stage}/data_quality/{key}_invalid_ratio', float(invalid_ratio), on_step=True, on_epoch=False)
+
+            # 特殊处理不同类型的数据
+            if key == 'aux_features':
+                # 只记录辅助特征的数据质量，不修改原始数据
+                # 数据清理现在通过掩码在模型层面处理
+                self._safe_log(f'{stage}/data_quality/aux_features_invalid_count', float(nan_count + inf_count), on_step=True, on_epoch=False)
+                
+                # 如果无效值比例过高，发出警告
+                if invalid_ratio > 0.1:  # 超过10%的值无效
+                    print(f"警告: {stage} batch {batch_idx} 中 'aux_features' 无效值比例过高: {invalid_ratio:.2%} (NaN: {nan_count}, Inf: {inf_count})")
+                elif not suppress_invalid:
+                    print(f"信息: {stage} batch {batch_idx} 中 'aux_features' 包含无效值（将通过掩码处理）: NaN: {nan_count}, Inf: {inf_count}")
+                continue
+                
+            elif key == 'target_seq':
+                # 目标序列有掩码处理，只记录不清理
+                if isinstance(batch.get('target_seq_valid_mask'), torch.Tensor):
+                    if not suppress_invalid:
+                        print(f"信息: {stage} batch {batch_idx} 中 'target_seq' 包含无效值（已有掩码处理）: NaN: {nan_count}, Inf: {inf_count}")
+                    continue
+                    
+            elif key in ['time_features', 'freq_features']:
+                # 时域和频域特征的保守清理
+                cleaned = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+                batch[key] = cleaned
+                self._safe_log(f'{stage}/data_cleaning/{key}_cleaned', float(nan_count + inf_count), on_step=True, on_epoch=False)
+                
+            # 严格验证模式下抛出错误
+            if self.config.debug.strict_validation and invalid_ratio > 0.05:  # 超过5%无效值
+                raise ValueError(f"发现过多无效数据在 {stage} batch {batch_idx}, key '{key}': "
+                               f"NaN: {nan_count}, Inf: {inf_count}, 无效比例: {invalid_ratio:.2%}")
+            
+            # 一般情况下的警告
+            if not suppress_invalid and invalid_ratio > 0.01:  # 超过1%无效值
+                print(f"警告: {stage} batch {batch_idx} 中 '{key}' 包含无效值: NaN: {nan_count}, Inf: {inf_count} ({invalid_ratio:.2%})")
+    
+    def _clean_aux_features_smart(self, aux_features: torch.Tensor, nan_count: int, inf_count: int) -> torch.Tensor:
+        """智能清理辅助特征"""
+        if aux_features.numel() == 0:
+            return aux_features
+            
+        # 获取特征维度
+        if aux_features.dim() == 1:
+            # 单个样本 [n_features]
+            features = aux_features.unsqueeze(0)
+            squeeze_output = True
+        else:
+            # 批次 [batch_size, n_features]
+            features = aux_features
+            squeeze_output = False
+            
+        batch_size, n_features = features.shape
+        cleaned = features.clone()
+        
+        # 逐特征处理
+        for feat_idx in range(n_features):
+            feat_col = cleaned[:, feat_idx]
+            
+            # 检查这个特征的无效值
+            nan_mask = torch.isnan(feat_col)
+            inf_mask = torch.isinf(feat_col)
+            
+            if not (nan_mask.any() or inf_mask.any()):
+                continue
+                
+            # 获取有效值用于统计
+            valid_mask = ~(nan_mask | inf_mask)
+            valid_values = feat_col[valid_mask]
+            
+            if valid_values.numel() == 0:
+                # 全部无效，填充为0
+                feat_col.fill_(0.0)
+            else:
+                # 有部分有效值，使用中位数填充NaN
+                if nan_mask.any():
+                    if valid_values.numel() == 1:
+                        median_val = valid_values[0]
+                    else:
+                        median_val = torch.median(valid_values)
+                    feat_col[nan_mask] = median_val
+                    
+                # 处理Inf值：裁剪到有效值范围
+                if inf_mask.any():
+                    min_val = torch.min(valid_values)
+                    max_val = torch.max(valid_values)
+                    
+                    # 扩展范围以避免过度裁剪
+                    range_val = max_val - min_val
+                    if range_val > 0:
+                        extended_min = min_val - 0.1 * range_val
+                        extended_max = max_val + 0.1 * range_val
+                    else:
+                        extended_min = min_val - 1.0
+                        extended_max = max_val + 1.0
+                        
+                    feat_col = torch.clamp(feat_col, extended_min, extended_max)
+                    
+            cleaned[:, feat_idx] = feat_col
+            
+        # 最终安全检查
+        cleaned = torch.nan_to_num(cleaned, nan=0.0, posinf=1e6, neginf=-1e6)
+        
+        if squeeze_output:
+            cleaned = cleaned.squeeze(0)
+            
+        return cleaned
     
     def _validate_predictions(self, pred_seq: torch.Tensor, 
                             stage: str, batch_idx: int) -> None:
         """验证序列预测的有效性，仅检查曲线值。"""
-        if not torch.isfinite(pred_seq).all():
+        if not self._isfinite(pred_seq).all():
             nan_count = torch.isnan(pred_seq).sum().item()
             inf_count = torch.isinf(pred_seq).sum().item()
             self._safe_log(f'{stage}/pred_seq_nan_count', float(nan_count), on_step=True, on_epoch=False)
@@ -918,7 +930,7 @@ class NILMLightningModule(pl.LightningModule):
             if loss_value.dim() > 0:
                 loss_value = loss_value.mean()
                 
-            if not torch.isfinite(loss_value):
+            if not bool(self._isfinite(loss_value)):
                 self._safe_log(f'{stage}/loss_invalid/{loss_name}', 1.0, on_step=True, on_epoch=False)
                 
                 if self.config.debug.strict_validation:
@@ -931,16 +943,13 @@ class NILMLightningModule(pl.LightningModule):
         callbacks = []
         
         # 模型检查点
-        # 兼容新的层级式指标命名：将旧的 'val_score' 映射为 'val/score'
-        ckpt_monitor = getattr(self.config.training.checkpoint, 'monitor', 'val/score')
-        if ckpt_monitor == 'val_score':
-            ckpt_monitor = 'val/score'
+        ckpt_monitor = 'val/loss'
         # 使用安全的文件名（不依赖指标占位，避免层级名导致格式错误）
         checkpoint_callback = ModelCheckpoint(
             dirpath=self.config.training.checkpoint.dirpath,
             filename='epoch{epoch:02d}',
             monitor=ckpt_monitor,
-            mode=self.config.training.checkpoint.mode,
+            mode='min',
             save_top_k=self.config.training.checkpoint.save_top_k,
             save_last=True,
             verbose=True
@@ -949,13 +958,11 @@ class NILMLightningModule(pl.LightningModule):
         
         # 早停
         if self.config.training.early_stopping.enable:
-            es_monitor = getattr(self.config.training.early_stopping, 'monitor', 'val/score')
-            if es_monitor == 'val_score':
-                es_monitor = 'val/score'
+            es_monitor = 'val/loss'
             early_stopping = EarlyStopping(
                 monitor=es_monitor,
                 patience=self.config.training.early_stopping.patience,
-                mode=self.config.training.early_stopping.mode,
+                mode='min',
                 verbose=True
             )
             callbacks.append(early_stopping)
@@ -1048,7 +1055,9 @@ def create_trainer(config: DictConfig, logger: Optional[pl.loggers.Logger] = Non
         deterministic=config.reproducibility.deterministic,
         benchmark=config.reproducibility.benchmark,
         # 性能优化
-        sync_batchnorm=True if (accelerator == 'gpu' and num_cuda_devices > 1) else False
+        sync_batchnorm=True if (accelerator == 'gpu' and num_cuda_devices > 1) else False,
+        # 避免 macOS MPS 在初始验证阶段触发 NDArray 缓冲错误
+        num_sanity_val_steps=0 if accelerator == 'mps' else getattr(getattr(config, 'training', None), 'num_sanity_val_steps', 2)
     )
     
     return trainer
@@ -1254,12 +1263,13 @@ def main(config: DictConfig) -> None:
     with open(summary_path, 'w', encoding='utf-8') as f:
         f.write(str(model_summary))
     
-    # 保存最终结果
+    # 保存最终结果（统一使用基于损失的最佳指标）
+    best_loss = float(getattr(model, 'best_val_loss', float('inf')))
     results = {
-        'best_val_score': model.best_val_score,
+        'best_val_loss': best_loss,
         'best_thresholds': model.best_thresholds,
         'test_results': test_results,
-        'best_model_path': trainer.checkpoint_callback.best_model_path if trainer.checkpoint_callback else None,
+        'best_model_path': trainer.checkpoint_callback.best_model_path if getattr(trainer, 'checkpoint_callback', None) else None,
         'model_summary': str(model_summary),
         'config': OmegaConf.to_container(config, resolve=True)
     }
@@ -1267,10 +1277,10 @@ def main(config: DictConfig) -> None:
     results_path = output_dir / f"{experiment_name}_results.yaml"
     OmegaConf.save(results, results_path)
     
-    print(f"训练完成! 最佳验证分数: {model.best_val_score:.4f}")
+    print(f"训练完成! 最佳验证损失: {best_loss:.4f}")
     print(f"结果保存至: {results_path}")
     print(f"模型摘要保存至: {summary_path}")
-    if trainer.checkpoint_callback:
+    if getattr(trainer, 'checkpoint_callback', None):
         print(f"最佳模型保存至: {trainer.checkpoint_callback.best_model_path}")
 
 

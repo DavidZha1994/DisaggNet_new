@@ -274,7 +274,7 @@ class WalkForwardValidator:
                 'fold_id': fold.fold_id,
                 'fold_info': fold.to_dict(),
                 'test_results': test_results[0] if test_results else {},
-                'best_val_score': float(model.best_val_score),
+                'best_val_loss': float(getattr(model, 'best_val_loss', float('inf'))),
                 'best_thresholds': {k: float(v) for k, v in model.best_thresholds.items()},
                 'best_model_path': str(trainer.checkpoint_callback.best_model_path) if trainer.checkpoint_callback else None,
                 'training_time': datetime.now().isoformat()
@@ -284,7 +284,7 @@ class WalkForwardValidator:
             with open(fold_result_path, 'w') as f:
                 yaml.dump(fold_result, f, default_flow_style=False)
             
-            logger.info(f"Fold {fold.fold_id} completed. Val score: {model.best_val_score:.4f}")
+            logger.info(f"Fold {fold.fold_id} completed. Val loss: {getattr(model, 'best_val_loss', float('inf')):.4f}")
             
             return fold_result
             
@@ -343,8 +343,8 @@ class WalkForwardValidator:
             yaml.dump(final_results, f, default_flow_style=False)
         
         logger.info(f"Walk-Forward validation completed. Results saved to {results_path}")
-        if 'avg_val_score' in summary:
-            logger.info(f"Average validation score: {summary['avg_val_score']:.4f} ± {summary['std_val_score']:.4f}")
+        if 'avg_val_loss' in summary:
+            logger.info(f"Average validation loss: {summary['avg_val_loss']:.4f} ± {summary['std_val_loss']:.4f}")
         else:
             logger.warning("No valid fold results available for summary statistics")
         
@@ -357,8 +357,8 @@ class WalkForwardValidator:
         if not valid_results:
             return {'error': 'No valid fold results'}
         
-        # 提取验证分数
-        val_scores = [r['best_val_score'] for r in valid_results]
+        # 提取验证损失
+        val_losses = [r['best_val_loss'] for r in valid_results]
         
         # 提取测试指标
         test_metrics = {}
@@ -375,10 +375,10 @@ class WalkForwardValidator:
             'num_folds': len(fold_results),
             'num_valid_folds': len(valid_results),
             'num_failed_folds': len(fold_results) - len(valid_results),
-            'avg_val_score': np.mean(val_scores),
-            'std_val_score': np.std(val_scores),
-            'min_val_score': np.min(val_scores),
-            'max_val_score': np.max(val_scores),
+            'avg_val_loss': np.mean(val_losses),
+            'std_val_loss': np.std(val_losses),
+            'min_val_loss': np.min(val_losses),
+            'max_val_loss': np.max(val_losses),
             **test_metrics
         }
         

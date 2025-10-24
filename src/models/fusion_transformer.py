@@ -14,20 +14,29 @@ class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 1000):
         super().__init__()
         self.d_model = d_model
-        
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        
+        self.max_len = max_len
+        # 预先构建一个默认长度的PE缓冲区，后续按需动态扩展
+        pe = self._build_pe(max_len, device=torch.device('cpu'), dtype=torch.float32)
+        self.register_buffer('pe', pe)
+    
+    def _build_pe(self, length: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        position = torch.arange(0, length, dtype=dtype, device=device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.d_model, 2, dtype=dtype, device=device) * (-math.log(10000.0) / self.d_model))
+        pe = torch.zeros(length, self.d_model, dtype=dtype, device=device)
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        
-        self.register_buffer('pe', pe)
+        pe = pe.unsqueeze(0).transpose(0, 1)  # (length, 1, d_model)
+        return pe
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (seq_len, batch_size, d_model)
-        return x + self.pe[:x.size(0), :]
+        seq_len = x.size(0)
+        if seq_len > self.pe.size(0):
+            # 动态扩展至匹配输入长度，并保持dtype/device一致
+            pe = self._build_pe(seq_len, device=x.device, dtype=x.dtype)
+        else:
+            pe = self.pe[:seq_len, :].to(dtype=x.dtype, device=x.device)
+        return x + pe
 
 
 class CausalMultiHeadAttention(nn.Module):
@@ -69,16 +78,18 @@ class CausalMultiHeadAttention(nn.Module):
         K = self.w_k(key).view(batch_size, k_len, self.n_heads, self.d_k).transpose(1, 2)
         V = self.w_v(value).view(batch_size, k_len, self.n_heads, self.d_k).transpose(1, 2)
         
-        # 构建注意力mask
-        attn_mask = None
+        # 构建注意力mask（统一为布尔掩码：True 表示屏蔽）
+        attn_mask_bool = None
         if self.causal:
-            causal_mask = self._get_causal_mask(q_len, query.device)
-            attn_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, self.n_heads, -1, -1)
+            causal_mask = self._get_causal_mask(q_len, query.device).bool()
+            attn_mask_bool = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, self.n_heads, -1, -1)
         
         if mask is not None:
-            # 扩展到多头维度，屏蔽无效位置（key维度）
-            additional_mask = mask.unsqueeze(1).unsqueeze(1).expand(-1, self.n_heads, q_len, -1)
-            attn_mask = additional_mask if attn_mask is None else attn_mask.masked_fill(additional_mask == 0, float('-inf'))
+            # mask 为 key 维度的有效位，转换为无效位布尔掩码
+            key_valid = (mask > 0) if mask.dtype != torch.bool else mask
+            key_invalid = ~key_valid
+            additional_mask = key_invalid.unsqueeze(1).unsqueeze(1).expand(-1, self.n_heads, q_len, -1)
+            attn_mask_bool = additional_mask if attn_mask_bool is None else (attn_mask_bool | additional_mask)
         
         # 在MPS上禁用F.scaled_dot_product_attention以避免NDArray断言错误
         use_fused_sdpa = hasattr(F, 'scaled_dot_product_attention') and not torch.backends.mps.is_available()
@@ -86,17 +97,18 @@ class CausalMultiHeadAttention(nn.Module):
         if use_fused_sdpa:
             context = F.scaled_dot_product_attention(
                 Q, K, V,
-                attn_mask=attn_mask,
+                attn_mask=attn_mask_bool,
                 dropout_p=self.dropout.p if self.training else 0.0,
                 is_causal=False
             )
         else:
             # 安全实现（手动softmax路径），兼容MPS
             scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # (B, H, q_len, k_len)
-            if attn_mask is not None:
-                scores = scores.masked_fill(attn_mask == float('-inf'), float('-inf'))
-                scores = scores.masked_fill(attn_mask == 0, float('-inf'))
+            if attn_mask_bool is not None:
+                scores = scores.masked_fill(attn_mask_bool, float('-inf'))
             attn = torch.softmax(scores, dim=-1)
+            # 若整行均为 -inf，softmax 产生 NaN；将其安全置零
+            attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
             attn = self.dropout(attn)
             context = torch.matmul(attn, V)  # (B, H, q_len, d_k)
         
@@ -308,8 +320,9 @@ class AuxEncoder(nn.Module):
         self.fc2: Optional[nn.Linear] = None
         self.norm = nn.LayerNorm(out_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, aux_valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # x: (batch_size, n_aux_features)
+        # aux_valid_mask: (batch_size, n_aux_features) - True表示有效特征
         if x is None:
             return None
 
@@ -321,14 +334,32 @@ class AuxEncoder(nn.Module):
             self.bn1 = nn.BatchNorm1d(self.hidden_dim).to(x.device)
             self.fc2 = nn.Linear(self.hidden_dim, self.out_dim).to(x.device)
 
+        # 处理无效值：用0填充，但保持梯度流动
+        x_processed = x.clone()
+        if aux_valid_mask is not None:
+            # 将无效位置设为0，但不阻断梯度
+            x_processed = torch.where(aux_valid_mask, x_processed, torch.zeros_like(x_processed))
+        else:
+            # 如果没有掩码，使用nan_to_num作为后备
+            x_processed = torch.nan_to_num(x_processed, nan=0.0, posinf=0.0, neginf=0.0)
+
         # 前向传播
-        y = self.fc1(x)
+        y = self.fc1(x_processed)
         # BatchNorm1d 期望 (N, C)
         y = self.bn1(y)
         y = self.act(y)
         y = self.dropout(y)
         y = self.fc2(y)
         y = self.norm(y)
+        
+        # 如果有掩码，应用特征级别的权重
+        if aux_valid_mask is not None:
+            # 计算每个样本的有效特征比例，用于调整输出强度
+            valid_ratio = aux_valid_mask.float().mean(dim=1, keepdim=True)  # (batch_size, 1)
+            # 避免除零，至少保持10%的强度
+            valid_ratio = torch.clamp(valid_ratio, min=0.1)
+            y = y * valid_ratio.sqrt()  # 使用平方根避免过度惩罚
+        
         return y
 
 
@@ -444,7 +475,7 @@ class MultiTaskHead(nn.Module):
                 nn.ReLU(),
                 nn.Dropout(0.1),
                 nn.Linear(hidden_dim, 1),
-                nn.ReLU()
+                nn.Softplus()
             ) for _ in range(n_devices)
         ])
         
@@ -454,7 +485,7 @@ class MultiTaskHead(nn.Module):
                 nn.ReLU(),
                 nn.Dropout(0.1),
                 nn.Linear(hidden_dim, 1),
-                nn.ReLU()
+                nn.Softplus()
             )
         else:
             self.unknown_regression_head = None
@@ -706,14 +737,15 @@ class FusionTransformer(nn.Module):
                 time_positional: Optional[torch.Tensor] = None,
                 aux_features: Optional[torch.Tensor] = None,
                 time_valid_mask: Optional[torch.Tensor] = None,
-                freq_valid_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+                freq_valid_mask: Optional[torch.Tensor] = None,
+                aux_valid_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         
         # 时域编码
         time_repr = self.time_encoder(time_features, time_positional, mask=time_valid_mask)
 
         # 辅助特征编码并融合（使用可学习权重，避免信息重复）
         if self.aux_encoder is not None and aux_features is not None:
-            aux_repr = self.aux_encoder(aux_features)  # (batch_size, d_model)
+            aux_repr = self.aux_encoder(aux_features, aux_valid_mask)  # (batch_size, d_model)
             seq_len = time_repr.size(1)
             aux_seq = aux_repr.unsqueeze(1).expand(-1, seq_len, -1)
             gate = self.aux_gate(aux_seq)
@@ -744,7 +776,8 @@ class FusionTransformer(nn.Module):
                     time_positional: Optional[torch.Tensor] = None,
                     aux_features: Optional[torch.Tensor] = None,
                     time_valid_mask: Optional[torch.Tensor] = None,
-                    freq_valid_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+                    freq_valid_mask: Optional[torch.Tensor] = None,
+                    aux_valid_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         产生序列→序列回归输出，并同步返回窗口级预测用于约束与评估。
         返回：
@@ -758,7 +791,7 @@ class FusionTransformer(nn.Module):
 
         # 辅助特征编码并融合
         if self.aux_encoder is not None and aux_features is not None:
-            aux_repr = self.aux_encoder(aux_features)
+            aux_repr = self.aux_encoder(aux_features, aux_valid_mask)
             seq_len = time_repr.size(1)
             aux_seq = aux_repr.unsqueeze(1).expand(-1, seq_len, -1)
             gate = self.aux_gate(aux_seq)
@@ -787,14 +820,15 @@ class FusionTransformer(nn.Module):
                 time_positional: Optional[torch.Tensor] = None,
                 aux_features: Optional[torch.Tensor] = None,
                 time_valid_mask: Optional[torch.Tensor] = None,
-                freq_valid_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+                freq_valid_mask: Optional[torch.Tensor] = None,
+                aux_valid_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         """与 forward 相同，但返回 (reg, cls, unknown?, embeddings)。"""
         # 时域编码
         time_repr = self.time_encoder(time_features, time_positional, mask=time_valid_mask)
 
         # 辅助特征编码并融合
         if self.aux_encoder is not None and aux_features is not None:
-            aux_repr = self.aux_encoder(aux_features)
+            aux_repr = self.aux_encoder(aux_features, aux_valid_mask)
             seq_len = time_repr.size(1)
             aux_seq = aux_repr.unsqueeze(1).expand(-1, seq_len, -1)
             gate = self.aux_gate(aux_seq)

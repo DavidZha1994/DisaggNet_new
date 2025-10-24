@@ -336,9 +336,15 @@ class UnifiedMultiTaskLoss(nn.Module):
             unknown = F.softplus(unknown_pred)
             predicted_total = predicted_total + unknown
         
-        # 使用相对误差，避免总功率为0的情况
-        relative_error = torch.abs(predicted_total - total_power) / (total_power + 1e-6)
-        return relative_error.mean()
+        # 掩蔽无效项（与无分类时的分支保持一致的稳健性）
+        valid_total = torch.isfinite(predicted_total) & torch.isfinite(total_power)
+        rel_err = torch.where(
+            valid_total,
+            torch.abs(predicted_total - total_power) / (total_power.abs() + 1e-6),
+            torch.zeros_like(total_power)
+        )
+        # 返回按样本平均（仅统计有效样本）
+        return rel_err.squeeze(1).mean()
     
     def consistency_constraint(self, pred_power: torch.Tensor, 
                              pred_switch: torch.Tensor,

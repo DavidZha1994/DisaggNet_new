@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import yaml
 from concurrent.futures import ThreadPoolExecutor
+from src.visualization.pipeline_viz import PipelineVisualizer, VizConfig
 
 
 @dataclass
@@ -92,6 +93,20 @@ class HIPEDataPreparationPipeline:
             n_jobs_cfg = max(1, os.cpu_count() or 1)
         self.n_jobs = n_jobs_cfg
         self.use_polars = bool(compute_cfg.get("use_polars", False))
+        # Visualization setup (independent output directory)
+        viz_cfg = self.config.get("visualization") or {}
+        self.viz_enabled = bool(viz_cfg.get("enable", True))
+        base_viz_dir = viz_cfg.get("output_dir") or os.path.join("reports", "pipeline_visualization")
+        os.makedirs(base_viz_dir, exist_ok=True)
+        from datetime import datetime as _dt
+        ts_dir = _dt.now().strftime("%Y%m%d_%H%M%S")
+        self.viz_dir = os.path.join(base_viz_dir, ts_dir)
+        os.makedirs(self.viz_dir, exist_ok=True)
+        try:
+            vconf = VizConfig()
+        except Exception:
+            vconf = None
+        self.viz = PipelineVisualizer(self.viz_dir, vconf)
 
     def get_pipeline_summary(self) -> Dict:
         return self.summary_.copy()
@@ -117,13 +132,29 @@ class HIPEDataPreparationPipeline:
         if not device_fps:
             raise FileNotFoundError("未找到设备 CSV（默认 device_*.csv），请在 hipe.device_pattern 配置或命名符合模式")
         df_main = self._read_mains(mains_fp)
+        if getattr(self, "viz_enabled", False):
+            try:
+                self.viz.plot_mains_pqs(df_main, ts_col=self.hipe.timestamp_col)
+            except Exception:
+                pass
         dev_dfs, dev_names = self._read_devices(device_fps)
         df_merged, label_map = self._align_and_merge(df_main, dev_dfs, dev_names)
+        if getattr(self, "viz_enabled", False):
+            try:
+                self.viz.plot_devices_p(df_merged, label_map, ts_col=self.hipe.timestamp_col)
+            except Exception:
+                pass
         # 仅使用成功合并的设备名称
         eff_dev_names = [label_map[i] for i in sorted(label_map.keys())]
 
         # 3) 连续性修复：填短缺口、保留长缺口为 NaN
+        df_before = df_merged.copy()
         df_merged = self._repair_small_gaps(df_merged)
+        if getattr(self, "viz_enabled", False):
+            try:
+                self.viz.plot_missing_heatmap(df_before, df_merged, ts_col=self.hipe.timestamp_col)
+            except Exception:
+                pass
 
         # 4) 特征与目标
         X_full = self._build_mains_features(df_merged)
@@ -136,11 +167,26 @@ class HIPEDataPreparationPipeline:
         valid_mask = self._valid_window_mask_by_ratio(Yp_full, starts_all, L, min_ratio=min_ratio)
         starts = starts_all[valid_mask]
         X_seq, Yp_seq, _ = self._slide_window(X_full, Yp_full, L=L, H=H, starts_override=starts)
+        if getattr(self, "viz_enabled", False):
+            try:
+                self.viz.plot_window_boundaries(df_merged, starts, L, ts_col=self.hipe.timestamp_col)
+            except Exception:
+                pass
         # 保持目标序列的 NaN（由下游 mask 处理），仅确保 dtype
         Yp_seq = Yp_seq.astype(np.float32)
         # 频域与辅助特征
         freq_feats = self._window_stft_frames(X_seq)
+        if getattr(self, "viz_enabled", False):
+            try:
+                self.viz.plot_stft_samples(freq_feats, n_fft=int(self.hipe.stft_n_fft), hop=int(self.hipe.stft_hop))
+            except Exception:
+                pass
         aux_feats, aux_names = self._aggregate_aux_features(X_seq, df_merged, starts)
+        if getattr(self, "viz_enabled", False):
+            try:
+                self.viz.plot_aux_feature_hist(aux_feats, aux_names)
+            except Exception:
+                pass
 
         # 5) 生成窗口元数据与段元数据
         windows_meta = self._build_windows_metadata(df_merged, starts, L)
@@ -156,6 +202,11 @@ class HIPEDataPreparationPipeline:
         from .cross_validation import WalkForwardCV
         cv = WalkForwardCV({"cross_validation": cv_cfg})
         folds = cv.create_folds(segments_meta)
+        if getattr(self, "viz_enabled", False):
+            try:
+                self.viz.plot_walk_forward(windows_meta, folds)
+            except Exception:
+                pass
         # 以工程/统计特征作为 X，标签为窗内设备功率均值（忽略 NaN）
         labels_mat = np.nanmean(Yp_seq, axis=1).astype(np.float32)  # [n_windows, K]
         labels_total = labels_mat.sum(axis=1).astype(np.float32)  # [n_windows]
@@ -393,8 +444,9 @@ class HIPEDataPreparationPipeline:
             # 名称文件
             with open(os.path.join(fold_dir, "feature_names.json"), "w") as f:
                 json.dump(aux_names, f, ensure_ascii=False, indent=2)
+            # 修正：保存完整原始通道名称与顺序，匹配 X_seq 的7个通道
             with open(os.path.join(fold_dir, "raw_channel_names.json"), "w") as f:
-                json.dump(["P_kW", "Q_kvar", "S_kVA"], f, ensure_ascii=False, indent=2)
+                json.dump(["P_kW", "Q_kvar", "S_kVA", "PF", "dP", "dQ", "dS"], f, ensure_ascii=False, indent=2)
 
         # 清理临时窗口 memmap 目录，避免磁盘膨胀
         try:
@@ -484,7 +536,7 @@ class HIPEDataPreparationPipeline:
         return out
 
     def _aggregate_aux_features(self, X_seq: np.ndarray, df_merged: pd.DataFrame, starts: np.ndarray) -> Tuple[np.ndarray, List[str]]:
-        """计算每窗口的统计特征（NaN感知）：mean/std，覆盖所有输入通道。"""
+        """计算每窗口的鲁棒统计特征（NaN感知）：mean/std/median，覆盖所有输入通道。"""
         if X_seq.size == 0:
             return np.empty((0, 0), dtype=np.float32), []
         N, L, C = X_seq.shape
@@ -494,63 +546,67 @@ class HIPEDataPreparationPipeline:
             channel_names = [f"ch_{i}" for i in range(C)]
         feats = []
         names = []
+        
+        # 基础统计特征（更鲁棒）
         for ci, cname in enumerate(channel_names):
             x = X_seq[:, :, ci]
+            
+            # 基础统计量
             mu = np.nanmean(x, axis=1)
             sd = np.nanstd(x, axis=1)
-            feats.append(mu)
-            feats.append(sd)
-            names.append(f"mean_{cname}")
-            names.append(f"std_{cname}")
-        # 工业电气派生：功率角、PF动态、通断与斜率
+            median = np.nanmedian(x, axis=1)
+            
+            # 处理全NaN窗口
+            mu = np.where(np.isnan(mu), 0.0, mu)
+            sd = np.where(np.isnan(sd), 0.0, sd)
+            median = np.where(np.isnan(median), 0.0, median)
+            
+            feats.extend([mu, sd, median])
+            names.extend([f"mean_{cname}", f"std_{cname}", f"median_{cname}"])
+            
+            # 有效值比例（数据质量指标）
+            valid_ratio = (~np.isnan(x)).sum(axis=1) / L
+            feats.append(valid_ratio.astype(np.float32))
+            names.append(f"valid_ratio_{cname}")
+            
+        # 工业电气派生特征（更鲁棒的计算）
         try:
             P_seq = X_seq[:, :, 0]
             Q_seq = X_seq[:, :, 1]
             PF_seq = X_seq[:, :, 3] if C >= 4 else np.full((N, L), np.nan, dtype=np.float32)
             dP_seq = X_seq[:, :, 4] if C >= 5 else np.full((N, L), np.nan, dtype=np.float32)
-            # 功率角 φ
-            phi_seq = np.arctan2(Q_seq, P_seq)
-            feats.append(np.nanmean(phi_seq, axis=1))
-            feats.append(np.nanstd(phi_seq, axis=1))
-            names.append("mean_phi")
-            names.append("std_phi")
-            # PF 动态
+            
+            # 功率角 φ（避免除零）
+            # 使用 atan2 并处理 P=0 的情况
+            phi_seq = np.full((N, L), np.nan, dtype=np.float32)
+            valid_pq = (~np.isnan(P_seq)) & (~np.isnan(Q_seq)) & (np.abs(P_seq) > 1e-6)
+            phi_seq[valid_pq] = np.arctan2(Q_seq[valid_pq], P_seq[valid_pq])
+            
+            phi_mean = np.nanmean(phi_seq, axis=1)
+            phi_std = np.nanstd(phi_seq, axis=1)
+            phi_mean = np.where(np.isnan(phi_mean), 0.0, phi_mean)
+            phi_std = np.where(np.isnan(phi_std), 0.0, phi_std)
+            
+            feats.extend([phi_mean, phi_std])
+            names.extend(["mean_phi", "std_phi"])
+            
+            # PF 动态变化（更鲁棒）
             if L > 1:
-                dPF_seq = PF_seq[:, 1:] - PF_seq[:, :-1]
-                feats.append(np.nanmean(dPF_seq, axis=1))
-                feats.append(np.nanstd(dPF_seq, axis=1))
-                names.append("mean_dPF")
-                names.append("std_dPF")
+                dPF_seq = np.diff(PF_seq, axis=1)
+                dPF_mean = np.nanmean(dPF_seq, axis=1)
+                dPF_std = np.nanstd(dPF_seq, axis=1)
+                dPF_mean = np.where(np.isnan(dPF_mean), 0.0, dPF_mean)
+                dPF_std = np.where(np.isnan(dPF_std), 0.0, dPF_std)
             else:
-                feats.append(np.zeros(N, dtype=np.float32))
-                feats.append(np.zeros(N, dtype=np.float32))
-                names.append("mean_dPF")
-                names.append("std_dPF")
-            # 通断比例与边缘计数
-            thr = float(getattr(self.hipe, "on_power_threshold_w", 0.5))
-            validP = ~np.isnan(P_seq)
-            on = (P_seq > thr) & validP
-            denom = validP.sum(axis=1)
-            on_ratio = np.divide(on.sum(axis=1), denom, out=np.zeros_like(denom, dtype=np.float64), where=denom > 0)
-            feats.append(on_ratio.astype(np.float32))
-            names.append("on_ratio")
-            if L > 1:
-                edge_cnt = np.sum(np.abs(np.diff(on.astype(np.int8), axis=1)), axis=1)
-            else:
-                edge_cnt = np.zeros(N, dtype=np.int64)
-            feats.append(edge_cnt.astype(np.float32))
-            names.append("edge_count")
-            # 斜率统计（正/负）
-            pos_vals = np.where(dP_seq > 0, dP_seq, np.nan)
-            neg_vals = np.where(dP_seq < 0, dP_seq, np.nan)
-            feats.append(np.nanmean(pos_vals, axis=1))
-            feats.append(np.nanstd(pos_vals, axis=1))
-            names.append("pos_ramp_mean")
-            names.append("pos_ramp_std")
-            feats.append(np.nanmean(neg_vals, axis=1))
-            feats.append(np.nanstd(neg_vals, axis=1))
-            names.append("neg_ramp_mean")
-            names.append("neg_ramp_std")
+                dPF_mean = np.zeros(N, dtype=np.float32)
+                dPF_std = np.zeros(N, dtype=np.float32)
+                
+            feats.extend([dPF_mean, dPF_std])
+            names.extend(["mean_dPF", "std_dPF"])
+            
+            # 删除 on_ratio 和 edge_count 特征 - 这些是未经验证的开关状态相关特征
+            
+            # 删除斜率统计特征 - 这些是基于功率变化率的未验证特征
         except Exception:
             pass
         # 能量增量（kWh）
@@ -609,7 +665,18 @@ class HIPEDataPreparationPipeline:
                 v_unbalance[i] = float(np.nanmean(ratio))
         feats.append(v_unbalance)
         names.append("voltage_unbalance_mean")
+        
+        # 最终的鲁棒性处理
         Fd = np.stack(feats, axis=1).astype(np.float32)
+        
+        # 清理所有无效值
+        Fd = np.nan_to_num(Fd, nan=0.0, posinf=1e6, neginf=-1e6)
+        
+        # 检查并报告数据质量
+        invalid_count = np.sum(~np.isfinite(Fd))
+        if invalid_count > 0:
+            print(f"警告: 辅助特征中发现 {invalid_count} 个无效值，已自动清理")
+            
         return Fd, names
 
     def _create_segments_meta(self, df_merged: pd.DataFrame) -> pd.DataFrame:
@@ -730,20 +797,7 @@ class HIPEDataPreparationPipeline:
         df[ts_col] = dt.dt.tz_localize(None)
         df = df.dropna(subset=[ts_col]).copy()
         df = df.sort_values(ts_col)
-        # 列映射
-        mains_map = self.hipe.mains_cols or {}
-        # 反向映射：输入列 -> 目标列
-        rename_map = {}
-        for src, dst in mains_map.items():
-            if src in df.columns:
-                # 输入是 src，目标是标准列名（P_kW等）
-                rename_map[src] = src  # 若已是标准名则保留
-        # 若输入采用别名（如 P_total_W），也映射到标准名
-        for src, dst in mains_map.items():
-            if dst in df.columns and src not in df.columns:
-                rename_map[dst] = src
-        if rename_map:
-            df = df.rename(columns=rename_map)
+        # 使用原始列名，不进行任何映射或单位转换
         # 保留标准列（扩展工业电气通道）
         keep_cols = [c for c in [ts_col,
                                  "P_kW", "Q_kvar", "S_kVA", "PF",
@@ -787,18 +841,8 @@ class HIPEDataPreparationPipeline:
             df[ts_col] = dt.dt.tz_localize(None)
             df = df.dropna(subset=[ts_col]).copy()
             df = df.sort_values(ts_col)
-            # 列映射
-            dev_map = self.hipe.device_cols or {}
-            rename_map = {}
-            for src, dst in dev_map.items():
-                if src in df.columns:
-                    rename_map[src] = src
-            for src, dst in dev_map.items():
-                if dst in df.columns and src not in df.columns:
-                    rename_map[dst] = src
-            if rename_map:
-                df = df.rename(columns=rename_map)
-            keep = [c for c in [ts_col, "P", "Q", "S"] if c in df.columns]
+            # 不做任何别名映射或单位转换，直接使用原始列
+            keep = [c for c in [ts_col, "P_kW", "Q_kvar", "S_kVA"] if c in df.columns]
             df = df[keep].copy()
             df = df.rename(columns={ts_col: self.hipe.timestamp_col})
             dev_dfs.append(df)
@@ -843,17 +887,20 @@ class HIPEDataPreparationPipeline:
 
     def _resample_rename_device(self, df: pd.DataFrame, name: str) -> Optional[pd.DataFrame]:
         ts_col = self.hipe.timestamp_col
-        cols = [c for c in ["P", "Q", "S"] if c in df.columns]
+        cols = [c for c in ["P_kW", "Q_kvar", "S_kVA"] if c in df.columns]
+        # 仅保留含有功功率 P_kW 的设备；没有 P_kW 列则跳过该设备
+        if "P_kW" not in cols:
+            return None
         if not cols:
             return None
         dfr = self._resample_df(df, cols)
         ren = {}
-        if "P" in dfr.columns:
-            ren["P"] = f"{name}_P_W"
-        if "Q" in dfr.columns:
-            ren["Q"] = f"{name}_Q_var"
-        if "S" in dfr.columns:
-            ren["S"] = f"{name}_S_VA"
+        if "P_kW" in dfr.columns:
+            ren["P_kW"] = f"{name}_P_kW"
+        if "Q_kvar" in dfr.columns:
+            ren["Q_kvar"] = f"{name}_Q_kvar"
+        if "S_kVA" in dfr.columns:
+            ren["S_kVA"] = f"{name}_S_kVA"
         dfr = dfr.rename(columns=ren)
         return dfr
 
@@ -928,7 +975,7 @@ class HIPEDataPreparationPipeline:
         T = len(df)
         mats = []
         for name in dev_names:
-            col = f"{name}_P_W" if kind == "P" else f"{name}_Q_var" if kind == "Q" else f"{name}_S_VA"
+            col = f"{name}_P_kW" if kind == "P" else f"{name}_Q_kvar" if kind == "Q" else f"{name}_S_kVA"
             if col in df.columns:
                 mats.append(df[col].to_numpy(dtype=np.float32))
             else:
