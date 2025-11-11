@@ -513,10 +513,35 @@ class RealTimeInferenceEngine:
         else:
             out['freq_features'] = None
         
-        # 时间位置编码 - 简单的序列位置
-        seq_len = window_data.shape[0]
-        time_pos = torch.arange(seq_len, dtype=torch.float32).unsqueeze(0).to(self.device)
-        out['time_positional'] = time_pos
+        # 时间位置编码 - 使用真实时间戳的周期特征（minute/hour/dow/month 的 sin/cos）
+        try:
+            import math
+            seq_len = window_data.shape[0]
+            tp = torch.empty(1, seq_len, 8, dtype=torch.float32)
+            for i in range(seq_len):
+                dt = timestamps[i]
+                minute = dt.minute
+                hour = dt.hour
+                dow = dt.weekday()
+                month = dt.month - 1
+                ang_min = 2.0 * math.pi * (minute / 60.0)
+                ang_hour = 2.0 * math.pi * (hour / 24.0)
+                ang_dow = 2.0 * math.pi * (dow / 7.0)
+                ang_month = 2.0 * math.pi * (month / 12.0)
+                tp[0, i, 0] = math.sin(ang_min)
+                tp[0, i, 1] = math.cos(ang_min)
+                tp[0, i, 2] = math.sin(ang_hour)
+                tp[0, i, 3] = math.cos(ang_hour)
+                tp[0, i, 4] = math.sin(ang_dow)
+                tp[0, i, 5] = math.cos(ang_dow)
+                tp[0, i, 6] = math.sin(ang_month)
+                tp[0, i, 7] = math.cos(ang_month)
+            out['time_positional'] = tp.to(self.device)
+        except Exception:
+            # 若时间戳异常则回退为简单索引编码
+            seq_len = window_data.shape[0]
+            time_pos = torch.arange(seq_len, dtype=torch.float32).unsqueeze(0).to(self.device)
+            out['time_positional'] = time_pos
         
         # 辅助特征占位
         out['aux_features'] = None

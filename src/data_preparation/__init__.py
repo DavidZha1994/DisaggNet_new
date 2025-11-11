@@ -7,25 +7,19 @@ Data Preparation Module
 - 窗口生成 (WindowGenerator)
 - 交叉验证 (WalkForwardCV)
 - 特征工程 (FeatureEngineer)
-- 标签处理 (LabelHandler)
-- 评估系统 (EventEvaluator)
 - HIPE数据准备流程 (HIPEDataPreparationPipeline)
 """
 
-from .segmentation import DataSegmenter
-from .windowing import WindowGenerator
+
 from .cross_validation import WalkForwardCV
-from .feature_engineering import FeatureEngineer
-from .label_handling import LabelHandler
-from .evaluation import EventEvaluator
-from .hipe_pipeline import HIPEDataPreparationPipeline
+
+# 延迟/安全导入 HIPE 管线，避免可选依赖缺失导致模块导入失败
+try:
+    from .hipe_pipeline import HIPEDataPreparationPipeline  # type: ignore
+except Exception:
+    HIPEDataPreparationPipeline = None  # 可选
 
 __all__ = [
-    'DataSegmenter',
-    'WindowGenerator', 
     'WalkForwardCV',
-    'FeatureEngineer',
-    'LabelHandler',
-    'EventEvaluator',
     'HIPEDataPreparationPipeline'
 ]

@@ -1,0 +1,117 @@
+compute:
+  chunk_size: 10000
+  memory_limit_gb: 8
+  n_jobs: -1
+  use_polars: true
+
+cross_validation:
+  n_folds: 3
+  purge_gap_minutes: 10
+  segment_isolation: false
+  time_based_split: true
+  min_train_days: 7.0
+  val_span_days: 3.0
+  test_span_days: 0.0
+
+data_storage:
+  output_directory: Data/prepared/hipe
+
+gap_filling:
+  # 最大填补缺口秒数（按 resample_seconds 换算为点数限制）
+  max_fill_seconds: 1200
+
+frequency:
+  signal: P_kW
+  n_fft: 256
+  hop_length: 64
+  win_length: 256
+  magnitude: true
+
+hipe:
+  enable: true
+  timestamp_col: datetime
+  mains_file: MainTerminal_PhaseCount_3_geq_2017-10-01_lt_2018-01-01.csv
+  device_pattern: '*_PhaseCount_*.csv'
+  resample_seconds: 5
+  window_length: 256
+  # 最小运行长度（点数），用于 HMM 开关识别抑制抖动；5s 采样下 12≈1分钟
+  # 自适应迟滞分位阈值
+  onoff_on_percentile: 70.0
+  onoff_off_percentile: 30.0
+  # 最短运行长度（点数）
+  onoff_min_on_points: 24
+  onoff_min_off_points: 24
+  step_size: 128
+  mains_cols:
+    P_kW: P_kW
+    Q_kvar: Q_kvar
+    S_kVA: S_kVA
+    PF: L_F
+  device_cols:
+    P: P_kW
+    Q: Q_kvar
+    S: S_kVA
+  stft:
+    n_fft: 256
+    hop_length: 64
+    win_length: 256
+    window: hann
+
+segmentation:
+  # 连续段构建的关键参数（用于窗口元数据与辅助特征）
+  k_median: 4.0
+  gap_seconds_min: 30
+
+labels: {}
+
+# =====================
+# REFIT/UKDALE 统一配置
+# =====================
+refit_ukdale:
+  sampling_rate: 1min
+  window_size: 256
+  window_stride: 128
+  list_exo_variables: [minute, hour, dow, month]
+  data_root: Data
+
+datasets:
+  REFIT:
+    Dishwasher:
+      app: Dishwasher
+      house_with_app_i: [1, 2, 3, 5, 6, 7, 9, 10, 13, 15, 16, 18, 20]
+    WashingMachine:
+      app: WashingMachine
+      house_with_app_i: [1, 2, 3, 5, 6, 7, 8, 9, 10, 13, 15, 16, 17, 18, 19]
+    Kettle:
+      app: Kettle
+      house_with_app_i: [2, 3, 4, 5, 6, 7, 9, 12, 13, 15, 19, 20]
+    Microwave:
+      app: Microwave
+      house_with_app_i: [2, 3, 4, 6, 8, 9, 10, 12, 13, 15, 17, 18, 19, 20]
+
+  UKDALE:
+    WashingMachine:
+      app: washing_machine
+      ind_house_train: [1, 3, 4, 5]
+      ind_house_valid: [1]
+      ind_house_test: [2]
+    Dishwasher:
+      app: dishwasher
+      ind_house_train: [1, 3, 4, 5]
+      ind_house_valid: [1]
+      ind_house_test: [2]
+    Kettle:
+      app: kettle
+      ind_house_train: [1, 3, 4, 5]
+      ind_house_valid: [1]
+      ind_house_test: [2]
+    Microwave:
+      app: microwave
+      ind_house_train: [1, 3, 4, 5]
+      ind_house_valid: [1]
+      ind_house_test: [2]
+    Fridge:
+      app: fridge
+      ind_house_train: [1, 3, 4, 5]
+      ind_house_valid: [1]
+      ind_house_test: [2]

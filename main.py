@@ -92,24 +92,45 @@ class UnifiedTrainingSystem:
     def setup_environment(self, config_ref: str = "configs/default.yaml") -> DictConfig:
         """设置训练环境（仅加载单一配置文件；支持路径或名称）"""
         # 解析配置引用：支持绝对/相对路径或简短名称
-        cfg_path: Path
+        candidates = []
         try:
             is_path_like = (config_ref.endswith('.yaml') or os.sep in config_ref or '/' in config_ref)
         except Exception:
             is_path_like = False
+
         if is_path_like:
             cfg_path = Path(config_ref)
             if not cfg_path.is_absolute():
                 cfg_path = self.project_root / cfg_path
+            candidates.append(cfg_path)
         else:
-            cfg_path = self.configs_dir / f"{config_ref}.yaml"
-        
-        if not cfg_path.exists():
-            logger.warning(f"配置文件 {cfg_path} 不存在，使用默认配置")
-            cfg_path = self.configs_dir / "default.yaml"
-        
+            # 优先在 configs/training 下查找，再回退到 configs 根目录
+            candidates.append(self.configs_dir / "training" / f"{config_ref}.yaml")
+            candidates.append(self.configs_dir / f"{config_ref}.yaml")
+
+        # 回退候选：默认配置（优先 training/default.yaml）
+        candidates.append(self.configs_dir / "training" / "default.yaml")
+        candidates.append(self.configs_dir / "default.yaml")
+
+        # 选择首个存在的配置文件
+        chosen = None
+        for path in candidates:
+            if path.exists():
+                chosen = path
+                break
+
+        if chosen is None:
+            # 无法找到任何配置文件，抛出明确错误
+            search_hint = (
+                "未找到可用配置。尝试过: "
+                + ", ".join(str(p) for p in candidates)
+            )
+            logger.error(search_hint)
+            raise FileNotFoundError(search_hint)
+
         # 仅加载单一配置文件（不再合并 base.yaml）
-        config = OmegaConf.load(cfg_path)
+        logger.info(f"环境设置完成，使用配置: {chosen}")
+        config = OmegaConf.load(chosen)
         
         # 设置随机种子（优先使用 reproducibility.seed，其次回退到顶层 seed，再默认 42）
         if hasattr(config, 'reproducibility') and hasattr(config.reproducibility, 'seed'):
@@ -131,7 +152,6 @@ class UnifiedTrainingSystem:
                 torch.autograd.set_detect_anomaly(True)
                 logger.info("已启用PyTorch异常检测")
         
-        logger.info(f"环境设置完成，使用配置: {cfg_path}")
         return config
     
     def train_basic(self, config_ref: str = "configs/default.yaml", **kwargs) -> None:
@@ -195,8 +215,13 @@ class UnifiedTrainingSystem:
             if value is not None:
                 args.extend([f"--{key}", str(value)])
         
-        # 调用HPO
-        optuna_main(config, n_trials=n_trials, timeout=timeout)
+        # 调用HPO（在此处进行局部导入，避免全局 None 覆盖）
+        try:
+            from src.hpo.optuna_runner import run_optimization
+            run_optimization(config, n_trials=n_trials, timeout=timeout)
+        except Exception as e:
+            logger.error(f"超参数优化调用失败: {e}")
+            raise
     
     def walk_forward_validation(self, 
                                config_name: str = "optimized_stable",
@@ -353,6 +378,7 @@ def create_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--epochs", type=int, help="训练轮数")
     train_parser.add_argument("--batch-size", type=int, help="批次大小")
     train_parser.add_argument("--lr", type=float, help="学习率")
+    train_parser.add_argument("--dataset", type=str, help="数据集名称（如 UKDALE/REFIT）")
     
     # 超参数优化
     hpo_parser = subparsers.add_parser("hpo", help="超参数优化")

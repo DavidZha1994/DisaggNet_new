@@ -1,0 +1,40 @@
+REFIT:
+  Dishwasher:
+    app: !!str Dishwasher
+    house_with_app_i: [1, 2, 3, 5, 6, 7, 9, 10, 13, 15, 16, 18, 20]
+  WashingMachine:
+    app: !!str  WashingMachine
+    house_with_app_i: [1, 2, 3, 5, 6, 7, 8, 9, 10, 13, 15, 16, 17, 18, 19]
+  Kettle:
+    app: !!str Kettle
+    house_with_app_i: [2, 3, 4, 5, 6, 7, 9, 12, 13, 15, 19, 20]
+  Microwave:
+    app: !!str Microwave
+    house_with_app_i: [2, 3, 4, 6, 8, 9, 10, 12, 13, 15, 17, 18, 19, 20]
+
+UKDALE:
+  WashingMachine:
+    app: !!str washing_machine
+    ind_house_train: [1, 3, 4, 5]
+    ind_house_valid: [5]
+    ind_house_test: [2]
+  Dishwasher:
+    app: !!str dishwasher
+    ind_house_train: [1, 3, 4, 5]
+    ind_house_valid: [1]
+    ind_house_test: [2]
+  Kettle:
+    app: !!str kettle
+    ind_house_train: [1, 3, 4, 5]
+    ind_house_valid: [1]
+    ind_house_test: [2]
+  Microwave:
+    app: !!str microwave
+    ind_house_train: [1, 3, 4, 5]
+    ind_house_valid: [1]
+    ind_house_test: [2]
+  Fridge:
+    app: !!str fridge
+    ind_house_train: [1, 3, 4, 5]
+    ind_house_valid: [1]
+    ind_house_test: [2]

@@ -39,6 +39,30 @@ class PositionalEncoding(nn.Module):
         return x + pe
 
 
+class TimeRPE(nn.Module):
+    """基于离散时间戳的周期性位置编码（TimeRPE）
+
+    将由分钟/小时/星期/月的 sin/cos 周期特征组成的 `time_positional: (B, T, Fp)`
+    通过 `Conv1d(k=1)` 压缩到固定维度，逐时间步与主嵌入拼接。
+    """
+
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        # k=1 实际等价于逐时间步的线性投影，但保持Conv1d形式以贴合论文实现
+        self.proj = nn.Conv1d(in_channels=in_dim, out_channels=out_dim, kernel_size=1)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, time_positional: torch.Tensor) -> torch.Tensor:
+        # time_positional: (B, T, Fp)
+        b, t, fp = time_positional.size()
+        x = time_positional.transpose(1, 2)  # (B, Fp, T)
+        y = self.proj(x)                     # (B, out_dim, T)
+        y = y.transpose(1, 2)                # (B, T, out_dim)
+        return self.dropout(y)
+
+
 class CausalMultiHeadAttention(nn.Module):
     """因果/通用多头注意力（在MPS上禁用SDPA，使用安全实现）"""
     
@@ -164,8 +188,14 @@ class TimeEncoder(nn.Module):
         self.use_conv_embed = config.input_conv_embed
         self.d_model = d_model
         self.input_projection: Optional[nn.Module] = None
-        self.time_proj: Optional[nn.Linear] = None
-        
+        # TimeRPE 与 TokenStats 相关模块（延迟初始化）
+        self.time_rpe: Optional[TimeRPE] = None
+        self.rpe_out_dim = d_model // 4
+        self.stats_proj: Optional[nn.Linear] = None
+        self.stats_out_dim = d_model // 4
+        self.concat_proj: Optional[nn.Linear] = None
+        self.norm_eps: float = float(getattr(config, 'norm_eps', 1e-6))
+
         # 位置编码
         self.pos_encoding = PositionalEncoding(d_model)
         
@@ -180,7 +210,7 @@ class TimeEncoder(nn.Module):
     def forward(self, x: torch.Tensor, time_features: Optional[torch.Tensor] = None, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # x: (batch_size, seq_len, n_features)
         batch_size, seq_len, n_features = x.size()
-        
+
         # 延迟初始化输入投影层
         if self.input_projection is None:
             if self.use_conv_embed:
@@ -189,7 +219,7 @@ class TimeEncoder(nn.Module):
             else:
                 # 使用Linear处理所有特征，保留跨特征关系
                 self.input_projection = nn.Linear(n_features, self.d_model).to(x.device)
-        
+
         # 输入投影
         if self.use_conv_embed:
             # (B, T, F) -> (B, F, T) -> Conv1d -> (B, d_model, T) -> (B, T, d_model)
@@ -198,34 +228,56 @@ class TimeEncoder(nn.Module):
             x = x.transpose(1, 2)
         else:
             x = self.input_projection(x)
-        
-        # 位置编码
+
+        # —— TokenStats：对投影后的序列做逐通道 z-标准化，并生成统计侧信息 ——
+        # 计算均值与方差（时间维度）
+        mu = x.mean(dim=1)                             # (B, d_model)
+        var = x.var(dim=1, unbiased=False)             # (B, d_model)
+        var = torch.clamp(var, min=self.norm_eps)
+        std = torch.sqrt(var)
+        # z-normalization（保留逐步信息）
+        x = (x - mu.unsqueeze(1)) / (std.unsqueeze(1) + self.norm_eps)
+        x = torch.nan_to_num(x)
+
+        # 统计侧信息： [mu, log(var)] -> 线性 -> (B, stats_out_dim) -> 广播到序列
+        stats_vec = torch.cat([mu, torch.log(var + self.norm_eps)], dim=-1)  # (B, 2*d_model)
+        if self.stats_proj is None:
+            self.stats_proj = nn.Linear(2 * self.d_model, self.stats_out_dim).to(x.device)
+        stats_seq = self.stats_proj(stats_vec).unsqueeze(1).expand(-1, seq_len, -1)  # (B, T, stats_out_dim)
+
+        # —— TimeRPE：利用真实时间戳的周期位置编码（逐时间步），避免时间维均值广播 ——
+        rpe_seq = None
+        if time_features is not None:
+            fp = time_features.size(-1)
+            if self.time_rpe is None:
+                self.time_rpe = TimeRPE(in_dim=fp, out_dim=self.rpe_out_dim).to(x.device)
+            rpe_seq = self.time_rpe(time_features)  # (B, T, rpe_out_dim)
+
+        # 拼接核心嵌入 + RPE + 统计侧信息 → 映射回 d_model
+        parts = [x, stats_seq]
+        if rpe_seq is not None:
+            parts.append(rpe_seq)
+        concat = torch.cat(parts, dim=-1)  # (B, T, d_model + stats_out_dim + rpe_out_dim?)
+        if self.concat_proj is None:
+            self.concat_proj = nn.Linear(concat.size(-1), self.d_model).to(x.device)
+        x = self.concat_proj(concat)
+
+        # 位置编码（相对索引）
         x = x.transpose(0, 1)  # (seq_len, batch_size, d_model)
         x = self.pos_encoding(x)
         x = x.transpose(0, 1)  # (batch_size, seq_len, d_model)
-        
-        # 添加时间特征（如果提供）
-        if time_features is not None:
-            # time_features应该包含hour_sin, hour_cos等
-            time_embed = torch.mean(time_features, dim=1, keepdim=True)  # (batch_size, 1, time_dim)
-            time_embed = time_embed.expand(-1, seq_len, -1)  # (batch_size, seq_len, time_dim)
-            if time_embed.size(-1) != x.size(-1):
-                if self.time_proj is None:
-                    self.time_proj = nn.Linear(time_embed.size(-1), x.size(-1)).to(x.device)
-                time_embed = self.time_proj(time_embed)
-            x = x + time_embed
-        
+
         x = self.dropout(x)
-        
+
         # Transformer层
         for layer in self.transformer_layers:
             x = layer(x, mask=mask)
-        
+
         return x
 
 
 class FreqEncoder(nn.Module):
-    """频域编码器（轻量与高效）"""
+    """频域编码器（轻量与高效，移除小型Transformer，仅保留Conv+Pool）"""
     
     def __init__(self, config: DictConfig):
         super().__init__()
@@ -233,7 +285,6 @@ class FreqEncoder(nn.Module):
         self.config = config
         self.proj_dim = config.proj_dim
         self.conv_kernel = config.conv1d_kernel
-        small_transformer_layers = config.small_transformer_layers
         dropout = config.dropout
         
         # 延迟初始化的Conv1d（以频率bin为通道）
@@ -242,15 +293,7 @@ class FreqEncoder(nn.Module):
         # 全局池化
         self.global_pool = nn.AdaptiveAvgPool1d(1)
         
-        # 可选的小Transformer
-        if small_transformer_layers > 0:
-            self.transformer_layers = nn.ModuleList([
-                TransformerBlock(self.proj_dim, 4, self.proj_dim * 2, dropout, causal=False)
-                for _ in range(small_transformer_layers)
-            ])
-        else:
-            self.transformer_layers = None
-        
+        # 简化：不再使用小型Transformer层
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, x: torch.Tensor, freq_valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -274,28 +317,14 @@ class FreqEncoder(nn.Module):
             m = freq_valid_mask.unsqueeze(1).to(conv_out.dtype)  # (B, 1, T_f)
             conv_out = conv_out * m
         
-        # 小Transformer在时间维度上（可选）
-        if self.transformer_layers is not None:
-            seq = conv_out.transpose(1, 2)  # (B, T_f, proj_dim)
-            seq = self.dropout(seq)
-            for layer in self.transformer_layers:
-                seq = layer(seq, mask=freq_valid_mask)
-            # 池化为最终表示（支持掩码）
-            if freq_valid_mask is not None:
-                m = freq_valid_mask.to(seq.dtype)
-                denom = m.sum(dim=1).clamp_min(1.0).unsqueeze(-1)
-                freq_repr = (seq * m.unsqueeze(-1)).sum(dim=1) / denom  # (B, proj_dim)
-            else:
-                freq_repr = torch.mean(seq, dim=1)  # (B, proj_dim)
+        # 直接时间全局池化（支持掩码）
+        if freq_valid_mask is not None:
+            m = freq_valid_mask.unsqueeze(1).to(conv_out.dtype)
+            num = (conv_out * m).sum(dim=-1)
+            den = m.sum(dim=-1).clamp_min(1.0)
+            freq_repr = num / den  # (B, proj_dim)
         else:
-            # 直接时间全局池化（支持掩码）
-            if freq_valid_mask is not None:
-                m = freq_valid_mask.unsqueeze(1).to(conv_out.dtype)
-                num = (conv_out * m).sum(dim=-1)
-                den = m.sum(dim=-1).clamp_min(1.0)
-                freq_repr = num / den  # (B, proj_dim)
-            else:
-                freq_repr = self.global_pool(conv_out).squeeze(-1)  # (B, proj_dim)
+            freq_repr = self.global_pool(conv_out).squeeze(-1)  # (B, proj_dim)
         
         return freq_repr
 
@@ -475,7 +504,7 @@ class MultiTaskHead(nn.Module):
                 nn.ReLU(),
                 nn.Dropout(0.1),
                 nn.Linear(hidden_dim, 1),
-                nn.Softplus()
+                nn.ReLU()
             ) for _ in range(n_devices)
         ])
         
@@ -485,7 +514,7 @@ class MultiTaskHead(nn.Module):
                 nn.ReLU(),
                 nn.Dropout(0.1),
                 nn.Linear(hidden_dim, 1),
-                nn.Softplus()
+                nn.ReLU()
             )
         else:
             self.unknown_regression_head = None
@@ -574,6 +603,22 @@ class MultiTaskHead(nn.Module):
         seq_regression_pred = torch.stack(seq_preds, dim=-1)  # (B, T, N)
         return seq_regression_pred
 
+    def forward_class_seq(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        序列级分类预测（逐时间步的开关状态概率）。
+        Args:
+            x: (batch_size, seq_len, d_model)
+        Returns:
+            seq_class_pred: (batch_size, seq_len, n_devices)
+        """
+        seq_preds: List[torch.Tensor] = []
+        for i in range(self.n_devices):
+            # 线性层可对最后维度广播，直接生成逐时间步概率
+            per_dev_seq = self.classification_heads[i](x)  # (B, T, 1)
+            seq_preds.append(per_dev_seq.squeeze(-1))      # (B, T)
+        seq_class_pred = torch.stack(seq_preds, dim=-1)    # (B, T, N)
+        return seq_class_pred
+
     def forward_with_embeddings(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         """
         与 forward 一致的计算流程，同时返回每设备的中间特征作为嵌入。
@@ -586,7 +631,7 @@ class MultiTaskHead(nn.Module):
         batch_size = x.size(0)
 
         # 注意力池化得到全局表示
-        pooled_x, _ = self.attention_pooling(x, x, x)
+        pooled_x = self.attention_pooling(x, x, x)
         global_repr = pooled_x.mean(dim=1)  # (B, D)
 
         # 设备嵌入
@@ -717,6 +762,11 @@ class FusionTransformer(nn.Module):
         
         # 初始化权重
         self._init_weights()
+
+        # 输出侧 ProjStats，用于对序列回归结果进行反标准化（提升稳态与跨域泛化）
+        self.denorm_mu_head = nn.Linear(config.time_encoder.d_model, n_devices)
+        self.denorm_logvar_head = nn.Linear(config.time_encoder.d_model, n_devices)
+        self.denorm_eps = 1e-6
     
     def _init_weights(self):
         """初始化模型权重"""
@@ -777,7 +827,8 @@ class FusionTransformer(nn.Module):
                     aux_features: Optional[torch.Tensor] = None,
                     time_valid_mask: Optional[torch.Tensor] = None,
                     freq_valid_mask: Optional[torch.Tensor] = None,
-                    aux_valid_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+                    aux_valid_mask: Optional[torch.Tensor] = None,
+                    external_scale: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         """
         产生序列→序列回归输出，并同步返回窗口级预测用于约束与评估。
         返回：
@@ -785,6 +836,7 @@ class FusionTransformer(nn.Module):
         - regression_pred: (B, N)
         - classification_pred: (B, N)
         - unknown_pred: (B, 1) 或 None
+        - class_seq_pred: (B, T, N)
         """
         # 时域编码
         time_repr = self.time_encoder(time_features, time_positional, mask=time_valid_mask)
@@ -805,15 +857,32 @@ class FusionTransformer(nn.Module):
         # 融合
         fused_repr = self.fusion(time_repr, freq_repr) if self.fusion is not None else time_repr
 
-        # 序列回归预测
-        seq_pred = self.prediction_head.forward_seq(fused_repr)  # (B, T, N)
+        # 序列回归预测（在标准化域）
+        seq_pred_norm = self.prediction_head.forward_seq(fused_repr)  # (B, T, N)
 
-        # 同步生成窗口级预测用于现有损失与约束
+        # 反标准化到物理单位：优先使用外部提供的每设备尺度（例如训练集P95）
+        if external_scale is not None:
+            # 接受形状为 (K,) 或 (1,1,K) 的尺度
+            if external_scale.dim() == 1:
+                scale = external_scale.view(1, 1, -1).to(fused_repr.device)
+            else:
+                scale = external_scale.to(fused_repr.device)
+            scale = torch.clamp(scale, min=1e-6)
+            seq_pred = seq_pred_norm * scale
+        else:
+            # 回退：使用可学习的 μ 与 σ² 进行反标准化
+            mu_pred = self.denorm_mu_head(fused_repr)                      # (B, T, N)
+            sigma2_pred = F.softplus(self.denorm_logvar_head(fused_repr))  # (B, T, N) ≥ 0
+            seq_pred = seq_pred_norm * torch.sqrt(sigma2_pred + self.denorm_eps) + mu_pred
+
+        # 同步生成窗口级预测
         reg_cls_unknown = self.prediction_head(fused_repr)
         regression_pred, classification_pred = reg_cls_unknown[0], reg_cls_unknown[1]
         unknown_pred = reg_cls_unknown[2] if self.include_unknown else None
+        # 序列级分类
+        class_seq_pred = self.prediction_head.forward_class_seq(fused_repr)
 
-        return seq_pred, regression_pred, classification_pred, unknown_pred
+        return seq_pred, regression_pred, classification_pred, unknown_pred, class_seq_pred
 
     def forward_with_embeddings(self, time_features: torch.Tensor, 
                 freq_features: Optional[torch.Tensor] = None,

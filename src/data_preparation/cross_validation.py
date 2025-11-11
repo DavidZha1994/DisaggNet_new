@@ -12,6 +12,7 @@ Cross Validation Module
 import numpy as np
 import polars as pl
 import pandas as pd
+from .io import safe_to_csv
 from typing import List, Dict, Tuple, Iterator, Optional
 from dataclasses import dataclass
 import logging
@@ -332,7 +333,7 @@ class WalkForwardCV:
             cv_plan.append(fold_data)
         
         cv_df = pd.DataFrame(cv_plan)
-        cv_df.to_csv(output_path, index=False)
+        safe_to_csv(cv_df, output_path)
         
         logger.info(f"CV计划已保存到: {output_path}")
     

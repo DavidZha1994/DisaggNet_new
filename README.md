@@ -47,21 +47,23 @@ pip install -r requirements.txt
 # 安装数据准备依赖
 python3 -m pip install -r requirements_data_prep.txt
 
-# 运行完整的数据准备流程（使用统一配置目录）
-python run_data_preparation.py --config config/prep_config.yaml --data Data/your_data.csv --output Data/prepared_data
+# 运行完整的数据准备流程（优先使用统一配置目录）
+python run_data_preparation.py --config configs/pipeline/prep_config.yaml --data Data/your_data.csv --output Data/prepared_data
 
 # 仅查看流程摘要
-python run_data_preparation.py --config config/prep_config.yaml --summary-only --output Data/prepared_data
+python run_data_preparation.py --config configs/pipeline/prep_config.yaml --summary-only --output Data/prepared_data
 
 # 验证输出数据
 python validate_prepared_data.py
 ```
 
+说明：配置文件路径统一为 `configs/pipeline/prep_config.yaml`，不再支持旧路径。
+
 ## 标签与时间窗口最佳实践
 
 - 窗口生成在数据准备阶段完成：通过 `WindowGenerator` 统一滑动窗口与质量过滤，避免训练阶段重复切片导致泄漏。
 - Walk-Forward 分割与净化间隔：`WalkForwardCV` 基于时间进行划分，使用 `purge_gap_minutes` 隔离训练/验证边界，防止时间泄漏与相邻窗口重叠。
-- 开关(on/off)标签生成：在 `config/prep_config.yaml` 的 `labels.onoff` 中配置观测列（如 `P_kW`）、阈值与迟滞，支持 `absolute`/`delta`/`hybrid` 策略与每设备阈值覆盖，标签定义为窗口内“开启”占比达到阈值。
+- 开关(on/off)标签生成：在 `configs/pipeline/prep_config.yaml` 的 `labels.onoff` 中配置观测列（如 `P_kW`）、阈值与迟滞，支持 `absolute`/`delta`/`hybrid` 策略与每设备阈值覆盖，标签定义为窗口内“开启”占比达到阈值。
 - 事件标签回退：若未启用 on/off 或观测列缺失，自动回退至事件定义（阈值+最小持续时间）进行窗口事件检测。
 - 不平衡处理：在数据模块中自动统计 `pos_weight` 与 `prior_p` 并注入训练；可启用 `labels.imbalance_handling.enabled` 与采样策略（过采样/欠采样/混合）作为数据级补充。
 - 模型输入映射：数据模块将原始窗口映射到 `time_features`，频域摘要/帧映射到 `freq_features`，工程特征映射到 `aux_features`，并生成 `target_power` 与 `target_states`。
@@ -73,8 +75,8 @@ python validate_prepared_data.py
 # 基础训练
 python main.py --mode train
 
-# 使用稳定性优化配置
-python main.py --mode train --config configs/optimized_stable.yaml
+# 使用稳定性优化配置（统一训练配置目录）
+python main.py --mode train --config configs/training/optimized_stable.yaml
 
 # 超参数优化
 python main.py --mode hpo --trials 100
@@ -139,7 +141,7 @@ python main.py --mode batch_infer --input_dir data/test_batch/
 
 - `configs/base.yaml` - 基础配置模板（其他配置继承）
 - `configs/default.yaml` - 默认训练配置
-- `configs/optimized_stable.yaml` - 优化稳定训练配置
+- `configs/training/optimized_stable.yaml` - 优化稳定训练配置（统一目录，兼容旧路径 `configs/optimized_stable.yaml`）
 
 ### 主要配置项
 
@@ -180,7 +182,8 @@ DisaggNet_new/
 ├── configs/                           # 配置文件目录
 │   ├── base.yaml                      # 基础配置模板
 │   ├── default.yaml                   # 默认训练配置
-│   └── optimized_stable.yaml          # 优化稳定训练配置
+│   ├── training/optimized_stable.yaml # 优化稳定训练配置（统一目录）
+│   └── pipeline/prep_config.yaml      # 数据准备配置（统一目录，兼容旧路径 config/prep_config.yaml）
 ├── src/                              # 源代码目录
 │   ├── data/                         # 数据处理模块
 │   │   └── datamodule.py            # 数据模块和数据加载器
@@ -197,10 +200,7 @@ DisaggNet_new/
 │   ├── eval.py                      # 评估脚本
 │   ├── infer.py                     # 推理脚本
 │   └── walk_forward.py              # Walk-Forward验证
-├── config/                          # 全局与子系统配置目录
-│   └── prep_config.yaml             # 数据准备配置（从根目录移入）
 ├── run_data_preparation.py          # 数据准备流水线 CLI 入口
-├── example_usage.py                 # 数据准备示例（统一使用 config/prep_config.yaml）
 ├── validate_prepared_data.py        # 数据准备输出验证脚本
 ├── requirements_data_prep.txt       # 数据准备子系统依赖清单
 ├── Data/                            # 数据目录
@@ -325,19 +325,19 @@ src/data/
 
 ```bash
 # 使用优化稳定配置训练
-python main.py --mode train --config configs/optimized_stable.yaml
+python main.py --mode train --config configs/training/optimized_stable.yaml
 
 # 超参数优化
-python main.py --mode hpo --config configs/optimized_stable.yaml --trials 50
+python main.py --mode hpo --config configs/training/optimized_stable.yaml --trials 50
 
 # Walk-Forward验证
-python main.py --mode walk_forward --config configs/optimized_stable.yaml --n_splits 5
+python main.py --mode walk_forward --config configs/training/optimized_stable.yaml --n_splits 5
 
 # 模型评估
 python main.py --mode eval --checkpoint outputs/checkpoints/best_model.pth
 
 # 稳定性检查
-python main.py --mode stability_check --config configs/optimized_stable.yaml
+python main.py --mode stability_check --config configs/training/optimized_stable.yaml
 ```
 
 #### 配置文件说明
@@ -460,7 +460,7 @@ src/utils/
 #### 数据准备
 ```bash
 # 运行数据准备流程
-python run_data_preparation.py --config config/prep_config.yaml --data Data/processed_data.csv
+python run_data_preparation.py --config configs/pipeline/prep_config.yaml --data Data/processed_data.csv
 ```
 
 #### 模型训练

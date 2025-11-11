@@ -1,0 +1,180 @@
+BiGRU:
+  model_kwargs:
+    out_channels: 1
+    dropout: 0.1
+    return_values: "power"
+    verbose_loss: false
+  model_training_param:
+    lr: !!float 1e-4
+    wd: !!float 0
+    training_in_model: false
+
+BiLSTM:
+  model_kwargs:
+    downstreamtask : "seq2seq"
+  model_training_param:
+    lr: !!float 1e-4
+    wd: !!float 0
+    training_in_model: false
+
+CNN1D:
+  model_kwargs:
+    quantiles:
+      - 0.5
+    num_classes: 1
+    dropout: !!float 0.1
+    pooling_size: 16
+    return_values: "power"
+    verbose_loss: false
+  model_training_param:
+    lr: !!float 1e-4
+    wd: !!float 0
+    training_in_model: false
+
+UNET_NILM:
+  model_kwargs:
+    num_layers: 4
+    features_start: 8
+    num_classes: 1
+    pooling_size: 16
+    quantiles: [0.5]
+    d_model: 128
+    dropout: 0.1
+    return_values: "power"
+    verbose_loss: false
+  model_training_param:
+    lr: !!float 1e-4
+    wd: 0
+    training_in_model: false
+
+FCN:
+  model_kwargs:
+    downstreamtask: "seq2seq"
+  model_training_param:
+    lr: !!float 1e-4
+    wd: !!float 0
+    training_in_model: false
+
+DResNet:
+  model_kwargs:
+    kernel_size: 3
+  model_training_param:
+    lr: !!float 1e-4
+    wd: !!float 0
+    training_in_model: false
+
+DAResNet:
+  model_kwargs:
+    kernel_size: 3
+  model_training_param:
+    lr: !!float 1e-4
+    wd: !!float 0
+    training_in_model: false
+
+BERT4NILM:
+  model_kwargs:
+    c_out: 1
+    dp_rate: 0.1
+    C0: 1
+    mask_prob: 0.2
+    use_bert4nilm_postprocessing: false
+    cutoff: null
+    threshold: null
+    return_values: !!str "power"
+  model_training_param:
+    lr: !!float 1e-4
+    wd: !!float 0
+    training_in_model: false
+
+DiffNILM:
+  model_kwargs: {}
+  model_training_param:
+    lr: !!float 1e-3
+    wd: !!float 0
+    training_in_model: true
+
+STNILM:
+  model_kwargs:
+    c_out: 1
+    n_experts: 10
+    dp_rate: 0.1
+    weight_moe: 0.1
+  model_training_param:
+    lr: !!float 1e-3
+    wd: !!float 0
+    training_in_model: true
+
+TSILNet:
+  model_kwargs:
+    downstreamtask: "seq2seq"
+    tcn_channels: [4, 16, 64]
+    tcn_kernel_size: 5
+    tcn_dropout: 0.2
+    lstm_hidden_sizes: [128, 256]
+    lstm_dropout: 0.2
+    dilation: 8
+    head_ffn_dim: 512
+    head_dropout: 0.2
+  model_training_param:
+    lr: !!float 1e-4
+    wd: !!float 0
+    training_in_model: false
+
+Energformer:
+  model_kwargs:
+    c_out: 1
+    kernel_embed_size: 3
+    n_encoder_layers: 4
+    d_model: 128
+    n_head: 4
+    d_ff: 256
+    att_dropout: 0.2
+    ffn_dropout: 0.2
+  model_training_param:
+    lr: !!float 1e-4
+    wd: !!float 0
+    training_in_model: false
+
+ConvNet:
+  model_kwargs: {}
+  model_training_param:
+    lr: !!float 1e-3
+    wd: !!float 0
+
+ResNet:
+  model_kwargs:
+    mid_channels: 64
+  model_training_param:
+    lr: !!float 1e-3
+    wd: !!float 0
+
+Inception:
+  model_kwargs:
+    n_filters: 32
+    n_blocks: 2
+    kernel_sizes: [9, 19, 39]
+    bottleneck_channels: 32
+  model_training_param:
+    lr: !!float 1e-3
+    wd: !!float 0
+
+NILMFormer:
+  model_kwargs:
+    c_out: 1
+
+    kernel_size: 3
+    kernel_size_head: 3
+    dilations: [1, 2, 4, 8]
+    conv_bias: true
+
+    use_efficient_attention: false
+    n_encoder_layers: 3
+    d_model: 96
+    dp_rate: 0.2
+    pffn_ratio: 4
+    n_head: 8
+    norm_eps: !!float 1e-5
+  model_training_param:
+    lr: !!float 1e-4
+    wd: !!float 0
+    training_in_model: false

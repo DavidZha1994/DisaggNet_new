@@ -164,7 +164,7 @@ Thumbs.db
 *.backup
 
 # HPO results
-hpo/
+
 optuna_study.db
 optimized_config.yaml
 
@@ -172,4 +172,4 @@ optimized_config.yaml
 mlruns/
 wandb/
 tensorboard_logs/
-reports/debug_manual/
+reports/

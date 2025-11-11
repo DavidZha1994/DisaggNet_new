@@ -1,0 +1,194 @@
+# DisaggNet 稳定优化配置（自包含，适配当前训练流水线）
+
+project_name: "DisaggNet"
+
+# 选择数据集（例如：UKDALE 或 REFIT）
+dataset: "UKDALE"
+
+experiment:
+  name: "optimized_stable"
+
+# 复现与稳定性
+reproducibility:
+  seed: 42
+  deterministic: true
+  benchmark: false
+
+paths:
+  output_dir: "outputs"
+  data_dir: "Data"
+  prepared_dir: "Data/prepared"
+
+logging:
+  save_dir: "logs/tensorboard"
+  version: "stable"
+
+# 数据设置（稳定版）
+data:
+  batch_size: 16
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  prefetch_factor: 2
+  window_size: 256
+
+# 模型设置（融合Transformer）
+model:
+  d_model: 256
+  n_heads: 4
+  num_layers: 4
+  dropout: 0.12488198442705756
+  calibration:
+    enable: true
+  time_encoder:
+    d_model: 256
+    n_heads: 4
+    num_layers: 4
+    dropout: 0.12488198442705756
+    input_conv_embed: false
+    causal_mask: true
+  freq_encoder:
+    enable: true
+    proj_dim: 96
+    conv1d_kernel: 3
+    dropout: 0.17422563172601108
+    small_transformer_layers: 0
+  fusion:
+    type: "cross_attention"
+    gated: true
+  aux_encoder:
+    enable: false
+    hidden: 128
+    dropout: 0.1
+  heads:
+    regression:
+      hidden: 64
+      dropout: 0.14363222460913566
+    classification:
+      init_p: [0.1]
+    unknown:
+      enable: false
+
+# 训练设置（稳定优化）
+training:
+  max_epochs: 50
+  min_epochs: 1
+  precision: "auto"
+  log_every_n_steps: 10
+  gradient_clip_val: 1.8328751677851103
+  accumulate_grad_batches: 2
+  check_val_every_n_epoch: 1
+  accelerator: "mps"
+  devices: 1
+  monitor_device_stats: false
+  visualization:
+    enable: true
+    plot_event_only: true
+    max_plots_per_epoch: 10
+    target_scale: 1.0
+    # 交互可视化设置：将验证拼接输出为可交互HTML
+    interactive: true
+    save_dir: "outputs/viz"
+  optimizer:
+    name: "adamw"
+    lr: 1.3837211673369064e-05
+    weight_decay: 5.746172615211344e-06
+    betas: [0.9, 0.999]
+  scheduler:
+    name: "cosine"
+    warmup_steps: 111
+    T_max: 200
+    eta_min: 1e-6
+  checkpoint:
+    dirpath: "outputs/checkpoints"
+    filename: "epochepoch={epoch:02d}-v{version}"
+    monitor: "val/loss"
+    mode: "min"
+    save_top_k: 1
+  early_stopping:
+    enable: false
+    monitor: "val/loss"
+    patience: 15
+    mode: "min"
+    min_delta: 0.001
+  masking:
+    window_strategy: "none"
+    min_valid_ratio_time: 0.5
+    min_valid_ratio_freq: 0.5
+    combine_modalities: "min"
+    downweight_power: 1.0
+    epsilon: 0.0
+  event_focus:
+    enable: true
+    weight: 1.5
+
+# 损失设置（优化版，含兼容字段）
+loss:
+  regression_weight: 1.0
+  classification_weight: 1.0
+  conservation_weight: 0.2
+  huber_delta: 0.5486708076412978
+  normalize_per_device: true
+  active_threshold_rel: 0.02
+  off_penalty_weight: 0.05279804514567863
+  rel_loss_weight: 1.5
+  # 稀有设备学习增强
+  rare_active_alpha: 0.5
+  rare_active_floor: 1.0
+  # 近似常开的设备（如冰箱）关闭期样本增强
+  rare_neg_alpha: 1.0
+  rare_neg_floor: 1.0
+  classification_loss_type: bce
+  classification_hard: true
+  hard_threshold: 0.5
+  off_penalty_rel_threshold: 0.02
+
+# 评估设置
+evaluation:
+  threshold_method: "optimal"
+  zero_window_weight: 0.1
+  test_after_training: false
+
+# 不平衡处理
+imbalance_handling:
+  use_weighted_sampling: true
+  pos_weight_auto: true
+  sampling_strategy: "mixed"
+
+# Walk-Forward 交叉验证（优化版本）
+walk_forward:
+  n_folds: 5
+  purge_gap_minutes: 15
+  val_span_days: 5.0
+  test_span_days: 5.0
+  min_train_days: 10.0
+  segment_isolation: true
+  holdout_test: true
+  time_based_split: true
+
+# 窗口设置（数据准备参考）
+windowing:
+  window_size: 256
+  stride: 128
+  overlap: 0.5
+
+# 共形预测（默认关闭）
+conformal_prediction:
+  enabled: false
+  alpha: 0.1
+  regression_method: "quantile"
+  classification_method: "adaptive"
+
+# 稳定性设置
+stability:
+  numerical:
+    detect_anomaly: true
+  reproducibility:
+    deterministic: true
+    benchmark: false
+
+# 调试
+debug:
+  track_grad_norm: 0
+  strict_validation: false
+  log_model_graph: false

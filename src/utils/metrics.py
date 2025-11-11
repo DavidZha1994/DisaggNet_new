@@ -156,28 +156,34 @@ class NILMMetrics:
             return float(np.mean(teca_values))
     
     def optimize_thresholds(self, y_pred_proba: torch.Tensor, y_true: torch.Tensor,
-                          method: str = 'f1') -> Dict[str, float]:
-        """优化分类阈值"""
+                          method: Optional[str] = None) -> Dict[str, float]:
+        """优化分类阈值
+        - 当 method 未指定时，使用实例初始化的 `threshold_method`。
+        - 支持 'f1'、'youden' 与 'optimal'（等同于按 F1 最优）。
+        """
         y_pred_proba = self._to_numpy(y_pred_proba)
         y_true = self._to_numpy(y_true)
-        
+
+        # 解析阈值方法（默认使用实例方法）
+        method = (method or self.threshold_method or 'f1').lower()
+
         optimal_thresholds = {}
-        
+
         for i in range(self.n_devices):
             device_name = self.device_names[i]
-            
+
             if len(np.unique(y_true[:, i])) < 2:
                 # 如果只有一个类别，使用默认阈值
                 optimal_thresholds[device_name] = 0.5
                 continue
-            
-            if method == 'f1':
+
+            if method in ('f1', 'optimal'):
                 # 基于F1分数优化
                 precision, recall, thresholds = precision_recall_curve(y_true[:, i], y_pred_proba[:, i])
                 f1_scores = 2 * (precision * recall) / (precision + recall + 1e-8)
                 best_idx = np.argmax(f1_scores)
                 optimal_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
-            
+
             elif method == 'youden':
                 # 基于Youden指数优化
                 from sklearn.metrics import roc_curve
@@ -185,12 +191,12 @@ class NILMMetrics:
                 youden_index = tpr - fpr
                 best_idx = np.argmax(youden_index)
                 optimal_threshold = thresholds[best_idx]
-            
+
             else:
                 optimal_threshold = 0.5
-            
+
             optimal_thresholds[device_name] = optimal_threshold
-        
+
         self.thresholds = optimal_thresholds
         return optimal_thresholds
     
