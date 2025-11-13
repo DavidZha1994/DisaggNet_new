@@ -504,7 +504,7 @@ class MultiTaskHead(nn.Module):
                 nn.ReLU(),
                 nn.Dropout(0.1),
                 nn.Linear(hidden_dim, 1),
-                nn.ReLU()
+                nn.Softplus()
             ) for _ in range(n_devices)
         ])
         
@@ -514,7 +514,7 @@ class MultiTaskHead(nn.Module):
                 nn.ReLU(),
                 nn.Dropout(0.1),
                 nn.Linear(hidden_dim, 1),
-                nn.ReLU()
+                nn.Softplus()
             )
         else:
             self.unknown_regression_head = None

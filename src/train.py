@@ -404,10 +404,16 @@ class NILMLightningModule(pl.LightningModule):
                 reg_warm = int(getattr(cur_cfg, 'reg_warmup_epochs', 0))
                 reg_warm_scale = float(getattr(cur_cfg, 'reg_warmup_scale', 1.5))
                 cls_start = int(getattr(cur_cfg, 'cls_start_epoch', 0))
+                unk_start = int(getattr(cur_cfg, 'unknown_start_epoch', 0))
+                unk_ramp = int(getattr(cur_cfg, 'unknown_ramp_epochs', 0))
                 if ep < reg_warm:
                     w_reg = w_reg * reg_warm_scale
                 if ep < cls_start:
                     w_cls = 0.0
+                if ep < unk_start:
+                    w_unk = 0.0
+                elif unk_ramp > 0:
+                    w_unk = w_unk * min(1.0, (ep - unk_start + 1) / float(unk_ramp))
         except Exception:
             pass
         total = w_reg * seq_reg_loss 

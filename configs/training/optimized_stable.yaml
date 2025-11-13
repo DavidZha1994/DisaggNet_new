@@ -25,7 +25,7 @@ logging:
 
 # 数据设置（稳定版）
 data:
-  batch_size: 16
+  batch_size: 64
   num_workers: 0
   pin_memory: false
   persistent_workers: false
@@ -127,13 +127,15 @@ loss:
   regression_weight: 1.0
   classification_weight: 1.0
   conservation_weight: 0.2
+  # weights tuning
+  #
   unknown_weight: 0.2
   unknown_match_weight: 1.0
   unknown_l1_penalty: 0.05
   huber_delta: 0.5486708076412978
   normalize_per_device: true
   active_threshold_rel: 0.02
-  off_penalty_weight: 0.05279804514567863
+  off_penalty_weight: 0.01
   rel_loss_weight: 1.5
   # 稀有设备学习增强
   rare_active_alpha: 0.5
@@ -147,8 +149,10 @@ loss:
   off_penalty_rel_threshold: 0.02
   # 课程式权重（翻转）：先回归，后分类
   reg_warmup_epochs: 10
-  reg_warmup_scale: 1.5
+  reg_warmup_scale: 2.0
   cls_start_epoch: 8
+  unknown_start_epoch: 5
+  unknown_ramp_epochs: 5
 
 # 评估设置
 evaluation:
@@ -162,7 +166,7 @@ imbalance_handling:
   pos_weight_auto: true
   sampling_strategy: "mixed"
   pos_count_inverse_enable: false
-  event_boost: 0.5
+  event_boost: 1.5
 
 # Walk-Forward 交叉验证（优化版本）
 walk_forward:
