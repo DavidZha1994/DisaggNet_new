@@ -106,8 +106,18 @@ class REFITUKDALEPipeline:
         base = data_root.rstrip(os.sep)
         if ds_name.upper() == "UKDALE":
             data_path = os.path.join(base, "UKDALE") + os.sep
+            if not os.path.exists(data_path):
+                alt_base = "data"
+                data_path_alt = os.path.join(alt_base, "UKDALE") + os.sep
+                if os.path.exists(data_path_alt):
+                    data_path = data_path_alt
         elif ds_name.upper() == "REFIT":
             data_path = os.path.join(base, "REFIT", "RAW_DATA_CLEAN") + os.sep
+            if not os.path.exists(data_path):
+                alt_base = "data"
+                data_path_alt = os.path.join(alt_base, "REFIT", "RAW_DATA_CLEAN") + os.sep
+                if os.path.exists(data_path_alt):
+                    data_path = data_path_alt
         else:
             raise ValueError(f"未知数据集 {ds_name}，仅支持 REFIT 或 UKDALE")
 
@@ -284,18 +294,58 @@ class REFITUKDALEPipeline:
         house_all = sorted(set((splits.get("train", []) or []) + (splits.get("valid", []) or [])))
         X_all, st_date_all, device_names = self._build_data(house_all)
 
-        # 时域窗口与目标序列
-        raw_all = self._build_time_domain(X_all)  # [N,L,2]
-        Y_seq_all = self._build_targets_seq(X_all, device_names)  # [N,L,K]
-        S_seq_all = self._build_status_seq(X_all, device_names)  # [N,L,K]
-        labels_all = self._build_labels(Y_seq_all)  # [N,K]
+        def _step_seconds(sr: str) -> int:
+            try:
+                s = str(sr).lower()
+                if "min" in s:
+                    return int(s.replace("min", "")) * 60
+                if s.endswith("s"):
+                    return int(s[:-1])
+                if s.endswith("t"):
+                    v = int(s[:-1])
+                    return 60 * v
+                return 60
+            except Exception:
+                return 60
+
+        def _sequence_non_overlapping(X: np.ndarray, st_df: pd.DataFrame, win_size: int, step_s: int) -> Tuple[np.ndarray, pd.DataFrame, np.ndarray]:
+            df = st_df.copy().reset_index()
+            df = df.rename(columns={df.columns[0]: "house"}) if df.columns[0] != "house" else df
+            df["start_ts"] = pd.to_datetime(df["start_date"]).astype("int64") // 1_000_000_000
+            df["end_ts"] = df["start_ts"] + int(win_size) * int(step_s)
+            g = df.groupby("house").agg(earliest=("start_ts", "min"), latest=("end_ts", "max")).reset_index()
+            order = g.sort_values("earliest")["house"].tolist()
+            selected: List[int] = []
+            prev_end: Optional[int] = None
+            for h in order:
+                rows = df[df["house"] == h].sort_values("start_ts")
+                if prev_end is None:
+                    keep_idx = rows.index.tolist()
+                    if len(rows) > 0:
+                        prev_end = int(rows["end_ts"].max())
+                else:
+                    rows2 = rows[rows["start_ts"] >= int(prev_end)]
+                    keep_idx = rows2.index.tolist()
+                    if len(rows2) > 0:
+                        prev_end = int(rows2["end_ts"].max())
+                selected.extend(keep_idx)
+            if len(selected) == 0:
+                return X, st_df, np.arange(X.shape[0], dtype=np.int64)
+            sel = np.array(selected, dtype=np.int64)
+            return X[sel], st_df.iloc[sel], sel
+
+        step_s = _step_seconds(self.ru.sampling_rate)
+        X_all, st_date_all, selected_idx = _sequence_non_overlapping(X_all, st_date_all, int(self.ru.window_size), int(step_s))
+
+        raw_all = self._build_time_domain(X_all)
+        Y_seq_all = self._build_targets_seq(X_all, device_names)
+        S_seq_all = self._build_status_seq(X_all, device_names)
+        labels_all = self._build_labels(Y_seq_all)
 
         # 频域与外生特征
         freq_frames_all, freq_mask_all = self._build_freq_frames(raw_all)
         aux_all, aux_names = self._build_exogene_features(raw_all, st_date_all)
 
-        # 构建窗口元数据（仅包含起止时间与段ID占位）
-        # 根据 st_date_all 序列与采样率、window_size 计算 start_ts/end_ts（秒）
         def _to_epoch_seconds(x) -> int:
             try:
                 return int(pd.to_datetime(x).timestamp())
@@ -305,24 +355,7 @@ class REFITUKDALEPipeline:
                     return int(pd.Timestamp(dt64).timestamp())
                 except Exception:
                     return 0
-
         start_ts = np.array([_to_epoch_seconds(sd) for sd in st_date_all["start_date"].tolist()], dtype=np.int64)
-        # window_size in samples; convert to seconds length by sampling_rate
-        # sampling_rate examples: '10s', '1min', '10min'
-        try:
-            sr = str(self.ru.sampling_rate).lower()
-            if "min" in sr:
-                step_s = int(sr.replace("min", "")) * 60
-            elif sr.endswith("s"):
-                step_s = int(sr[:-1])
-            elif sr.endswith("t"):
-                # pandas offset alias
-                val = int(sr[:-1])
-                step_s = 60 if sr.endswith("t") and val == 1 else 60 * val
-            else:
-                step_s = 60
-        except Exception:
-            step_s = 60
         end_ts = start_ts + int(self.ru.window_size) * int(step_s)
         windows_meta = pd.DataFrame({
             "window_idx": np.arange(len(start_ts), dtype=np.int64),

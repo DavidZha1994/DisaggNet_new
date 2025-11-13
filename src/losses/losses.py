@@ -9,6 +9,9 @@ RECOMMENDED_LOSS_CONFIGS: Dict[str, Dict[str, Any]] = {
         "regression_weight": 1.0,
         "classification_weight": 1.0,
         "conservation_weight": 0.0,
+        "unknown_weight": 0.0,
+        "unknown_match_weight": 1.0,
+        "unknown_l1_penalty": 0.1,
         "huber_delta": 1.0,
         "normalize_per_device": True,
         "active_threshold_rel": 0.05,
@@ -29,6 +32,9 @@ class NILMLoss:
         self.regression_weight = float(cfg.get("regression_weight", 1.0))
         self.classification_weight = float(cfg.get("classification_weight", 1.0))
         self.conservation_weight = float(cfg.get("conservation_weight", 0.0))
+        self.unknown_weight = float(cfg.get("unknown_weight", 0.0))
+        self.unknown_match_weight = float(cfg.get("unknown_match_weight", 1.0))
+        self.unknown_l1_penalty = float(cfg.get("unknown_l1_penalty", 0.1))
         self.huber_delta = float(cfg.get("huber_delta", 1.0))
         self.normalize_per_device = bool(cfg.get("normalize_per_device", True))
         # 更低的激活阈值，提升对中低功率事件的敏感度
@@ -289,7 +295,9 @@ class NILMLoss:
         return el.sum(dim=(0, 1)) / denom
 
     def conservation_loss(self, mains_seq: Optional[torch.Tensor], pred_seq: torch.Tensor) -> torch.Tensor:
-        """窗口级能量守恒：设备和的时间均值与总功率代表值接近（相对误差）。"""
+        """窗口级能量守恒：设备和的时间均值与总功率代表值接近（相对误差）。
+        注意：此守恒项不包含未知残差，未知残差由 unknown_residual_loss 处理。
+        """
         if not isinstance(mains_seq, torch.Tensor):
             return torch.tensor(0.0, device=pred_seq.device)
         sum_per_t = pred_seq.sum(dim=2)  # (B, L)
@@ -298,6 +306,32 @@ class NILMLoss:
         rel = torch.where(valid, torch.abs(pred_total - mains_seq) / (mains_seq.abs() + 1e-6), torch.zeros_like(mains_seq))
         denom = valid.float().sum().clamp_min(1.0)
         return rel.sum() / denom
+
+    def unknown_residual_loss(self, mains_seq: Optional[torch.Tensor], pred_seq: torch.Tensor,
+                               unknown_win: Optional[torch.Tensor]) -> torch.Tensor:
+        """未知残差匹配：鼓励未知头拟合主功率中“未由设备解释的部分”，并对过度使用未知施加惩罚。
+        - mains_seq: (B, L)
+        - pred_seq: (B, L, K)
+        - unknown_win: (B, 1) 或 None  -> 窗口级未知功率预测
+        返回标量损失： match + penalty
+        """
+        if not (isinstance(mains_seq, torch.Tensor) and isinstance(unknown_win, torch.Tensor)):
+            return torch.tensor(0.0, device=pred_seq.device)
+        B, L, K = pred_seq.size(0), pred_seq.size(1), pred_seq.size(2)
+        # 设备总功率的窗口均值
+        sum_per_t = pred_seq.sum(dim=2)              # (B, L)
+        dev_total = sum_per_t.mean(dim=1, keepdim=True)  # (B, 1)
+        mains_mean = mains_seq.mean(dim=1, keepdim=True) # (B, 1)
+        # 只拟合正的未解释残差（避免负残差导致未知吸收基线）
+        residual_target = torch.relu(mains_mean - dev_total)
+        # 匹配损失：SmoothL1（窗口级）
+        diff = torch.abs(unknown_win - residual_target)
+        delta = self.huber_delta
+        match = torch.where(diff < delta, 0.5 * diff ** 2, delta * (diff - 0.5 * delta))
+        match = match.mean()
+        # 使用惩罚抑制滥用未知：L1 强度（越小越好）
+        penalty = torch.relu(unknown_win).mean()
+        return self.unknown_match_weight * match + float(self.unknown_l1_penalty) * penalty
 
 
 def create_loss_function(cfg: Dict[str, Any]) -> NILMLoss:

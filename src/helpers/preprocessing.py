@@ -619,7 +619,6 @@ class UKDALE_DataBuilder(object):
 
         Return : pd.core.frame.DataFrame instance
         """
-        # Robustly resolve UKDALE house directory (supports House{n}, house_{n}, house{n})
         candidates = [
             os.path.join(self.data_path, f"House{indice}") + os.sep,
             os.path.join(self.data_path, f"house_{indice}") + os.sep,
@@ -627,13 +626,12 @@ class UKDALE_DataBuilder(object):
         ]
         path_house = None
         for p in candidates:
-            if os.path.exists(os.path.join(p, "labels.dat")):
+            if os.path.isfile(os.path.join(p, "labels.dat")):
                 path_house = p
                 break
         if path_house is None:
-            raise FileNotFoundError(
-                f"UKDALE house directory not found. Tried: {', '.join(candidates)}"
-            )
+            path_house = candidates[0]
+        self._check_if_file_exist(path_house + "labels.dat")
 
         # House labels
         house_label = pd.read_csv(path_house + "labels.dat", sep=" ", header=None)
@@ -1063,28 +1061,11 @@ class REFIT_DataBuilder(object):
 
         Return : pd.core.frame.DataFrame instance
         """
-        file = os.path.join(self.data_path, f"CLEAN_House{indice}.csv")
+        file = self.data_path + "CLEAN_House" + str(indice) + ".csv"
         self._check_if_file_exist(file)
-
-        # Resolve REFIT labels file robustly: support HOUSES_Labels/HOUSE_Labels with or without .csv
-        label_candidates = [
-            "HOUSES_Labels",
-            "HOUSES_Labels.csv",
-            "HOUSE_Labels",
-            "HOUSE_Labels.csv",
-        ]
-        labels_path = None
-        for cand in label_candidates:
-            candidate_path = os.path.join(self.data_path, cand)
-            if os.path.isfile(candidate_path):
-                labels_path = candidate_path
-                break
-        if labels_path is None:
-            raise FileNotFoundError(
-                f"REFIT house labels file not found in {self.data_path}. Tried: {', '.join(label_candidates)}"
-            )
-
-        labels_houses = pd.read_csv(labels_path).set_index("House_id")
+        labels_houses = pd.read_csv(self.data_path + "HOUSES_Labels").set_index(
+            "House_id"
+        )
 
         house_data = pd.read_csv(file)
         house_data.columns = list(labels_houses.loc[int(indice)].values)

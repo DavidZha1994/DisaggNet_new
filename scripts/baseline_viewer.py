@@ -87,6 +87,7 @@ def load_fold_paths(prepared_dir: str, fold_id: int) -> Dict[str, str]:
         'feature_names_json': os.path.join(fold_dir, 'feature_names.json'),
         'indices_pt': os.path.join(fold_dir, 'train_indices.pt'),
         'mask_pt': os.path.join(fold_dir, 'train_mask.pt'),
+        'labels_pt': os.path.join(fold_dir, 'train_labels.pt'),
     }
 
 
@@ -110,7 +111,7 @@ def main():
     st.title("24小时滚动低分位基线对比（mains 与设备总功率）")
 
     # 基本输入
-    prepared_dir = st.text_input("prepared目录", value="Data/prepared")
+    prepared_dir = st.text_input("prepared目录", value="Data/prepared/hipe")
     fold_id = st.number_input("fold_id", min_value=0, value=2, step=1)
     q = st.slider("分位数 q", 0.01, 0.50, 0.05, 0.01)
     show_debug = st.checkbox("显示调试信息", value=False)
@@ -149,6 +150,13 @@ def main():
     if frames is None:
         st.error("train_raw.pt 不包含可识别的窗口帧。")
         return
+    # 调试：显示原始窗口维度
+    try:
+        N, L = frames.shape[:2]
+        C = frames.shape[2] if frames.ndim == 3 else 1
+        st.caption(f"raw frames 维度: N={N}, L={L}, C={C}")
+    except Exception:
+        pass
     # 加载 indices / mask（可选）
     starts = None
     if os.path.exists(paths['indices_pt']):
@@ -159,6 +167,19 @@ def main():
             starts = idx_obj.get('indices')
             if isinstance(starts, torch.Tensor):
                 starts = starts.detach().cpu().numpy().astype(np.int64)
+    # 若 indices 缺失，尝试从 labels 的时间戳构造绝对时间索引用于展示
+    labels_meta = None
+    abs_start_sec = None
+    if os.path.exists(paths['labels_pt']):
+        lbl_obj = _load_pt(paths['labels_pt'])
+        if isinstance(lbl_obj, dict):
+            labels_meta = lbl_obj.get('label_metadata')
+            if isinstance(labels_meta, list) and labels_meta:
+                iso0 = labels_meta[0].get('datetime_iso')
+                try:
+                    abs_start_sec = int(pd.to_datetime(iso0, errors='coerce').value // 1_000_000_000)
+                except Exception:
+                    abs_start_sec = None
     mask = None
     if os.path.exists(paths['mask_pt']):
         m_obj = _load_pt(paths['mask_pt'])
@@ -170,6 +191,14 @@ def main():
     mains_ch = resolve_mains_channel(frames, paths['raw_names_json'])
     mains_frames = frames[..., mains_ch]
     mains_series = overlap_add(mains_frames, starts, step_size, mask)
+
+    # 若存在绝对起点，构造时间索引用于更直观展示
+    dt_index = None
+    if abs_start_sec is not None and isinstance(mains_series, np.ndarray) and mains_series.size > 0:
+        try:
+            dt_index = pd.to_datetime(np.arange(abs_start_sec, abs_start_sec + len(mains_series) * resample_seconds, resample_seconds), unit='s')
+        except Exception:
+            dt_index = None
 
     # 24h滚动低分位基线与去基线
     baseline_raw = rolling_low_quantile(mains_series, day_points, q)
@@ -227,6 +256,8 @@ def main():
         'baseline': baseline,
         ('mains_detrended' if not clip_neg else 'mains_detrended_clipped'): mains_detrended_display,
     })
+    if dt_index is not None:
+        df_main.index = dt_index
     st.line_chart(df_main)
     # 负值统计提示
     try:
@@ -242,6 +273,8 @@ def main():
             'devices_sum_raw': device_sum_series,
             'devices_sum_detrended': device_sum_detrended,
         })
+        if dt_index is not None:
+            df_dev.index = dt_index
         st.line_chart(df_dev)
 
         st.subheader("对比：主表原始 vs 设备总原始")
@@ -249,6 +282,8 @@ def main():
             'mains_raw': mains_series,
             'devices_sum_raw': device_sum_series,
         })
+        if dt_index is not None:
+            df_cmp.index = dt_index
         st.line_chart(df_cmp)
 
         # 新增：主表去基线 vs 设备总原始
@@ -257,11 +292,17 @@ def main():
             ('mains_detrended' if not clip_neg else 'mains_detrended_clipped'): mains_detrended_display,
             'devices_sum_raw': device_sum_series,
         })
+        if dt_index is not None:
+            df_cmp2.index = dt_index
         st.line_chart(df_cmp2)
 
     if device_sum_series is None and os.path.exists(paths['targets_pt']):
         st.info("已找到 targets 文件，但未识别到设备P目标键。可打开“显示调试信息”查看键列表。")
-    st.success("完成：可用滑块调整分位数 q（Q10–Q20），观察对比效果。")
+    # 显式提示数据是否为空
+    if isinstance(mains_series, np.ndarray) and mains_series.size == 0:
+        st.error("重建后的主表序列为空，请检查 starts/step_size 是否正确或数据是否存在。")
+    else:
+        st.success("完成：可用滑块调整分位数 q（Q10–Q20），观察对比效果。")
 
 
 if __name__ == '__main__':

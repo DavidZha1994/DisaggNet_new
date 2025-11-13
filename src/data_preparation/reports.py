@@ -5,7 +5,11 @@ import numpy as np
 import pandas as pd
 
 from .io import safe_to_csv
-from src.tools.advanced_onoff_methods import AdaptiveHysteresisDetector
+# 可选依赖：自适应迟滞开关检测器
+try:
+    from src.tools.advanced_onoff_methods import AdaptiveHysteresisDetector  # type: ignore
+except Exception:
+    AdaptiveHysteresisDetector = None  # 依赖缺失时回退
 try:
     from tqdm import tqdm as _tqdm
 except Exception:
@@ -379,7 +383,13 @@ def export_onoff_masks(
         ts = pd.to_datetime(df_filled[ts_col], errors="coerce") if ts_col in df_filled.columns else None
         if ts is None:
             return
-        det = AdaptiveHysteresisDetector()
+        # 优先使用自适应迟滞检测器；若不存在则回退为中位数阈值法
+        det = None
+        try:
+            if AdaptiveHysteresisDetector is not None:
+                det = AdaptiveHysteresisDetector()
+        except Exception:
+            det = None
 
         out_fp = os.path.join(qdir, "device_onoff_masks.csv")
         header_written = False
@@ -395,8 +405,11 @@ def export_onoff_masks(
                 continue
             x = df_filled[col].to_numpy(dtype=np.float32)
             try:
+                if det is not None:
                     # 统一使用自适应迟滞法（与管线一致）
                     st, info = det.detect(x)
+                else:
+                    raise RuntimeError("Adaptive detector unavailable")
             except Exception:
                 st = (x > np.nanmedian(x)).astype(int)
                 info = {"method": "median_threshold"}

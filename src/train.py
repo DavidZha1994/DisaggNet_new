@@ -385,10 +385,35 @@ class NILMLightningModule(pl.LightningModule):
 
         # 守恒损失（窗口级）
         cons_loss = self.loss_fn.conservation_loss(batch.get('mains_seq', None), pred_seq)
+        unk_loss = torch.tensor(0.0, device=pred_seq.device)
+        try:
+            if isinstance(batch.get('mains_seq', None), torch.Tensor) and (unk_win is not None):
+                unk_loss = self.loss_fn.unknown_residual_loss(batch.get('mains_seq'), pred_seq, unk_win)
+        except Exception:
+            pass
 
-        total = self.loss_fn.regression_weight * seq_reg_loss 
-        total = total + self.loss_fn.classification_weight * seq_cls_loss 
-        total = total + self.loss_fn.conservation_weight * cons_loss
+        # 课程式权重（可选）：若配置提供 warmup/boost，按当前 epoch 调整权重
+        w_reg = float(getattr(self.loss_fn, 'regression_weight', 1.0))
+        w_cls = float(getattr(self.loss_fn, 'classification_weight', 1.0))
+        w_cons = float(getattr(self.loss_fn, 'conservation_weight', 0.0))
+        w_unk = float(getattr(self.loss_fn, 'unknown_weight', 0.0))
+        try:
+            ep = int(getattr(self, 'current_epoch', 0))
+            cur_cfg = getattr(self.config, 'loss', None)
+            if cur_cfg is not None:
+                reg_warm = int(getattr(cur_cfg, 'reg_warmup_epochs', 0))
+                reg_warm_scale = float(getattr(cur_cfg, 'reg_warmup_scale', 1.5))
+                cls_start = int(getattr(cur_cfg, 'cls_start_epoch', 0))
+                if ep < reg_warm:
+                    w_reg = w_reg * reg_warm_scale
+                if ep < cls_start:
+                    w_cls = 0.0
+        except Exception:
+            pass
+        total = w_reg * seq_reg_loss 
+        total = total + w_cls * seq_cls_loss 
+        total = total + w_cons * cons_loss
+        total = total + w_unk * unk_loss
 
         # 记录
         self._safe_log(f'{stage}/loss/regression_seq', seq_reg_loss, on_step=True, on_epoch=True)
@@ -396,6 +421,8 @@ class NILMLightningModule(pl.LightningModule):
             self._safe_log(f'{stage}/loss/classification_seq', seq_cls_loss, on_step=True, on_epoch=True)
         if self.loss_fn.conservation_weight > 0:
             self._safe_log(f'{stage}/loss/conservation', cons_loss, on_step=False, on_epoch=True)
+        if self.loss_fn.unknown_weight > 0:
+            self._safe_log(f'{stage}/loss/unknown', unk_loss, on_step=False, on_epoch=True)
 
         # 分设备损失记录（按 epoch 聚合，避免日志过密）
         try:

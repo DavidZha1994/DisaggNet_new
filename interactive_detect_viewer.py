@@ -136,10 +136,11 @@ def load_detection_fold(fold_dir: str):
         # 设备名与时间线
         dev_names = obj.get('device_names') or []
         step = int(obj.get('step_seconds', 5))
-        timeline = obj.get('timeline_sec')
-        timeline = _to_numpy(timeline) if timeline is not None else None
         meta = obj.get('label_metadata') or []
         iso = [m.get('datetime_iso', '') for m in meta]
+        # 将 ISO 时间解析为 epoch 秒，用于绝对时间轴
+        ser_iso = pd.Series(list(iso)) if len(iso) > 0 else pd.Series(dtype=object)
+        starts_sec = (pd.to_datetime(ser_iso, errors='coerce').astype('int64') // 1_000_000_000).to_numpy(dtype=np.int64) if len(ser_iso) > 0 else np.array([], dtype=np.int64)
 
         # 窗口维度
         tP = obj.get('targets_P'); tQ = obj.get('targets_Q'); tS = obj.get('targets_S')
@@ -161,10 +162,19 @@ def load_detection_fold(fold_dir: str):
         if tP is None:
             raise ValueError('train_targets_seq 缺少 targets_P。')
         N, L, K = tP.shape
-        # 重建连续时间序列与掩码
-        if timeline is None:
-            T = int(N * L)
-            timeline = np.arange(0, T * step, step, dtype=np.int64)
+        # 重建绝对连续时间轴：优先使用窗口 ISO 的最早时间
+        T = int(N * L)
+        if starts_sec.size > 0 and np.isfinite(starts_sec).all():
+            start0 = int(np.nanmin(starts_sec))
+            timeline = np.arange(start0, start0 + T * step, step, dtype=np.int64)
+        else:
+            # 回退：若无 ISO，则尝试使用对象中的时间线；仍无则使用 0 起点
+            timeline_obj = obj.get('timeline_sec')
+            timeline_obj = _to_numpy(timeline_obj) if timeline_obj is not None else None
+            if isinstance(timeline_obj, np.ndarray) and timeline_obj.size == T:
+                timeline = timeline_obj.astype(np.int64)
+            else:
+                timeline = np.arange(0, T * step, step, dtype=np.int64)
         series_P = _reconstruct_series_from_windows(tP, iso, timeline, L)
         series_Q = _reconstruct_series_from_windows(tQ, iso, timeline, L) if isinstance(tQ, np.ndarray) else np.zeros_like(series_P)
         series_S = _reconstruct_series_from_windows(tS, iso, timeline, L) if isinstance(tS, np.ndarray) else np.zeros_like(series_P)
@@ -227,8 +237,15 @@ def load_detection_fold(fold_dir: str):
                 iso = [m.get('datetime_iso', '') for m in meta] if meta else []
             except Exception:
                 iso = []
+        # 使用窗口最早 ISO 时间作为绝对时间线起点
         T = int(N * L)
-        timeline = np.arange(0, T * step, step, dtype=np.int64)
+        if len(iso) > 0:
+            ser_iso = pd.Series(list(iso))
+            starts_sec = (pd.to_datetime(ser_iso, errors='coerce').astype('int64') // 1_000_000_000).to_numpy(dtype=np.int64)
+            start0 = int(np.nanmin(starts_sec))
+            timeline = np.arange(start0, start0 + T * step, step, dtype=np.int64)
+        else:
+            timeline = np.arange(0, T * step, step, dtype=np.int64)
         series_P = _reconstruct_series_from_windows(arr, iso, timeline, L)
         series_Q = np.zeros_like(series_P)
         series_S = np.zeros_like(series_P)
@@ -255,7 +272,7 @@ def load_detection_fold(fold_dir: str):
 
 
 st.sidebar.title("交互配置")
-default_fold = os.path.join(os.getcwd(), 'Data', 'prepared', 'fold_2')
+default_fold = os.path.join(os.getcwd(), 'Data', 'prepared','hipe', 'fold_2')
 fold_dir = st.sidebar.text_input("Fold 目录", value=default_fold)
 
 try:
