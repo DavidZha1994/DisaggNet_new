@@ -25,27 +25,33 @@ logging:
 
 # 数据设置（稳定版）
 data:
-  batch_size: 64
+  batch_size: 32
   num_workers: 0
   pin_memory: false
   persistent_workers: false
   prefetch_factor: 2
   window_size: 256
+  device_names:
+    - washing_machine
+    - dishwasher
+    - kettle
+    - microwave
+    - fridge
 
 # 模型设置（融合Transformer）
 model:
   d_model: 256
-  n_heads: 4
-  num_layers: 4
+  n_heads: 8
+  num_layers: 8
   dropout: 0.12488198442705756
   calibration:
     enable: true
   time_encoder:
     d_model: 256
-    n_heads: 4
-    num_layers: 4
+    n_heads: 8
+    num_layers: 8
     dropout: 0.12488198442705756
-    input_conv_embed: false
+    input_conv_embed: true
     causal_mask: true
   freq_encoder:
     enable: true
@@ -62,12 +68,19 @@ model:
     dropout: 0.1
   heads:
     regression:
-      hidden: 64
+      hidden: 192
+      init_bias: 0.0
+      seq_emb_scale: 0.1
+      use_softplus: true
+      seq_use_softplus: false
+    conditioning:
+      enable_film: true
       dropout: 0.14363222460913566
     classification:
+      enable: true
       init_p: [0.1]
     unknown:
-      enable: true
+      enable: false
 
 # 训练设置（稳定优化）
 training:
@@ -76,7 +89,7 @@ training:
   precision: "auto"
   log_every_n_steps: 10
   gradient_clip_val: 1.8328751677851103
-  accumulate_grad_batches: 2
+  accumulate_grad_batches: 20
   check_val_every_n_epoch: 1
   accelerator: "mps"
   devices: 1
@@ -91,7 +104,7 @@ training:
     save_dir: "outputs/viz"
   optimizer:
     name: "adamw"
-    lr: 1.3837211673369064e-05
+    lr: 1e-3
     weight_decay: 5.746172615211344e-06
     betas: [0.9, 0.999]
   scheduler:
@@ -124,35 +137,63 @@ training:
 
 # 损失设置（优化版，含兼容字段）
 loss:
-  regression_weight: 1.0
-  classification_weight: 1.0
-  conservation_weight: 0.2
+  regression_weight: 30.0
+  classification_weight: 0.5
+  conservation_weight: 1.0
+  consistency_weight: 0.5
+  nonneg_penalty_weight: 0.3
   # weights tuning
   #
-  unknown_weight: 0.2
+  unknown_weight: 0.0
   unknown_match_weight: 1.0
   unknown_l1_penalty: 0.05
-  huber_delta: 0.5486708076412978
-  normalize_per_device: true
+  huber_delta: 2.0
+  normalize_per_device: false
   active_threshold_rel: 0.02
-  off_penalty_weight: 0.01
+  active_boost_weight: 20.0
+  off_penalty_weight: 0.15
   rel_loss_weight: 1.5
+  peak_focus_top_p: 0.1
+  peak_focus_weight: 30.0
+  shape_loss_weight: 0.6
+  derivative_loss_weight: 2.0
+  edge_focus_weight: 1.0
+  edge_focus_thr_rel: 0.03
+  multiscale_shapes: [2, 4, 8]
   # 稀有设备学习增强
-  rare_active_alpha: 0.5
+  rare_active_alpha: 1.0
   rare_active_floor: 1.0
   # 近似常开的设备（如冰箱）关闭期样本增强
   rare_neg_alpha: 1.0
   rare_neg_floor: 1.0
   classification_loss_type: bce
-  classification_hard: true
+  classification_hard: false
   hard_threshold: 0.5
   off_penalty_rel_threshold: 0.02
   # 课程式权重（翻转）：先回归，后分类
-  reg_warmup_epochs: 10
-  reg_warmup_scale: 2.0
-  cls_start_epoch: 8
-  unknown_start_epoch: 5
-  unknown_ramp_epochs: 5
+  reg_warmup_epochs: 15
+  reg_warmup_scale: 4.0
+  cls_start_epoch: 20
+  unknown_start_epoch: 20
+  unknown_ramp_epochs: 10
+  cons_start_epoch: 5
+  cons_ramp_epochs: 10
+  off_start_epoch: 10
+  off_ramp_epochs: 10
+  peak_ramp_start: 12
+  peak_ramp_epochs: 6
+  peak_target_weight: 1.5
+  edge_ramp_start: 12
+  edge_ramp_epochs: 6
+  edge_target_weight: 1.2
+  derivative_ramp_start: 12
+  derivative_ramp_epochs: 6
+  derivative_target_weight: 1.2
+  shape_ramp_start: 12
+  shape_ramp_epochs: 6
+  shape_target_weight: 0.8
+  active_boost_start_epoch: 0
+  active_boost_ramp_epochs: 0
 
 # 评估设置
 evaluation:
@@ -166,7 +207,9 @@ imbalance_handling:
   pos_weight_auto: true
   sampling_strategy: "mixed"
   pos_count_inverse_enable: false
-  event_boost: 1.5
+  event_boost: 8.0
+  early_oversample_epochs: 25
+  early_event_boost: 8.0
 
 # Walk-Forward 交叉验证（优化版本）
 walk_forward:
@@ -202,6 +245,13 @@ stability:
 
 # 调试
 debug:
-  track_grad_norm: 0
+  track_grad_norm: 2
   strict_validation: false
   log_model_graph: false
+aux_training:
+  metric_learning:
+    enable: true
+    use_power: true
+    weight: 0.2
+    margin: 0.2
+    power_threshold_rel: 0.05

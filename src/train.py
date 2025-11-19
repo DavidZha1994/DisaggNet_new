@@ -65,8 +65,22 @@ class NILMLightningModule(pl.LightningModule):
         if hasattr(config, 'loss') and config.loss:
             loss_config.update(OmegaConf.to_container(config.loss, resolve=True))
         self.loss_fn = create_loss_function(loss_config)
-        # 分类启用
-        self.classification_enabled = True
+        loss_cfg_container = OmegaConf.to_container(getattr(config, 'loss', {}), resolve=True) if hasattr(config, 'loss') else {}
+        cls_w = float(loss_cfg_container.get('classification_weight', 1.0)) if isinstance(loss_cfg_container, dict) else 1.0
+        self.classification_enabled = bool(cls_w > 0.0)
+        self._base_loss_weights = {
+            'regression_weight': float(loss_cfg_container.get('regression_weight', getattr(self.loss_fn, 'regression_weight', 1.0))) if isinstance(loss_cfg_container, dict) else getattr(self.loss_fn, 'regression_weight', 1.0),
+            'classification_weight': float(loss_cfg_container.get('classification_weight', getattr(self.loss_fn, 'classification_weight', 1.0))) if isinstance(loss_cfg_container, dict) else getattr(self.loss_fn, 'classification_weight', 1.0),
+            'unknown_weight': float(loss_cfg_container.get('unknown_weight', getattr(self.loss_fn, 'unknown_weight', 0.0))) if isinstance(loss_cfg_container, dict) else getattr(self.loss_fn, 'unknown_weight', 0.0),
+            'consistency_weight': float(loss_cfg_container.get('consistency_weight', getattr(self.loss_fn, 'consistency_weight', 0.0))) if isinstance(loss_cfg_container, dict) else getattr(self.loss_fn, 'consistency_weight', 0.0),
+            'conservation_weight': float(loss_cfg_container.get('conservation_weight', getattr(self.loss_fn, 'conservation_weight', 0.0))) if isinstance(loss_cfg_container, dict) else getattr(self.loss_fn, 'conservation_weight', 0.0),
+            'off_penalty_weight': float(loss_cfg_container.get('off_penalty_weight', getattr(self.loss_fn, 'off_penalty_weight', 0.0))) if isinstance(loss_cfg_container, dict) else getattr(self.loss_fn, 'off_penalty_weight', 0.0),
+            'peak_focus_weight': float(loss_cfg_container.get('peak_focus_weight', getattr(self.loss_fn, 'peak_focus_weight', 0.0))) if isinstance(loss_cfg_container, dict) else getattr(self.loss_fn, 'peak_focus_weight', 0.0),
+            'edge_focus_weight': float(loss_cfg_container.get('edge_focus_weight', getattr(self.loss_fn, 'edge_focus_weight', 0.0))) if isinstance(loss_cfg_container, dict) else getattr(self.loss_fn, 'edge_focus_weight', 0.0),
+            'derivative_loss_weight': float(loss_cfg_container.get('derivative_loss_weight', getattr(self.loss_fn, 'derivative_loss_weight', 0.0))) if isinstance(loss_cfg_container, dict) else getattr(self.loss_fn, 'derivative_loss_weight', 0.0),
+            'shape_loss_weight': float(loss_cfg_container.get('shape_loss_weight', getattr(self.loss_fn, 'shape_loss_weight', 0.0))) if isinstance(loss_cfg_container, dict) else getattr(self.loss_fn, 'shape_loss_weight', 0.0),
+            'active_boost_weight': float(loss_cfg_container.get('active_boost_weight', getattr(self.loss_fn, 'active_boost_weight', 2.0))) if isinstance(loss_cfg_container, dict) else getattr(self.loss_fn, 'active_boost_weight', 2.0),
+        }
 
         # 评估器（用于窗口级指标计算）
         eval_cfg = getattr(self.config, 'evaluation', None)
@@ -373,22 +387,26 @@ class NILMLightningModule(pl.LightningModule):
             svm = batch.get('status_seq_valid_mask', None)
             if isinstance(svm, torch.Tensor) and svm.dim() + 1 == cls_seq.dim():
                 svm = svm.unsqueeze(-1)
-            # 若启用硬二值训练，使用 STE 的概率进行反向传播
-            if bool(getattr(self.loss_fn, 'classification_hard', False)):
-                thr = float(getattr(self.loss_fn, 'hard_threshold', 0.5))
-                prob_soft = cls_seq
-                y_hard = (prob_soft >= thr).float()
-                prob_hat = y_hard + prob_soft - prob_soft.detach()
-                seq_cls_loss = self.loss_fn.classification_seq_loss(prob_hat, status_seq, svm)
-            else:
-                seq_cls_loss = self.loss_fn.classification_seq_loss(cls_seq, status_seq, svm)
+            # 将直通估计的处理集中在损失函数内部，避免双重STE减弱梯度
+            seq_cls_loss = self.loss_fn.classification_seq_loss(cls_seq, status_seq, svm)
 
         # 守恒损失（窗口级）
-        cons_loss = self.loss_fn.conservation_loss(batch.get('mains_seq', None), pred_seq)
+        cons_loss = self.loss_fn.conservation_loss(
+            batch.get('mains_seq', None),
+            pred_seq,
+            batch.get('target_seq', None),
+            self.power_scale
+        )
+        # 序列→窗口一致性（将时间均值与窗口级预测对齐）
+        consw_loss = torch.tensor(0.0, device=pred_seq.device)
+        try:
+            consw_loss = self.loss_fn.consistency_window_loss(pred_seq, reg_win, valid, self.power_scale)
+        except Exception:
+            pass
         unk_loss = torch.tensor(0.0, device=pred_seq.device)
         try:
             if isinstance(batch.get('mains_seq', None), torch.Tensor) and (unk_win is not None):
-                unk_loss = self.loss_fn.unknown_residual_loss(batch.get('mains_seq'), pred_seq, unk_win)
+                unk_loss = self.loss_fn.unknown_residual_loss(batch.get('mains_seq'), pred_seq, unk_win, batch.get('status_seq', None))
         except Exception:
             pass
 
@@ -419,14 +437,50 @@ class NILMLightningModule(pl.LightningModule):
         total = w_reg * seq_reg_loss 
         total = total + w_cls * seq_cls_loss 
         total = total + w_cons * cons_loss
+        total = total + float(getattr(self.loss_fn, 'consistency_weight', 0.0)) * consw_loss
         total = total + w_unk * unk_loss
+
+        # —— 训练期：更新设备原型库（用于后续异常检测） ——
+        try:
+            if stage == 'train' and self.metric_learning_enable and (self.prototype_library is not None):
+                with torch.no_grad():
+                    _, _, _, emb = self.forward_with_embeddings(batch)
+                    tp = batch.get('target_power', None)
+                    if isinstance(tp, torch.Tensor):
+                        sv = self._ensure_power_scale(emb.device, self.n_devices).view(1, 1, -1).squeeze(1)
+                        sv = sv.expand(tp.size(0), -1)
+                        thr = float(getattr(getattr(getattr(self.config, 'aux_training', None), 'metric_learning', None), 'power_threshold_rel', 0.05))
+                        mask = (tp / sv > thr).float()
+                        self.prototype_library.update(emb.detach(), mask.detach())
+                    else:
+                        self.prototype_library.update(emb.detach(), None)
+        except Exception:
+            pass
 
         # 记录
         self._safe_log(f'{stage}/loss/regression_seq', seq_reg_loss, on_step=True, on_epoch=True)
+        try:
+            neg_ratio = (pred_seq < 0).float().mean()
+            self._safe_log(f'{stage}/stats/neg_ratio', neg_ratio, on_step=False, on_epoch=True)
+            self._safe_log(f'{stage}/stats/seq_mean', torch.nanmean(pred_seq), on_step=False, on_epoch=True)
+            self._safe_log(f'{stage}/stats/seq_std', torch.nanstd(pred_seq), on_step=False, on_epoch=True)
+            if reg_win is not None:
+                self._safe_log(f'{stage}/stats/reg_win_mean', torch.nanmean(reg_win), on_step=False, on_epoch=True)
+                self._safe_log(f'{stage}/stats/reg_win_std', torch.nanstd(reg_win), on_step=False, on_epoch=True)
+                vm2 = valid.to(torch.float32) if isinstance(valid, torch.Tensor) else torch.ones_like(pred_seq[...,0])
+                num = (pred_seq * vm2.unsqueeze(-1)).sum(dim=1)
+                den = vm2.sum(dim=1).clamp_min(1.0)
+                mean_seq = num / den
+                gap = torch.abs(mean_seq - reg_win).mean()
+                self._safe_log(f'{stage}/stats/consistency_gap', gap, on_step=False, on_epoch=True)
+        except Exception:
+            pass
         if isinstance(status_seq, torch.Tensor) and isinstance(cls_seq, torch.Tensor):
             self._safe_log(f'{stage}/loss/classification_seq', seq_cls_loss, on_step=True, on_epoch=True)
         if self.loss_fn.conservation_weight > 0:
             self._safe_log(f'{stage}/loss/conservation', cons_loss, on_step=False, on_epoch=True)
+        if float(getattr(self.loss_fn, 'consistency_weight', 0.0)) > 0:
+            self._safe_log(f'{stage}/loss/consistency_window', consw_loss, on_step=False, on_epoch=True)
         if self.loss_fn.unknown_weight > 0:
             self._safe_log(f'{stage}/loss/unknown', unk_loss, on_step=False, on_epoch=True)
 
@@ -632,10 +686,14 @@ class NILMLightningModule(pl.LightningModule):
             pass
 
         # 每隔一定步数记录训练指标与梯度范数
-        if batch_idx % self.config.training.log_every_n_steps == 0:
+        try:
+            log_every = int(getattr(getattr(self.config, 'training', None), 'log_every_n_steps', 50))
+        except Exception:
+            log_every = 50
+        if log_every > 0 and (batch_idx % log_every == 0):
             with torch.no_grad():
                 _ = self._compute_metrics(batch, stage='train')
-                if self.config.debug.track_grad_norm > 0:
+                if int(getattr(getattr(self.config, 'debug', None), 'track_grad_norm', 0)) > 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=float('inf'))
                     self._safe_log('train/metrics/optimization/grad_norm', grad_norm, on_step=False, on_epoch=True)
                     if torch.isnan(grad_norm) or torch.isinf(grad_norm):
@@ -819,6 +877,135 @@ class NILMLightningModule(pl.LightningModule):
             if self.enable_visualization and len(self._sequence_examples) > 0:
                 self._save_sequence_examples('train')
                 self._sequence_examples.clear()
+        except Exception:
+            pass
+
+    def on_train_epoch_start(self) -> None:
+        try:
+            dm = getattr(self.trainer, 'datamodule', None)
+            imb = getattr(self.config, 'imbalance_handling', None)
+            if dm is not None and imb is not None:
+                early = int(getattr(imb, 'early_oversample_epochs', 0))
+                base = str(getattr(imb, 'sampling_strategy', 'mixed'))
+                base_boost = float(getattr(imb, 'event_boost', 2.0))
+                early_boost = float(getattr(imb, 'early_event_boost', base_boost))
+                if int(self.current_epoch) < early:
+                    dm.set_sampling_strategy('oversample', event_boost=early_boost, pos_count_inverse_enable=False)
+                else:
+                    dm.set_sampling_strategy(base, event_boost=base_boost, pos_count_inverse_enable=bool(getattr(imb, 'pos_count_inverse_enable', False)))
+                try:
+                    self.trainer.reset_train_dataloader()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            loss_cfg = getattr(self.config, 'loss', None)
+            if loss_cfg is not None:
+                warm_ep = int(getattr(loss_cfg, 'reg_warmup_epochs', 0))
+                warm_scale = float(getattr(loss_cfg, 'reg_warmup_scale', 1.0))
+                if int(self.current_epoch) < warm_ep and warm_scale > 1.0:
+                    self.loss_fn.regression_weight = float(self._base_loss_weights['regression_weight']) * warm_scale
+                else:
+                    self.loss_fn.regression_weight = float(self._base_loss_weights['regression_weight'])
+
+                cls_start = int(getattr(loss_cfg, 'cls_start_epoch', 0))
+                if int(self.current_epoch) < cls_start:
+                    self.loss_fn.classification_weight = 0.0
+                else:
+                    self.loss_fn.classification_weight = float(self._base_loss_weights['classification_weight'])
+
+                unk_start = int(getattr(loss_cfg, 'unknown_start_epoch', 0))
+                unk_ramp = int(getattr(loss_cfg, 'unknown_ramp_epochs', 0))
+                base_unk = float(self._base_loss_weights['unknown_weight'])
+                if int(self.current_epoch) < unk_start:
+                    self.loss_fn.unknown_weight = 0.0
+                else:
+                    if unk_ramp > 0:
+                        t = min(max(int(self.current_epoch) - unk_start + 1, 0), unk_ramp)
+                        frac = float(t) / float(unk_ramp)
+                        self.loss_fn.unknown_weight = base_unk * frac
+                    else:
+                        self.loss_fn.unknown_weight = base_unk
+
+                self.loss_fn.consistency_weight = float(self._base_loss_weights['consistency_weight'])
+
+                # 能量守恒权重：在 cons_start_epoch 后线性爬升到基础权重
+                cons_start = int(getattr(loss_cfg, 'cons_start_epoch', 0))
+                cons_ramp = int(getattr(loss_cfg, 'cons_ramp_epochs', 0))
+                base_cons = float(self._base_loss_weights['conservation_weight'])
+                if int(self.current_epoch) < cons_start:
+                    self.loss_fn.conservation_weight = 0.0
+                else:
+                    if cons_ramp > 0:
+                        t = min(max(int(self.current_epoch) - cons_start + 1, 0), cons_ramp)
+                        frac = float(t) / float(cons_ramp)
+                        self.loss_fn.conservation_weight = base_cons * frac
+                    else:
+                        self.loss_fn.conservation_weight = base_cons
+
+                # 关闭抑制项权重：在 off_start_epoch 后线性爬升，避免早期压制振幅
+                off_start = int(getattr(loss_cfg, 'off_start_epoch', 0))
+                off_ramp = int(getattr(loss_cfg, 'off_ramp_epochs', 0))
+                base_off = float(self._base_loss_weights['off_penalty_weight'])
+                if int(self.current_epoch) < off_start:
+                    self.loss_fn.off_penalty_weight = 0.0
+                else:
+                    if off_ramp > 0:
+                        t = min(max(int(self.current_epoch) - off_start + 1, 0), off_ramp)
+                        frac = float(t) / float(off_ramp)
+                        self.loss_fn.off_penalty_weight = base_off * frac
+                    else:
+                        self.loss_fn.off_penalty_weight = base_off
+
+                # 事件期聚焦权重课程式提升（peak/edge/derivative/shape）
+                def _ramp(cur_ep: int, start: int, ramp: int, base_w: float, target_w: float) -> float:
+                    if cur_ep < start:
+                        return base_w
+                    if ramp <= 0:
+                        return target_w
+                    t = min(max(cur_ep - start + 1, 0), ramp)
+                    frac = float(t) / float(ramp)
+                    return base_w + (target_w - base_w) * frac
+
+                cur_ep = int(self.current_epoch)
+                # peak
+                p_start = int(getattr(loss_cfg, 'peak_ramp_start', 0))
+                p_ramp = int(getattr(loss_cfg, 'peak_ramp_epochs', 0))
+                p_target = float(getattr(loss_cfg, 'peak_target_weight', self._base_loss_weights['peak_focus_weight']))
+                self.loss_fn.peak_focus_weight = _ramp(cur_ep, p_start, p_ramp, float(self._base_loss_weights['peak_focus_weight']), p_target)
+                # edge
+                e_start = int(getattr(loss_cfg, 'edge_ramp_start', 0))
+                e_ramp = int(getattr(loss_cfg, 'edge_ramp_epochs', 0))
+                e_target = float(getattr(loss_cfg, 'edge_target_weight', self._base_loss_weights['edge_focus_weight']))
+                self.loss_fn.edge_focus_weight = _ramp(cur_ep, e_start, e_ramp, float(self._base_loss_weights['edge_focus_weight']), e_target)
+                # derivative
+                d_start = int(getattr(loss_cfg, 'derivative_ramp_start', 0))
+                d_ramp = int(getattr(loss_cfg, 'derivative_ramp_epochs', 0))
+                d_target = float(getattr(loss_cfg, 'derivative_target_weight', self._base_loss_weights['derivative_loss_weight']))
+                self.loss_fn.derivative_loss_weight = _ramp(cur_ep, d_start, d_ramp, float(self._base_loss_weights['derivative_loss_weight']), d_target)
+                # shape
+                s_start = int(getattr(loss_cfg, 'shape_ramp_start', 0))
+                s_ramp = int(getattr(loss_cfg, 'shape_ramp_epochs', 0))
+                s_target = float(getattr(loss_cfg, 'shape_target_weight', self._base_loss_weights['shape_loss_weight']))
+                self.loss_fn.shape_loss_weight = _ramp(cur_ep, s_start, s_ramp, float(self._base_loss_weights['shape_loss_weight']), s_target)
+                # active boost (提升事件期损失贡献)
+                ab_target = float(getattr(loss_cfg, 'active_boost_target', self._base_loss_weights['active_boost_weight']))
+                ab_start = int(getattr(loss_cfg, 'active_boost_start_epoch', 0))
+                ab_ramp = int(getattr(loss_cfg, 'active_boost_ramp_epochs', 0))
+                self.loss_fn.active_boost_weight = _ramp(cur_ep, ab_start, ab_ramp, float(self._base_loss_weights['active_boost_weight']), ab_target)
+                self.classification_enabled = bool(self.loss_fn.classification_weight > 0.0)
+                self._safe_log('train/schedule/regression_weight', self.loss_fn.regression_weight, on_step=False, on_epoch=True)
+                self._safe_log('train/schedule/classification_weight', self.loss_fn.classification_weight, on_step=False, on_epoch=True)
+                self._safe_log('train/schedule/unknown_weight', self.loss_fn.unknown_weight, on_step=False, on_epoch=True)
+                self._safe_log('train/schedule/conservation_weight', self.loss_fn.conservation_weight, on_step=False, on_epoch=True)
+                self._safe_log('train/schedule/off_penalty_weight', getattr(self.loss_fn, 'off_penalty_weight', 0.0), on_step=False, on_epoch=True)
+                self._safe_log('train/schedule/peak_focus_weight', getattr(self.loss_fn, 'peak_focus_weight', 0.0), on_step=False, on_epoch=True)
+                self._safe_log('train/schedule/edge_focus_weight', getattr(self.loss_fn, 'edge_focus_weight', 0.0), on_step=False, on_epoch=True)
+                self._safe_log('train/schedule/derivative_loss_weight', getattr(self.loss_fn, 'derivative_loss_weight', 0.0), on_step=False, on_epoch=True)
+                self._safe_log('train/schedule/shape_loss_weight', getattr(self.loss_fn, 'shape_loss_weight', 0.0), on_step=False, on_epoch=True)
+                self._safe_log('train/schedule/active_boost_weight', getattr(self.loss_fn, 'active_boost_weight', 0.0), on_step=False, on_epoch=True)
         except Exception:
             pass
 
@@ -1087,28 +1274,30 @@ class NILMLightningModule(pl.LightningModule):
     def configure_optimizers(self) -> Dict[str, Any]:
         """配置优化器和学习率调度器"""
         # 优化器 - 使用更保守的学习率
-        if self.config.training.optimizer.name == 'adamw':
+        if getattr(getattr(getattr(self.config, 'training', None), 'optimizer', None), 'name', 'adamw') == 'adamw':
             optimizer = torch.optim.AdamW(
                 self.parameters(),
-                lr=min(self.config.training.optimizer.lr, 1e-4),  # 限制最大学习率
-                weight_decay=self.config.training.optimizer.weight_decay,
-                betas=self.config.training.optimizer.betas,
-                eps=1e-8  # 数值稳定性
+                lr=float(getattr(getattr(getattr(self.config, 'training', None), 'optimizer', None), 'lr', 1e-3)),
+                weight_decay=float(getattr(getattr(getattr(self.config, 'training', None), 'optimizer', None), 'weight_decay', 0.01)),
+                betas=getattr(getattr(getattr(self.config, 'training', None), 'optimizer', None), 'betas', (0.9, 0.999)),
+                eps=1e-8
             )
-        elif self.config.training.optimizer.name == 'adam':
+        elif getattr(getattr(getattr(self.config, 'training', None), 'optimizer', None), 'name', 'adamw') == 'adam':
             optimizer = torch.optim.Adam(
                 self.parameters(),
-                lr=min(self.config.training.optimizer.lr, 1e-4),  # 限制最大学习率
-                weight_decay=self.config.training.optimizer.weight_decay,
-                eps=1e-8  # 数值稳定性
+                lr=float(getattr(getattr(getattr(self.config, 'training', None), 'optimizer', None), 'lr', 1e-3)),
+                weight_decay=float(getattr(getattr(getattr(self.config, 'training', None), 'optimizer', None), 'weight_decay', 0.01)),
+                eps=1e-8
             )
         else:
-            raise ValueError(f"Unknown optimizer: {self.config.training.optimizer.name}")
+            name = getattr(getattr(getattr(self.config, 'training', None), 'optimizer', None), 'name', 'adamw')
+            if name not in ('adamw', 'adam'):
+                raise ValueError(f"Unknown optimizer: {name}")
         
         # 学习率调度器
-        scheduler_config = self.config.training.scheduler
+        scheduler_config = getattr(getattr(self.config, 'training', None), 'scheduler', None)
         
-        if scheduler_config.name == 'cosine':
+        if getattr(scheduler_config, 'name', 'none') == 'cosine':
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
                 T_max=scheduler_config.T_max,
@@ -1122,7 +1311,7 @@ class NILMLightningModule(pl.LightningModule):
                     'frequency': 1
                 }
             }
-        elif scheduler_config.name == 'reduce_on_plateau':
+        elif getattr(scheduler_config, 'name', 'none') == 'reduce_on_plateau':
             # 让调度器监控与回调一致的指标与模式
             es_cfg = getattr(self.config.training, 'early_stopping', None)
             ckpt_cfg = getattr(self.config.training, 'checkpoint', None)
@@ -1314,24 +1503,38 @@ class NILMLightningModule(pl.LightningModule):
         
         # 模型检查点
         ckpt_monitor = 'val/loss'
-        # 使用安全的文件名（不依赖指标占位，避免层级名导致格式错误）
+        try:
+            dirpath = getattr(getattr(getattr(self.config, 'training', None), 'checkpoint', None), 'dirpath', str(Path('outputs')/ 'checkpoints'))
+            save_top_k = int(getattr(getattr(getattr(self.config, 'training', None), 'checkpoint', None), 'save_top_k', 1))
+        except Exception:
+            dirpath = str(Path('outputs') / 'checkpoints')
+            save_top_k = 1
         checkpoint_callback = ModelCheckpoint(
-            dirpath=self.config.training.checkpoint.dirpath,
+            dirpath=dirpath,
             filename='epoch{epoch:02d}',
             monitor=ckpt_monitor,
             mode='min',
-            save_top_k=self.config.training.checkpoint.save_top_k,
+            save_top_k=save_top_k,
             save_last=True,
             verbose=True
         )
         callbacks.append(checkpoint_callback)
         
         # 早停
-        if self.config.training.early_stopping.enable:
+        try:
+            es_cfg = getattr(getattr(self.config, 'training', None), 'early_stopping', None)
+            enable_es = bool(getattr(es_cfg, 'enable', False))
+        except Exception:
+            enable_es = False
+        if enable_es:
+            try:
+                patience = int(getattr(es_cfg, 'patience', 10))
+            except Exception:
+                patience = 10
             es_monitor = 'val/loss'
             early_stopping = EarlyStopping(
                 monitor=es_monitor,
-                patience=self.config.training.early_stopping.patience,
+                patience=patience,
                 mode='min',
                 verbose=True
             )
@@ -1342,7 +1545,7 @@ class NILMLightningModule(pl.LightningModule):
         callbacks.append(lr_monitor)
         
         # 设备状态监控
-        if self.config.training.monitor_device_stats:
+        if bool(getattr(getattr(self.config, 'training', None), 'monitor_device_stats', False)):
             device_stats = DeviceStatsMonitor()
             callbacks.append(device_stats)
         
@@ -1411,13 +1614,13 @@ def create_trainer(config: DictConfig, logger: Optional[pl.loggers.Logger] = Non
         devices=devices,
         strategy=strategy,
         precision=precision,
-        max_epochs=config.training.max_epochs,
-        min_epochs=config.training.min_epochs,
-        gradient_clip_val=min(config.training.gradient_clip_val, 1.0),  # 限制梯度裁剪值
+        max_epochs=getattr(getattr(config, 'training', None), 'max_epochs', 10),
+        min_epochs=getattr(getattr(config, 'training', None), 'min_epochs', 1),
+        gradient_clip_val=min(getattr(getattr(config, 'training', None), 'gradient_clip_val', 0.5), 1.0),  # 限制梯度裁剪值
         gradient_clip_algorithm='norm',  # 使用L2范数裁剪
-        accumulate_grad_batches=config.training.accumulate_grad_batches,
-        check_val_every_n_epoch=config.training.check_val_every_n_epoch,
-        log_every_n_steps=config.training.log_every_n_steps,
+        accumulate_grad_batches=getattr(getattr(config, 'training', None), 'accumulate_grad_batches', 1),
+        check_val_every_n_epoch=getattr(getattr(config, 'training', None), 'check_val_every_n_epoch', 1),
+        log_every_n_steps=getattr(getattr(config, 'training', None), 'log_every_n_steps', 50),
         enable_checkpointing=True,
         enable_progress_bar=True,
         enable_model_summary=True,
@@ -1440,29 +1643,66 @@ def setup_logging(config: DictConfig, experiment_name: str) -> TensorBoardLogger
     if isinstance(version, str) and version.strip().lower() in {'stable', 'default', ''}:
         version = None
 
-    logger = TensorBoardLogger(
-        save_dir=config.logging.save_dir,
-        name=experiment_name,
-        version=version,
-        default_hp_metric=False
-    )
+    try:
+        logger = TensorBoardLogger(
+            save_dir=config.logging.save_dir,
+            name=experiment_name,
+            version=version,
+            default_hp_metric=False
+        )
+    except Exception as e:
+        try:
+            from pytorch_lightning.loggers import CSVLogger
+            logger = CSVLogger(save_dir=config.logging.save_dir, name=experiment_name, version=version)
+            print(f"[警告] TensorBoard 不可用，已回退到 CSVLogger：{e}")
+        except Exception as e2:
+            print(f"[警告] 所有日志器初始化失败，将禁用训练日志：{e2}")
+            class _NullLogger:
+                def __init__(self):
+                    self.experiment = type('E', (), {'add_scalar': lambda *args, **kwargs: None, 'add_histogram': lambda *args, **kwargs: None})()
+                def log_hyperparams(self, *args, **kwargs):
+                    pass
+            logger = _NullLogger()
     
-    # 记录超参数到TensorBoard
+    # 记录超参数到TensorBoard（容错）
+    try:
+        lr_val = float(getattr(getattr(getattr(config, 'training', None), 'optimizer', None), 'lr', 1e-4))
+    except Exception:
+        lr_val = 1e-4
+    try:
+        max_epochs = int(getattr(getattr(config, 'training', None), 'max_epochs', 10))
+    except Exception:
+        max_epochs = 10
+    try:
+        opt_name = str(getattr(getattr(getattr(config, 'training', None), 'optimizer', None), 'name', 'adamw'))
+    except Exception:
+        opt_name = 'adamw'
+    try:
+        prec = getattr(getattr(config, 'training', None), 'precision', '16-mixed')
+    except Exception:
+        prec = '16-mixed'
+    try:
+        sched_name = str(getattr(getattr(getattr(config, 'training', None), 'scheduler', None), 'name', 'none'))
+    except Exception:
+        sched_name = 'none'
     hparams = {
-        'learning_rate': config.training.optimizer.lr,
-        'batch_size': config.data.batch_size,
-        'max_epochs': config.training.max_epochs,
-        'model_d_model': config.model.d_model,
-        'model_n_heads': config.model.n_heads,
-        'model_num_layers': config.model.num_layers,
-        'dropout': config.model.dropout,
-        'precision': config.training.precision if hasattr(config.training, 'precision') else '16-mixed',
-        'optimizer_type': config.training.optimizer.name,
-        'scheduler_type': config.training.scheduler.name if hasattr(config.training, 'scheduler') else 'none'
+        'learning_rate': lr_val,
+        'batch_size': int(getattr(getattr(config, 'data', None), 'batch_size', 32)),
+        'max_epochs': max_epochs,
+        'model_d_model': getattr(getattr(config, 'model', None), 'd_model', 32),
+        'model_n_heads': getattr(getattr(config, 'model', None), 'n_heads', getattr(getattr(config, 'model', None), 'num_heads', 4)),
+        'model_num_layers': getattr(getattr(config, 'model', None), 'num_layers', 4),
+        'dropout': getattr(getattr(config, 'model', None), 'dropout', 0.1),
+        'precision': prec,
+        'optimizer_type': opt_name,
+        'scheduler_type': sched_name,
     }
     
     # 记录超参数
-    logger.log_hyperparams(hparams)
+    try:
+        logger.log_hyperparams(hparams)
+    except Exception:
+        pass
     
     return logger
 
@@ -1495,7 +1735,7 @@ def _detect_dataset_dir(prepared_dir: Path) -> Tuple[Path, str]:
 
 def load_device_info(config: DictConfig) -> Tuple[Dict, List[str]]:
     """加载设备信息。
-    优先使用配置中的 data.device_names；若未提供，则尝试从 Data/prepared/device_name_to_id.json 推断。
+    若 prepared_dir 下存在设备映射文件，则优先使用该映射；否则回退到配置中的 data.device_names。
     """
     # 推断 prepared 数据目录
     try:
@@ -1503,51 +1743,48 @@ def load_device_info(config: DictConfig) -> Tuple[Dict, List[str]]:
     except Exception:
         prepared_dir = Path('Data/prepared')
 
-    # 若配置显式提供了设备名称，则直接使用（用于测试/最小配置场景）
-    try:
-        cfg_names = list(getattr(getattr(config, 'data', {}), 'device_names', []) or [])
-    except Exception:
-        cfg_names = []
-    if cfg_names:
-        device_names: List[str] = cfg_names
-    else:
-        mapping_path = prepared_dir / 'device_name_to_id.json'
-        device_names: List[str] = []
-        # 若存在映射文件，按 id 顺序解析设备名称
-        if mapping_path.exists():
-            try:
-                with open(mapping_path, 'r', encoding='utf-8') as f:
-                    mapping = json.load(f)
+    mapping_path = prepared_dir / 'device_name_to_id.json'
+    device_names: List[str] = []
+    # 优先使用映射文件
+    if mapping_path.exists():
+        try:
+            with open(mapping_path, 'r', encoding='utf-8') as f:
+                mapping = json.load(f)
 
-                def _to_int(x):
-                    try:
-                        return int(x)
-                    except Exception:
-                        return None
+            def _to_int(x):
+                try:
+                    return int(x)
+                except Exception:
+                    return None
 
-                sample_key = next(iter(mapping.keys()))
-                sample_val = mapping[sample_key]
-                key_is_int_like = _to_int(sample_key) is not None
-                val_is_int_like = _to_int(sample_val) is not None
+            sample_key = next(iter(mapping.keys()))
+            sample_val = mapping[sample_key]
+            key_is_int_like = _to_int(sample_key) is not None
+            val_is_int_like = _to_int(sample_val) is not None
 
-                if key_is_int_like and not val_is_int_like:
-                    # id(str)->name(str)
-                    pairs = sorted(((int(k), v) for k, v in mapping.items()), key=lambda kv: kv[0])
-                    device_names = [name for _, name in pairs]
-                elif not key_is_int_like and val_is_int_like:
-                    # name->id
-                    pairs = sorted(((v, k) for k, v in mapping.items()), key=lambda kv: kv[0])
-                    device_names = [name for _, name in pairs]
-                else:
-                    # 回退：按键排序
-                    device_names = sorted(list(mapping.keys()))
-            except Exception as e:
-                print(f"[警告] 解析 {mapping_path} 失败，回退到默认设备名称：{e}")
+            if key_is_int_like and not val_is_int_like:
+                # id(str)->name(str)
+                pairs = sorted(((int(k), v) for k, v in mapping.items()), key=lambda kv: kv[0])
+                device_names = [name for _, name in pairs]
+            elif not key_is_int_like and val_is_int_like:
+                # name->id
+                pairs = sorted(((v, k) for k, v in mapping.items()), key=lambda kv: kv[0])
+                device_names = [name for _, name in pairs]
+            else:
+                # 回退：按键排序
+                device_names = sorted(list(mapping.keys()))
+        except Exception as e:
+            print(f"[警告] 解析 {mapping_path} 失败：{e}")
 
-        # 若仍为空，构造占位名称
-        if not device_names:
-            device_names = ['device_1']
-            print('[警告] 未能推断设备名称，使用占位 device_1')
+    # 回退到配置中的 data.device_names
+    if not device_names:
+        try:
+            cfg_names = list(getattr(getattr(config, 'data', {}), 'device_names', []) or [])
+        except Exception:
+            cfg_names = []
+        device_names = cfg_names if cfg_names else ['device_1']
+        if not cfg_names:
+            print('[警告] 未能从配置或映射推断设备名称，使用占位 device_1')
 
     # 构造设备信息字典（默认值，后续会由数据模块注入 pos_weight 等）
     device_info: Dict[int, Dict[str, Any]] = {}

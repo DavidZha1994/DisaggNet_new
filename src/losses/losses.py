@@ -32,7 +32,7 @@ class NILMLoss:
         self.regression_weight = float(cfg.get("regression_weight", 1.0))
         self.classification_weight = float(cfg.get("classification_weight", 1.0))
         self.conservation_weight = float(cfg.get("conservation_weight", 0.0))
-        self.unknown_weight = float(cfg.get("unknown_weight", 0.0))
+        self.unknown_weight = float(cfg.get("unknown_weight", 0.3))
         self.unknown_match_weight = float(cfg.get("unknown_match_weight", 1.0))
         self.unknown_l1_penalty = float(cfg.get("unknown_l1_penalty", 0.1))
         self.huber_delta = float(cfg.get("huber_delta", 1.0))
@@ -43,6 +43,16 @@ class NILMLoss:
         # 相对误差权重与激活增强权重，提高模型对事件期的学习强度
         self.rel_loss_weight = float(cfg.get("rel_loss_weight", 1.5))
         self.active_boost_weight = float(cfg.get("active_boost_weight", 2.0))
+        self.peak_focus_top_p = float(cfg.get("peak_focus_top_p", 0.1))
+        self.peak_focus_weight = float(cfg.get("peak_focus_weight", 0.8))
+        self.shape_loss_weight = float(cfg.get("shape_loss_weight", 0.5))
+        self.derivative_loss_weight = float(cfg.get("derivative_loss_weight", 0.6))
+        self.edge_focus_weight = float(cfg.get("edge_focus_weight", 0.6))
+        self.edge_focus_thr_rel = float(cfg.get("edge_focus_thr_rel", 0.05))
+        ms = cfg.get("multiscale_shapes", [2, 4, 8])
+        self.multiscales = [int(v) for v in (ms if isinstance(ms, (list, tuple)) else [2,4,8])]
+        self.consistency_weight = float(cfg.get("consistency_weight", 0.0))
+        self.nonneg_penalty_weight = float(cfg.get("nonneg_penalty_weight", 0.2))
         # 稀有设备活跃期加权：根据训练集中该设备的阳性比例 p_k 进行增强
         # device_weight = (1 / (p_k + eps)) ** rare_active_alpha，乘以 rare_active_floor 作为下限系数
         self.rare_active_alpha = float(cfg.get("rare_active_alpha", 0.0))
@@ -80,8 +90,8 @@ class NILMLoss:
         return scale
 
     def regression_seq_loss(self, pred_seq: torch.Tensor, target_seq: torch.Tensor,
-                             status_seq: Optional[torch.Tensor], valid_mask: Optional[torch.Tensor],
-                             power_scale: Optional[torch.Tensor]) -> torch.Tensor:
+                            status_seq: Optional[torch.Tensor], valid_mask: Optional[torch.Tensor],
+                            power_scale: Optional[torch.Tensor]) -> torch.Tensor:
         """
         在相对刻度上计算 SmoothL1 + 激活时相对误差；并在关闭时添加抑制项。
         - pred_seq/target_seq: (B, L, K)
@@ -94,6 +104,7 @@ class NILMLoss:
         scale = self._ensure_scale(power_scale, device, K)
         pred_n = pred_seq / scale
         target_n = target_seq / scale
+        use_norm = bool(self.normalize_per_device)
 
         # 有效掩码
         valid = valid_mask if isinstance(valid_mask, torch.Tensor) else torch.isfinite(pred_n) & torch.isfinite(target_n)
@@ -105,39 +116,142 @@ class NILMLoss:
             p = torch.clamp(self.prior_p_vec.to(device), min=1e-6).view(1, 1, -1)
             device_weight = torch.pow(1.0 / p, self.rare_active_alpha) * float(self.rare_active_floor)
 
-        # SmoothL1（Huber）在相对刻度
-        delta = self.huber_delta
-        resid = torch.abs(pred_n - target_n)
-        huber_el = torch.where(resid < delta, 0.5 * resid ** 2, delta * (resid - 0.5 * delta))
-        # 激活增强：在设备开关状态为1时，放大损失贡献，避免“全零预测但损失很小”的现象
-        if isinstance(status_seq, torch.Tensor):
-            boost = 1.0 + self.active_boost_weight * device_weight * torch.clamp(status_seq, min=0.0, max=1.0)
-            huber_el = huber_el * boost
-        huber_el = torch.where(valid, huber_el, torch.zeros_like(huber_el))
-        denom = valid.float().sum().clamp_min(1.0)
-        huber_loss = huber_el.sum() / denom
+        if use_norm:
+            delta = self.huber_delta
+            resid = torch.abs(pred_n - target_n)
+            huber_el = torch.where(resid < delta, 0.5 * resid ** 2, delta * (resid - 0.5 * delta))
+            if isinstance(status_seq, torch.Tensor):
+                boost = 1.0 + self.active_boost_weight * device_weight * torch.clamp(status_seq, min=0.0, max=1.0)
+                huber_el = huber_el * boost
+            huber_el = torch.where(valid, huber_el, torch.zeros_like(huber_el))
+            denom = valid.float().sum().clamp_min(1.0)
+            huber_loss = huber_el.sum() / denom
+        else:
+            eps = 1e-6
+            valid_f = valid.float()
+            active = (target_seq > eps).float()
+            try:
+                q = torch.quantile(target_seq, q=0.90, dim=1, keepdim=True)
+            except Exception:
+                topk = max(1, int(L * 0.1))
+                vals, idx = torch.topk(target_seq, k=topk, dim=1)
+                mask_peak = torch.zeros_like(target_seq, dtype=torch.bool)
+                mask_peak.scatter_(1, idx, True)
+                q = torch.where(mask_peak, target_seq, torch.zeros_like(target_seq)).max(dim=1, keepdim=True)[0]
+            peak_mask = (target_seq >= q).float()
+            w = 0.1 + float(self.active_boost_weight) * active + float(self.peak_focus_weight) * peak_mask
+            w = w * valid_f
+            mse = (pred_seq - target_seq) ** 2
+            huber_loss = (mse * w).sum() / w.sum().clamp_min(1.0)
 
-        # 激活门控下的相对误差（仅在 target_n 大于阈值时计算）
-        rel_thr = self.active_threshold_rel
-        act_mask = (target_n > rel_thr) & valid
-        rel_err = torch.abs(pred_n - target_n) / (target_n.abs() + 1e-6)
-        if isinstance(status_seq, torch.Tensor):
-            boost = 1.0 + self.active_boost_weight * device_weight * torch.clamp(status_seq, min=0.0, max=1.0)
-            rel_err = rel_err * boost
-        rel_err = torch.where(act_mask, rel_err, torch.zeros_like(rel_err))
-        denom_rel = act_mask.float().sum().clamp_min(1.0)
-        rel_loss = rel_err.sum() / denom_rel
+        if use_norm:
+            rel_thr = self.active_threshold_rel
+            act_mask = (target_n > rel_thr) & valid
+            rel_err = torch.abs(pred_n - target_n) / (target_n.abs() + 1e-6)
+            if isinstance(status_seq, torch.Tensor):
+                boost = 1.0 + self.active_boost_weight * device_weight * torch.clamp(status_seq, min=0.0, max=1.0)
+                rel_err = rel_err * boost
+            rel_err = torch.where(act_mask, rel_err, torch.zeros_like(rel_err))
+            denom_rel = act_mask.float().sum().clamp_min(1.0)
+            rel_loss = rel_err.sum() / denom_rel
+        else:
+            rel_loss = torch.tensor(0.0, device=device)
 
         # 关闭抑制项：当 status==0 且目标功率接近零时惩罚过高的预测（避免误抑制基线）
         off_pen = torch.tensor(0.0, device=device)
         if isinstance(status_seq, torch.Tensor):
             off_mask = (status_seq <= 0.5) & valid & (target_n <= float(self.off_penalty_rel_threshold))
             # 在原始刻度下惩罚预测值（L1，使用非负幅值避免负损失）
-            off_mag = torch.where(off_mask, torch.relu(pred_seq), torch.zeros_like(pred_seq))
+            off_mag = torch.where(off_mask, torch.abs(pred_seq), torch.zeros_like(pred_seq))
             denom_off = off_mask.float().sum().clamp_min(1.0)
             off_pen = off_mag.sum() / denom_off
 
-        return huber_loss + self.rel_loss_weight * rel_loss + self.off_penalty_weight * off_pen
+        peak = torch.tensor(0.0, device=device)
+        if use_norm:
+            if self.peak_focus_weight > 0.0:
+                topk = max(1, int(L * max(min(self.peak_focus_top_p, 0.5), 0.0)))
+                if topk > 0:
+                    if isinstance(status_seq, torch.Tensor):
+                        act = torch.clamp(status_seq, min=0.0, max=1.0)
+                    else:
+                        act = torch.ones_like(target_n)
+                    valid_peak = valid & (act > 0.5)
+                    vals, idx = torch.topk(target_n, k=topk, dim=1)
+                    mask_peak = torch.zeros_like(target_n, dtype=torch.bool)
+                    mask_peak.scatter_(1, idx, True)
+                    mask_peak = mask_peak & valid_peak
+                    err_peak = torch.abs(pred_n - target_n)
+                    err_peak = torch.where(mask_peak, err_peak, torch.zeros_like(err_peak))
+                    denom_peak = mask_peak.float().sum().clamp_min(1.0)
+                    peak = err_peak.sum() / denom_peak
+        shape = torch.tensor(0.0, device=device)
+        if use_norm:
+            if self.shape_loss_weight > 0.0:
+                t_mean = target_n.mean(dim=1, keepdim=True)
+                p_mean = pred_n.mean(dim=1, keepdim=True)
+                t0 = target_n - t_mean
+                p0 = pred_n - p_mean
+                t_norm = torch.sqrt((t0 ** 2).sum(dim=1, keepdim=True) + 1e-6)
+                p_norm = torch.sqrt((p0 ** 2).sum(dim=1, keepdim=True) + 1e-6)
+                t_hat = t0 / t_norm
+                p_hat = p0 / p_norm
+                act_mask = (target_n > float(self.active_threshold_rel)) & valid
+                m = act_mask.float()
+                dot = (p_hat * t_hat * m).sum(dim=1)
+                den = m.sum(dim=1).clamp_min(1.0)
+                cos = dot / den
+                base_shape = (1.0 - cos).mean()
+                ms_shape = torch.tensor(0.0, device=device)
+                for s in self.multiscales:
+                    if s <= 1 or s > L:
+                        continue
+                    tn = t_hat.transpose(1,2).contiguous()
+                    pn = p_hat.transpose(1,2).contiguous()
+                    pad = s // 2
+                    tn = torch.nn.functional.avg_pool1d(tn, kernel_size=s, stride=1, padding=pad)
+                    pn = torch.nn.functional.avg_pool1d(pn, kernel_size=s, stride=1, padding=pad)
+                    tn = tn.transpose(1,2)
+                    pn = pn.transpose(1,2)
+                    tn = tn[:, :L, :]
+                    pn = pn[:, :L, :]
+                    dot_s = (pn * tn * m).sum(dim=1)
+                    den_s = m.sum(dim=1).clamp_min(1.0)
+                    cos_s = dot_s / den_s
+                    ms_shape = ms_shape + (1.0 - cos_s).mean()
+                shape = base_shape + 0.5 * ms_shape
+        der = torch.tensor(0.0, device=device)
+        edge = torch.tensor(0.0, device=device)
+        if use_norm:
+            if self.derivative_loss_weight > 0.0 or self.edge_focus_weight > 0.0:
+                dp = pred_n[:,1:,:] - pred_n[:,:-1,:]
+                dt = target_n[:,1:,:] - target_n[:,:-1,:]
+                v1 = valid[:,1:,:] & valid[:,:-1,:]
+                act1 = (target_n[:,1:,:] > float(self.active_threshold_rel)) | (target_n[:,:-1,:] > float(self.active_threshold_rel))
+                mask1 = v1 & act1
+                der_err = torch.abs(dp - dt)
+                der = (der_err * mask1.float()).sum() / mask1.float().sum().clamp_min(1.0)
+                thr = float(self.edge_focus_thr_rel)
+                edge_mask = (torch.abs(dt) > thr) & mask1
+                edge_err = torch.abs(dp - dt)
+                edge = (edge_err * edge_mask.float()).sum() / edge_mask.float().sum().clamp_min(1.0)
+        else:
+            dp = pred_seq[:,1:,:] - pred_seq[:,:-1,:]
+            dt = target_seq[:,1:,:] - target_seq[:,:-1,:]
+            d_err = torch.abs(dp - dt)
+            beta = float(self.huber_delta)
+            huber_d = torch.where(d_err < beta, 0.5 * (d_err ** 2) / beta, d_err - 0.5 * beta)
+            thr_rel = float(self.edge_focus_thr_rel)
+            thr = (scale.squeeze(0) * thr_rel).view(1, 1, -1)
+            edge_mask = (torch.abs(dt) >= thr).float()
+            v1 = valid.float()[:,1:,:] * valid.float()[:,:-1,:]
+            w_d = (v1) * ((target_seq[:, :-1, :] > 0).float() + (target_seq[:, 1:, :] > 0).float() + float(self.edge_focus_weight) * edge_mask)
+            der = (huber_d * w_d).sum() / w_d.sum().clamp_min(1.0)
+        neg_mag = torch.relu(-pred_seq)
+        nonneg = (neg_mag / scale.squeeze(0)).mean()
+        if use_norm:
+            return huber_loss + self.rel_loss_weight * rel_loss + self.off_penalty_weight * off_pen + self.peak_focus_weight * peak + self.shape_loss_weight * shape + self.derivative_loss_weight * der + self.edge_focus_weight * edge + float(self.nonneg_penalty_weight) * nonneg
+        else:
+            return huber_loss + float(self.derivative_loss_weight) * der + float(self.edge_focus_weight) * edge + float(self.nonneg_penalty_weight) * nonneg
 
     def regression_seq_loss_per_device(self, pred_seq: torch.Tensor, target_seq: torch.Tensor,
                                        status_seq: Optional[torch.Tensor], valid_mask: Optional[torch.Tensor],
@@ -185,7 +299,7 @@ class NILMLoss:
         off_pen_k = torch.zeros(K, device=device)
         if isinstance(status_seq, torch.Tensor):
             off_mask = (status_seq <= 0.5) & valid
-            off_mag = torch.where(off_mask, torch.relu(pred_seq), torch.zeros_like(pred_seq))
+            off_mag = torch.where(off_mask, torch.abs(pred_seq), torch.zeros_like(pred_seq))
             denom_off = off_mask.float().sum(dim=(0, 1)).clamp_min(1.0)
             off_pen_k = off_mag.sum(dim=(0, 1)) / denom_off
 
@@ -294,21 +408,45 @@ class NILMLoss:
         denom = valid.float().sum(dim=(0, 1)).clamp_min(1.0)  # (K,)
         return el.sum(dim=(0, 1)) / denom
 
-    def conservation_loss(self, mains_seq: Optional[torch.Tensor], pred_seq: torch.Tensor) -> torch.Tensor:
-        """窗口级能量守恒：设备和的时间均值与总功率代表值接近（相对误差）。
-        注意：此守恒项不包含未知残差，未知残差由 unknown_residual_loss 处理。
+    def conservation_loss(self, mains_seq: Optional[torch.Tensor], pred_seq: torch.Tensor,
+                          target_seq: Optional[torch.Tensor] = None,
+                          power_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """窗口级能量守恒（逐时间步）：设备和应接近主功率。
+        - 仅在“已知设备确实活跃”的时间步强化约束，避免长时间背景期把序列拉平。
+        - 活跃判断：若提供 `target_seq`，在相对刻度上对 \sum_k target_seq[:,t,k] 做阈值门控；否则以 mains 强度门控。
         """
         if not isinstance(mains_seq, torch.Tensor):
             return torch.tensor(0.0, device=pred_seq.device)
+        B, L, K = pred_seq.size(0), pred_seq.size(1), pred_seq.size(2)
+        # 逐时间步设备总和
         sum_per_t = pred_seq.sum(dim=2)  # (B, L)
-        pred_total = sum_per_t.mean(dim=1, keepdim=True)  # (B, 1)
-        valid = torch.isfinite(pred_total) & torch.isfinite(mains_seq)
-        rel = torch.where(valid, torch.abs(pred_total - mains_seq) / (mains_seq.abs() + 1e-6), torch.zeros_like(mains_seq))
-        denom = valid.float().sum().clamp_min(1.0)
-        return rel.sum() / denom
+        # 合法性与数值稳定
+        valid = torch.isfinite(sum_per_t) & torch.isfinite(mains_seq)
+        # 活跃期掩码
+        active_mask = torch.ones_like(mains_seq, dtype=torch.bool)
+        try:
+            if isinstance(target_seq, torch.Tensor) and target_seq.numel() == (B * L * K):
+                device = pred_seq.device
+                scale = self._ensure_scale(power_scale, device, K)
+                target_n = target_seq.to(device) / scale  # (B,L,K)
+                sum_target_n = target_n.sum(dim=2)  # (B,L)
+                thr = float(self.active_threshold_rel)
+                active_mask = sum_target_n > thr
+            else:
+                # 回退：使用 mains 强度门控，避免噪声主导
+                active_mask = mains_seq.abs() > 1e-3
+        except Exception:
+            active_mask = mains_seq.abs() > 1e-3
+        mask = valid & active_mask
+        # 忽略接近零的主功率（避免除零与噪声主导）
+        denom = mains_seq.abs().clamp_min(1e-3)
+        rel_t = torch.where(mask, torch.abs(sum_per_t - mains_seq) / denom, torch.zeros_like(mains_seq))
+        # 仅在有效且活跃的时间步统计平均
+        denom_count = mask.float().sum().clamp_min(1.0)
+        return rel_t.sum() / denom_count
 
     def unknown_residual_loss(self, mains_seq: Optional[torch.Tensor], pred_seq: torch.Tensor,
-                               unknown_win: Optional[torch.Tensor]) -> torch.Tensor:
+                               unknown_win: Optional[torch.Tensor], status_seq: Optional[torch.Tensor] = None) -> torch.Tensor:
         """未知残差匹配：鼓励未知头拟合主功率中“未由设备解释的部分”，并对过度使用未知施加惩罚。
         - mains_seq: (B, L)
         - pred_seq: (B, L, K)
@@ -318,12 +456,15 @@ class NILMLoss:
         if not (isinstance(mains_seq, torch.Tensor) and isinstance(unknown_win, torch.Tensor)):
             return torch.tensor(0.0, device=pred_seq.device)
         B, L, K = pred_seq.size(0), pred_seq.size(1), pred_seq.size(2)
-        # 设备总功率的窗口均值
-        sum_per_t = pred_seq.sum(dim=2)              # (B, L)
-        dev_total = sum_per_t.mean(dim=1, keepdim=True)  # (B, 1)
-        mains_mean = mains_seq.mean(dim=1, keepdim=True) # (B, 1)
-        # 只拟合正的未解释残差（避免负残差导致未知吸收基线）
-        residual_target = torch.relu(mains_mean - dev_total)
+        sum_per_t = pred_seq.sum(dim=2)
+        if isinstance(status_seq, torch.Tensor) and status_seq.numel() == (B * L * K):
+            active_any = (status_seq > 0.5).any(dim=2)
+            off_mask = (~active_any).to(sum_per_t.dtype)
+            num = (torch.relu(mains_seq - sum_per_t) * off_mask).sum(dim=1, keepdim=True)
+            den = off_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+            residual_target = num / den
+        else:
+            residual_target = torch.relu(mains_seq.mean(dim=1, keepdim=True) - sum_per_t.mean(dim=1, keepdim=True))
         # 匹配损失：SmoothL1（窗口级）
         diff = torch.abs(unknown_win - residual_target)
         delta = self.huber_delta
@@ -332,6 +473,21 @@ class NILMLoss:
         # 使用惩罚抑制滥用未知：L1 强度（越小越好）
         penalty = torch.relu(unknown_win).mean()
         return self.unknown_match_weight * match + float(self.unknown_l1_penalty) * penalty
+
+    def consistency_window_loss(self, seq_pred: torch.Tensor, reg_win: Optional[torch.Tensor],
+                                valid_mask: Optional[torch.Tensor], power_scale: Optional[torch.Tensor]) -> torch.Tensor:
+        if reg_win is None:
+            return torch.tensor(0.0, device=seq_pred.device)
+        B, L, K = seq_pred.size(0), seq_pred.size(1), seq_pred.size(2)
+        device = seq_pred.device
+        scale = self._ensure_scale(power_scale, device, K)
+        valid = valid_mask if isinstance(valid_mask, torch.Tensor) else torch.isfinite(seq_pred)
+        m = valid.to(torch.float32)
+        num = (seq_pred * m).sum(dim=1)
+        den = m.sum(dim=1).clamp_min(1.0)
+        mean_seq = num / den
+        err = torch.abs((mean_seq - reg_win) / scale.squeeze(0))
+        return err.mean()
 
 
 def create_loss_function(cfg: Dict[str, Any]) -> NILMLoss:

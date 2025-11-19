@@ -245,7 +245,7 @@ def test_forward_seq_shapes_real(prepared_dir):
     else:
         batch = next(iter(dm.train_dataloader()))
 
-    seq_pred, reg_pred, cls_pred, unk_pred = lm.model.forward_seq(
+    seq_pred, reg_pred, cls_pred, unk_pred, cls_seq = lm.model.forward_seq(
         time_features=batch['time_features'],
         freq_features=batch.get('freq_features'),
         time_positional=None,

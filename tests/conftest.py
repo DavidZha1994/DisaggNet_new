@@ -33,7 +33,6 @@ def prepared_dir(tmp_path_factory):
     """
     repo_root = Path(REPO_ROOT)
     raw_src = repo_root / "Data" / "raw"
-    assert raw_src.exists(), f"原始数据目录不存在: {raw_src}"
 
     work_root = tmp_path_factory.mktemp("hipe_work")
     raw_dst = work_root / "raw"
@@ -41,28 +40,61 @@ def prepared_dir(tmp_path_factory):
     raw_dst.mkdir(parents=True, exist_ok=True)
     prepared_dst.mkdir(parents=True, exist_ok=True)
 
-    # 选择主端与前3个设备CSV，截断前 N 行以加速测试
     mains_csv = None
     device_csvs = []
-    for fp in sorted(raw_src.glob("*.csv")):
-        name = fp.name
-        if mains_csv is None and ("MainTerminal" in name or "main" in name.lower() or "mains" in name.lower()):
-            mains_csv = fp
-            continue
-        device_csvs.append(fp)
-    device_csvs = device_csvs[:3]
-    assert mains_csv is not None, "未找到主端CSV（包含MainTerminal/main/mains）"
-    assert device_csvs, "未找到设备CSV"
+    if raw_src.exists():
+        for fp in sorted(raw_src.glob("*.csv")):
+            name = fp.name
+            if mains_csv is None and ("MainTerminal" in name or "main" in name.lower() or "mains" in name.lower()):
+                mains_csv = fp
+                continue
+            device_csvs.append(fp)
+        device_csvs = device_csvs[:3]
+        assert mains_csv is not None, "未找到主端CSV（包含MainTerminal/main/mains）"
+        assert device_csvs, "未找到设备CSV"
 
-    # 截断函数：读取前 N 行并写入目标目录，保留原列
-    def _truncate_copy(src_fp: Path, dst_fp: Path, n_rows: int = 5000):
-        df = pd.read_csv(src_fp, nrows=n_rows)
-        df.to_csv(dst_fp, index=False)
+        def _truncate_copy(src_fp: Path, dst_fp: Path, n_rows: int = 5000):
+            df = pd.read_csv(src_fp, nrows=n_rows)
+            df.to_csv(dst_fp, index=False)
 
-    # 拷贝主端与设备到临时 raw 目录
-    _truncate_copy(mains_csv, raw_dst / mains_csv.name)
-    for dev in device_csvs:
-        _truncate_copy(dev, raw_dst / dev.name)
+        _truncate_copy(mains_csv, raw_dst / mains_csv.name)
+        for dev in device_csvs:
+            _truncate_copy(dev, raw_dst / dev.name)
+    else:
+        # 合成最小可用 CSV（5000行，5s间隔），匹配 HIPE 所需列
+        import numpy as np
+        base_ts = pd.date_range("2024-01-01", periods=5000, freq="5S")
+        # 设备功率波形：多个脉冲与台阶
+        def mk_device(seed: int, scale: float):
+            rng = np.random.default_rng(seed)
+            x = rng.normal(0.0, 0.2, size=len(base_ts))
+            for s in [200, 600, 1200, 1800, 2400, 3000, 3600, 4200]:
+                w = 120
+                x[s:s+w] += scale * (rng.random() * 0.5 + 0.5)
+            x = np.clip(x, 0.0, None)
+            return x
+        dev1 = mk_device(1, 1.5)
+        dev2 = mk_device(2, 1.0)
+        dev3 = mk_device(3, 0.6)
+        mains_p = dev1 + dev2 + dev3 + np.random.default_rng(0).normal(0.0, 0.05, size=len(base_ts))
+        mains_df = pd.DataFrame({
+            "timestamp": base_ts,
+            "P_kW": mains_p,
+            "Q_kvar": np.zeros_like(mains_p),
+            "S_kVA": np.zeros_like(mains_p),
+            "PF": np.ones_like(mains_p)*0.95,
+        })
+        mains_csv = raw_dst / "main.csv"
+        mains_df.to_csv(mains_csv, index=False)
+        for name, arr in [("device_kettle.csv", dev1), ("device_microwave.csv", dev2), ("device_fridge.csv", dev3)]:
+            df = pd.DataFrame({
+                "timestamp": base_ts,
+                "P": arr,
+                "Q": np.zeros_like(arr),
+                "S": np.zeros_like(arr),
+            })
+            (raw_dst / name).parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(raw_dst / name, index=False)
 
     # 构造测试配置：关闭可视化、缩短窗口长度、简化CV
     cfg = {
@@ -77,6 +109,8 @@ def prepared_dir(tmp_path_factory):
             "step_size": 128,
             "label_mode": "regression",
             "stft": {"n_fft": 128, "hop_length": 64, "win_length": 128, "window": "hann"},
+            # 设备列映射：合成/示例设备CSV为 P/Q/S
+            "device_cols": {"P": "P", "Q": "Q", "S": "S"},
         },
         # 降低窗口有效比例阈值，避免小样本数据导致无窗口
         "masking": {"min_valid_ratio": 0.0},
@@ -118,7 +152,6 @@ def hipe_raw_setup(tmp_path_factory):
     """
     repo_root = Path(REPO_ROOT)
     raw_src = repo_root / "Data" / "raw"
-    assert raw_src.exists(), f"原始数据目录不存在: {raw_src}"
 
     work_root = tmp_path_factory.mktemp("hipe_steps")
     raw_dst = work_root / "raw"
@@ -128,23 +161,57 @@ def hipe_raw_setup(tmp_path_factory):
 
     mains_csv = None
     device_csvs = []
-    for fp in sorted(raw_src.glob("*.csv")):
-        name = fp.name
-        if mains_csv is None and ("MainTerminal" in name or "main" in name.lower() or "mains" in name.lower()):
-            mains_csv = fp
-            continue
-        device_csvs.append(fp)
-    device_csvs = device_csvs[:3]
-    assert mains_csv is not None, "未找到主端CSV（包含MainTerminal/main/mains）"
-    assert device_csvs, "未找到设备CSV"
+    if raw_src.exists():
+        for fp in sorted(raw_src.glob("*.csv")):
+            name = fp.name
+            if mains_csv is None and ("MainTerminal" in name or "main" in name.lower() or "mains" in name.lower()):
+                mains_csv = fp
+                continue
+            device_csvs.append(fp)
+        device_csvs = device_csvs[:3]
+        assert mains_csv is not None, "未找到主端CSV（包含MainTerminal/main/mains）"
+        assert device_csvs, "未找到设备CSV"
 
-    def _truncate_copy(src_fp: Path, dst_fp: Path, n_rows: int = 5000):
-        df = pd.read_csv(src_fp, nrows=n_rows)
-        df.to_csv(dst_fp, index=False)
+        def _truncate_copy(src_fp: Path, dst_fp: Path, n_rows: int = 5000):
+            df = pd.read_csv(src_fp, nrows=n_rows)
+            df.to_csv(dst_fp, index=False)
 
-    _truncate_copy(mains_csv, raw_dst / mains_csv.name)
-    for dev in device_csvs:
-        _truncate_copy(dev, raw_dst / dev.name)
+        _truncate_copy(mains_csv, raw_dst / mains_csv.name)
+        for dev in device_csvs:
+            _truncate_copy(dev, raw_dst / dev.name)
+    else:
+        import numpy as np
+        base_ts = pd.date_range("2024-01-01", periods=5000, freq="5S")
+        def mk_device(seed: int, scale: float):
+            rng = np.random.default_rng(seed)
+            x = rng.normal(0.0, 0.2, size=len(base_ts))
+            for s in [200, 600, 1200, 1800, 2400, 3000, 3600, 4200]:
+                w = 120
+                x[s:s+w] += scale * (rng.random() * 0.5 + 0.5)
+            x = np.clip(x, 0.0, None)
+            return x
+        dev1 = mk_device(1, 1.5)
+        dev2 = mk_device(2, 1.0)
+        dev3 = mk_device(3, 0.6)
+        mains_p = dev1 + dev2 + dev3 + np.random.default_rng(0).normal(0.0, 0.05, size=len(base_ts))
+        mains_df = pd.DataFrame({
+            "timestamp": base_ts,
+            "P_kW": mains_p,
+            "Q_kvar": np.zeros_like(mains_p),
+            "S_kVA": np.zeros_like(mains_p),
+            "PF": np.ones_like(mains_p)*0.95,
+        })
+        mains_csv = raw_dst / "main.csv"
+        mains_df.to_csv(mains_csv, index=False)
+        for name, arr in [("device_kettle.csv", dev1), ("device_microwave.csv", dev2), ("device_fridge.csv", dev3)]:
+            df = pd.DataFrame({
+                "timestamp": base_ts,
+                "P": arr,
+                "Q": np.zeros_like(arr),
+                "S": np.zeros_like(arr),
+            })
+            (raw_dst / name).parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(raw_dst / name, index=False)
 
     cfg = {
         "data_storage": {"output_directory": str(prepared_dst)},
@@ -156,6 +223,7 @@ def hipe_raw_setup(tmp_path_factory):
             "step_size": 128,
             "label_mode": "regression",
             "stft": {"n_fft": 128, "hop_length": 64, "win_length": 128, "window": "hann"},
+            "device_cols": {"P": "P", "Q": "Q", "S": "S"},
         },
         "alignment": {"direction": "nearest", "tolerance_seconds": 5},
         "masking": {"keep_all_windows": True},

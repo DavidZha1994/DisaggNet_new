@@ -2,7 +2,7 @@ import torch
 from omegaconf import OmegaConf
 
 from src.models.fusion_transformer import FusionTransformer
-from src.losses.losses import UnifiedMultiTaskLoss, RECOMMENDED_LOSS_CONFIGS
+from src.losses.losses import create_loss_function
 from src.train import NILMLightningModule, load_device_info
 
 
@@ -132,43 +132,33 @@ def test_fusion_transformer_forward_with_embeddings_shapes():
     assert not torch.isnan(emb).any()
 
 
-def test_unified_multitask_loss_with_conservation():
-    n_devices = 2
-    loss_conf = RECOMMENDED_LOSS_CONFIGS.get('balanced', {}).copy()
-    # 覆盖以确保含守恒约束
-    loss_conf.update({
-        'classification_weight': 2.0,
+def test_multitask_losses_exist_and_scalar():
+    cfg = {
         'regression_weight': 1.0,
+        'classification_weight': 2.0,
         'conservation_weight': 0.5,
         'consistency_weight': 1.0,
         'focal_alpha': 0.25,
         'focal_gamma': 2.0,
         'huber_delta': 1.0,
-    })
-    loss_fn = UnifiedMultiTaskLoss(**loss_conf)
+    }
+    loss_fn = create_loss_function(cfg)
 
-    B = 4
-    pred_power = torch.rand(B, n_devices)
-    pred_switch = torch.rand(B, n_devices)
-    target_power = torch.rand(B, n_devices)
-    target_switch = torch.randint(0, 2, (B, n_devices)).float()
-    total_power = torch.rand(B, 1)
+    B, L, K = 4, 16, 2
+    pred_seq = torch.rand(B, L, K)
+    target_seq = torch.rand(B, L, K)
+    status_seq = torch.randint(0, 2, (B, L, K)).float()
+    valid_mask = torch.ones(B, L, K, dtype=torch.bool)
+    mains_seq = torch.rand(B, L)
+    scale = torch.tensor([100., 100.])
 
-    total_loss, details = loss_fn(
-        pred_power=pred_power,
-        pred_switch=pred_switch,
-        target_power=target_power,
-        target_switch=target_switch,
-        total_power=total_power,
-    )
+    reg = loss_fn.regression_seq_loss(pred_seq, target_seq, status_seq, valid_mask, scale)
+    cls = loss_fn.classification_seq_loss(pred_seq.clamp(0,1), status_seq, valid_mask)
+    cons = loss_fn.conservation_loss(mains_seq, pred_seq)
+    consw = loss_fn.consistency_window_loss(pred_seq, pred_seq.mean(dim=1), valid_mask, scale)
+    total = reg + cls + cons + consw
 
-    # 返回值检查
-    assert isinstance(total_loss, torch.Tensor)
-    assert 'regression' in details and 'classification' in details
-    assert 'conservation' in details and 'consistency' in details
-    assert 'total' in details
-    # 损失应为标量
-    for k, v in details.items():
+    for v in [reg, cls, cons, consw, total]:
         assert isinstance(v, torch.Tensor)
         assert v.dim() == 0
 

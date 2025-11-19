@@ -160,21 +160,32 @@ class UnifiedTrainingSystem:
         
         try:
             config = self.setup_environment(config_ref)
+            # 兼容缺失 training 节点的配置：动态填充最小必需项
+            if not hasattr(config, 'training') or getattr(config, 'training') is None:
+                from omegaconf import OmegaConf as _OC
+                config.training = _OC.create({
+                    'max_epochs': 10,
+                    'min_epochs': 1,
+                    'optimizer': {'name': 'adamw', 'lr': 1e-4},
+                    'checkpoint': {'dirpath': 'outputs/checkpoints', 'filename': 'epoch={epoch:02d}', 'monitor': 'val/loss', 'mode': 'min', 'save_top_k': 1},
+                })
             
             # 更新配置参数（支持嵌套项覆盖）
             for key, value in kwargs.items():
                 try:
                     if key == 'epochs':
-                        config.training.max_epochs = int(value)
+                        if hasattr(config, 'training'):
+                            config.training.max_epochs = int(value)
                         # 保证最小轮数不超过最大轮数
-                        if hasattr(config.training, 'min_epochs'):
+                        if hasattr(config, 'training') and hasattr(config.training, 'min_epochs'):
                             config.training.min_epochs = min(int(getattr(config.training, 'min_epochs', 1)), int(value))
                         logger.info(f"更新配置参数: training.max_epochs = {value}")
                     elif key == 'batch_size':
                         config.data.batch_size = int(value)
                         logger.info(f"更新配置参数: data.batch_size = {value}")
                     elif key == 'lr':
-                        config.training.optimizer.lr = float(value)
+                        if hasattr(config, 'training') and hasattr(config.training, 'optimizer'):
+                            config.training.optimizer.lr = float(value)
                         logger.info(f"更新配置参数: training.optimizer.lr = {value}")
                     else:
                         # 顶层兜底

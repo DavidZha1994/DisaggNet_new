@@ -222,12 +222,12 @@ class TimeEncoder(nn.Module):
 
         # 输入投影
         if self.use_conv_embed:
-            # (B, T, F) -> (B, F, T) -> Conv1d -> (B, d_model, T) -> (B, T, d_model)
             x = x.transpose(1, 2)
             x = self.input_projection(x)
             x = x.transpose(1, 2)
         else:
             x = self.input_projection(x)
+        x_raw = x
 
         # —— TokenStats：对投影后的序列做逐通道 z-标准化，并生成统计侧信息 ——
         # 计算均值与方差（时间维度）
@@ -235,7 +235,6 @@ class TimeEncoder(nn.Module):
         var = x.var(dim=1, unbiased=False)             # (B, d_model)
         var = torch.clamp(var, min=self.norm_eps)
         std = torch.sqrt(var)
-        # z-normalization（保留逐步信息）
         x = (x - mu.unsqueeze(1)) / (std.unsqueeze(1) + self.norm_eps)
         x = torch.nan_to_num(x)
 
@@ -254,7 +253,7 @@ class TimeEncoder(nn.Module):
             rpe_seq = self.time_rpe(time_features)  # (B, T, rpe_out_dim)
 
         # 拼接核心嵌入 + RPE + 统计侧信息 → 映射回 d_model
-        parts = [x, stats_seq]
+        parts = [x, stats_seq, x_raw]
         if rpe_seq is not None:
             parts.append(rpe_seq)
         concat = torch.cat(parts, dim=-1)  # (B, T, d_model + stats_out_dim + rpe_out_dim?)
@@ -277,56 +276,86 @@ class TimeEncoder(nn.Module):
 
 
 class FreqEncoder(nn.Module):
-    """频域编码器（轻量与高效，移除小型Transformer，仅保留Conv+Pool）"""
+    """频域编码器
+
+    输入：`x: (B, T_f, F_f)`，其中 `T_f` 为频域帧数，`F_f` 为频率bin数。
+    - 先对频率维做卷积/线性投射到 `proj_dim`
+    - 可选：在时间帧上应用 Transformer 层（非因果，支持 `return_sequence` 输出）
+    - 输出：`(B, proj_dim)` 或 `(B, T_f, proj_dim)`
+    """
     
     def __init__(self, config: DictConfig):
         super().__init__()
         
         self.config = config
         self.proj_dim = config.proj_dim
-        self.conv_kernel = config.conv1d_kernel
-        dropout = config.dropout
+        self.conv_kernel = getattr(config, 'conv1d_kernel', 3)
+        dropout = getattr(config, 'dropout', 0.1)
+        self.use_transformer = bool(getattr(config, 'use_transformer', False))
+        self.num_layers = int(getattr(config, 'num_layers', 2))
+        self.n_heads = int(getattr(config, 'n_heads', 4))
+        self.return_sequence = bool(getattr(config, 'return_sequence', False))
         
-        # 延迟初始化的Conv1d（以频率bin为通道）
+        # 延迟初始化的Conv1d（以频率bin为通道）或线性投射
         self.conv1: Optional[nn.Conv1d] = None
+        self.lin_proj: Optional[nn.Linear] = None
         
         # 全局池化
         self.global_pool = nn.AdaptiveAvgPool1d(1)
-        
-        # 简化：不再使用小型Transformer层
         self.dropout = nn.Dropout(dropout)
+        
+        # 时间帧上的 Transformer（非因果）
+        if self.use_transformer:
+            self.pos_encoding = PositionalEncoding(self.proj_dim)
+            self.tf_layers = nn.ModuleList([
+                TransformerBlock(self.proj_dim, self.n_heads, self.proj_dim * 4, dropout, causal=False)
+                for _ in range(self.num_layers)
+            ])
     
     def forward(self, x: torch.Tensor, freq_valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # x: (batch_size, n_time_frames, n_freq_bins)
+        # x: (B, T_f, F_f)
         if x is None:
             return None
         
         batch_size, n_time_frames, n_freq_bins = x.size()
         
-        # (B, T_f, F_f) -> (B, F_f, T_f)
-        x = x.transpose(1, 2)
+        if self.conv1 is None and self.lin_proj is None:
+            # 优先使用卷积；若频率bin极小，可切换为线性
+            if n_freq_bins >= 3:
+                self.conv1 = nn.Conv1d(in_channels=n_freq_bins, out_channels=self.proj_dim, kernel_size=self.conv_kernel, padding=self.conv_kernel // 2).to(x.device)
+            else:
+                self.lin_proj = nn.Linear(n_freq_bins, self.proj_dim).to(x.device)
         
-        # 延迟初始化Conv1d以适配动态频率维度
-        if self.conv1 is None:
-            self.conv1 = nn.Conv1d(in_channels=n_freq_bins, out_channels=self.proj_dim, kernel_size=self.conv_kernel, padding=self.conv_kernel // 2).to(x.device)
-        
-        conv_out = F.relu(self.conv1(x))  # (B, proj_dim, T_f)
-        
-        # 应用帧掩码（时间维度）
-        if freq_valid_mask is not None:
-            m = freq_valid_mask.unsqueeze(1).to(conv_out.dtype)  # (B, 1, T_f)
-            conv_out = conv_out * m
-        
-        # 直接时间全局池化（支持掩码）
-        if freq_valid_mask is not None:
-            m = freq_valid_mask.unsqueeze(1).to(conv_out.dtype)
-            num = (conv_out * m).sum(dim=-1)
-            den = m.sum(dim=-1).clamp_min(1.0)
-            freq_repr = num / den  # (B, proj_dim)
+        if self.conv1 is not None:
+            x_c = x.transpose(1, 2)  # (B, F_f, T_f)
+            conv_out = F.relu(self.conv1(x_c))  # (B, proj_dim, T_f)
+            h = conv_out.transpose(1, 2)  # (B, T_f, proj_dim)
         else:
-            freq_repr = self.global_pool(conv_out).squeeze(-1)  # (B, proj_dim)
+            h = F.relu(self.lin_proj(x))  # (B, T_f, proj_dim)
         
-        return freq_repr
+        # 掩码
+        if freq_valid_mask is not None:
+            m = freq_valid_mask.unsqueeze(-1).to(h.dtype)  # (B, T_f, 1)
+            h = h * m
+        
+        # Transformer 在时间帧维
+        if self.use_transformer:
+            q = self.pos_encoding(h.transpose(0, 1)).transpose(0, 1)  # (B, T_f, D)
+            for layer in self.tf_layers:
+                q = layer(q)
+            h = q
+        
+        if self.return_sequence:
+            return h  # (B, T_f, proj_dim)
+        
+        # 池化为窗口向量
+        if freq_valid_mask is not None:
+            m = freq_valid_mask.unsqueeze(-1).to(h.dtype)
+            num = (h * m).sum(dim=1)
+            den = m.sum(dim=1).clamp_min(1.0)
+            return num / den  # (B, proj_dim)
+        else:
+            return h.mean(dim=1)
 
 
 class AuxEncoder(nn.Module):
@@ -472,7 +501,12 @@ class MultiTaskHead(nn.Module):
     
     def __init__(self, d_model: int, n_devices: int, hidden_dim: int = 128, 
                  init_p: Optional[float] = None, enable_film: bool = False, 
-                 enable_routing: bool = False, include_unknown: bool = False):
+                 enable_routing: bool = False, include_unknown: bool = False,
+                 classification_enable: bool = True,
+                 regression_init_bias: float = 0.0, seq_emb_scale_init: float = 0.1,
+                 use_seq_ln: bool = True,
+                 reg_use_softplus: bool = True,
+                 seq_use_softplus: bool = False):
         super().__init__()
         
         self.d_model = d_model
@@ -480,6 +514,7 @@ class MultiTaskHead(nn.Module):
         self.enable_film = enable_film
         self.enable_routing = enable_routing
         self.include_unknown = include_unknown
+        self.classification_enable = classification_enable
         
         # 使用安全注意力池化（非因果）
         self.attention_pooling = CausalMultiHeadAttention(d_model, n_heads=8, dropout=0.1, causal=False)
@@ -504,7 +539,7 @@ class MultiTaskHead(nn.Module):
                 nn.ReLU(),
                 nn.Dropout(0.1),
                 nn.Linear(hidden_dim, 1),
-                nn.Softplus()
+                ZeroSoftplus() if reg_use_softplus else nn.Identity()
             ) for _ in range(n_devices)
         ])
         
@@ -514,22 +549,55 @@ class MultiTaskHead(nn.Module):
                 nn.ReLU(),
                 nn.Dropout(0.1),
                 nn.Linear(hidden_dim, 1),
-                nn.Softplus()
+                ZeroSoftplus()
             )
         else:
             self.unknown_regression_head = None
         
-        self.classification_heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(d_model, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(hidden_dim, 1),
-                nn.Sigmoid()
-            ) for _ in range(n_devices)
+        if self.classification_enable:
+            self.classification_heads = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(d_model, hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(hidden_dim, 1),
+                    nn.Sigmoid()
+                ) for _ in range(n_devices)
+            ])
+        else:
+            self.classification_heads = None
+        self.seq_conv = nn.Conv1d(d_model, d_model, kernel_size=5, padding=2)
+        self.seq_tcn = nn.Sequential(
+            nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, dilation=1),
+            nn.GELU(),
+            nn.Conv1d(d_model, d_model, kernel_size=3, padding=2, dilation=2),
+            nn.GELU(),
+            nn.Conv1d(d_model, d_model, kernel_size=3, padding=4, dilation=4),
+            nn.GELU(),
+        )
+        self.seq_ln = nn.LayerNorm(d_model) if use_seq_ln else nn.Identity()
+        # 设备嵌入缩放，避免覆盖时间特征
+        self.seq_emb_scale = nn.Parameter(torch.tensor(seq_emb_scale_init))
+
+        # 序列Decoder（每设备查询，跨注意力到时序记忆）
+        self.dec_layers = nn.ModuleList([
+            nn.ModuleDict({
+                'self_attn': CausalMultiHeadAttention(d_model, n_heads=4, dropout=0.1, causal=True),
+                'cross_attn': CausalMultiHeadAttention(d_model, n_heads=4, dropout=0.1, causal=False),
+                'ffn': nn.Sequential(
+                    nn.Linear(d_model, d_model * 4), nn.GELU(), nn.Dropout(0.1), nn.Linear(d_model * 4, d_model), nn.Dropout(0.1)
+                ),
+                'norm1': nn.LayerNorm(d_model),
+                'norm2': nn.LayerNorm(d_model),
+                'norm3': nn.LayerNorm(d_model),
+            }) for _ in range(1)
+        ])
+        self.pos_encoding_seq = PositionalEncoding(d_model)
+        self.seq_out_heads = nn.ModuleList([
+            nn.Sequential(nn.Linear(d_model, 1), ZeroSoftplus() if seq_use_softplus else nn.Identity()) for _ in range(n_devices)
         ])
         
-        if init_p is not None:
+        if init_p is not None and self.classification_enable:
             if isinstance(init_p, (list, tuple)) or isinstance(init_p, ListConfig):
                 for i, head in enumerate(self.classification_heads):
                     p = float(init_p[i]) if i < len(init_p) else float(init_p[-1])
@@ -539,9 +607,17 @@ class MultiTaskHead(nn.Module):
             else:
                 p = float(init_p)
                 p = max(min(p, 1 - 1e-6), 1e-6)
-                for head in self.classification_heads:
-                    final_layer = head[-2]
-                    nn.init.constant_(final_layer.bias, math.log(p / (1 - p)))
+                if self.classification_heads is not None:
+                    for head in self.classification_heads:
+                        final_layer = head[-2]
+                        nn.init.constant_(final_layer.bias, math.log(p / (1 - p)))
+        try:
+            for head in self.regression_heads:
+                nn.init.constant_(head[-2].bias, float(regression_init_bias))
+            if self.unknown_regression_head is not None:
+                nn.init.constant_(self.unknown_regression_head[-2].bias, float(regression_init_bias))
+        except Exception:
+            pass
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         batch_size = x.size(0)
@@ -574,11 +650,15 @@ class MultiTaskHead(nn.Module):
             device_features = combined_repr[:, i, :]
             reg_pred = self.regression_heads[i](device_features)
             regression_preds.append(reg_pred)
-            cls_pred = self.classification_heads[i](device_features)
-            classification_preds.append(cls_pred)
+            if self.classification_heads is not None:
+                cls_pred = self.classification_heads[i](device_features)
+                classification_preds.append(cls_pred)
         
         regression_pred = torch.cat(regression_preds, dim=1)
-        classification_pred = torch.cat(classification_preds, dim=1)
+        if self.classification_heads is not None:
+            classification_pred = torch.cat(classification_preds, dim=1)
+        else:
+            classification_pred = torch.zeros(batch_size, self.n_devices, device=x.device)
         
         if self.unknown_regression_head is not None:
             unknown_pred = self.unknown_regression_head(global_repr)
@@ -595,11 +675,30 @@ class MultiTaskHead(nn.Module):
         Returns:
             seq_regression_pred: (batch_size, seq_len, n_devices)
         """
+        y = x.transpose(1,2)
+        y = self.seq_conv(y)
+        y = self.seq_tcn(y)
+        y = y.transpose(1,2)
+        y = self.seq_ln(y)  # memory: (B, T, D)
+
+        B, T, D = y.size()
+        device_ids = torch.arange(self.n_devices, device=x.device)
+        device_embeds = self.device_embeddings(device_ids)  # (N, D)
         seq_preds: List[torch.Tensor] = []
+        # 构造查询：位置编码 + 设备嵌入
+        base_q = torch.zeros(T, B, D, device=x.device)
+        base_q = self.pos_encoding_seq(base_q).transpose(0,1)  # (B, T, D)
         for i in range(self.n_devices):
-            # 利用每设备的回归头对每个时间步进行预测（Linear支持对最后维度的广播）
-            per_dev_seq = self.regression_heads[i](x)  # (B, T, 1)
-            seq_preds.append(per_dev_seq.squeeze(-1))  # (B, T)
+            emb = device_embeds[i].view(1,1,-1).expand(B, T, -1)
+            q = base_q + self.seq_emb_scale * emb
+            for layer in self.dec_layers:
+                q_norm = layer['norm1'](q)
+                q = q + layer['self_attn'](q_norm, q_norm, q_norm)
+                q_norm = layer['norm2'](q)
+                q = q + layer['cross_attn'](q_norm, y, y)
+                q = q + layer['ffn'](layer['norm3'](q))
+            out = self.seq_out_heads[i](q)  # (B, T, 1)
+            seq_preds.append(out.squeeze(-1))
         seq_regression_pred = torch.stack(seq_preds, dim=-1)  # (B, T, N)
         return seq_regression_pred
 
@@ -612,10 +711,15 @@ class MultiTaskHead(nn.Module):
             seq_class_pred: (batch_size, seq_len, n_devices)
         """
         seq_preds: List[torch.Tensor] = []
+        device_ids = torch.arange(self.n_devices, device=x.device)
+        device_embeds = self.device_embeddings(device_ids)
         for i in range(self.n_devices):
-            # 线性层可对最后维度广播，直接生成逐时间步概率
-            per_dev_seq = self.classification_heads[i](x)  # (B, T, 1)
-            seq_preds.append(per_dev_seq.squeeze(-1))      # (B, T)
+            emb = device_embeds[i].view(1, 1, -1).expand(x.size(0), x.size(1), -1)
+            if self.classification_heads is not None:
+                per_dev_seq = self.classification_heads[i](x + emb)
+                seq_preds.append(per_dev_seq.squeeze(-1))
+            else:
+                seq_preds.append(torch.zeros(x.size(0), x.size(1), device=x.device))
         seq_class_pred = torch.stack(seq_preds, dim=-1)    # (B, T, N)
         return seq_class_pred
 
@@ -745,7 +849,7 @@ class FusionTransformer(nn.Module):
         init_p = getattr(init_p, 'init_p', None) if init_p is not None else None
         # Unknown/Residual 头开关（默认关闭，保持兼容）
         unknown_conf = getattr(getattr(config, 'heads', None), 'unknown', None)
-        include_unknown = bool(unknown_conf is not None and getattr(unknown_conf, 'enable', False))
+        include_unknown = bool(getattr(unknown_conf, 'enable', True)) if unknown_conf is not None else True
         self.include_unknown = include_unknown
 
         self.prediction_head = MultiTaskHead(
@@ -757,7 +861,13 @@ class FusionTransformer(nn.Module):
                         getattr(getattr(config.heads, 'conditioning', None), 'enable_film', False),
             enable_routing=getattr(getattr(config, 'heads', None), 'routing', None) is not None and \
                            getattr(getattr(config.heads, 'routing', None), 'enable', False),
-            include_unknown=include_unknown
+            include_unknown=include_unknown,
+            classification_enable=bool(getattr(getattr(config.heads, 'classification', None), 'enable', True)),
+            regression_init_bias=float(getattr(getattr(config.heads, 'regression', None), 'init_bias', 0.0)),
+            seq_emb_scale_init=float(getattr(getattr(config.heads, 'regression', None), 'seq_emb_scale', 0.1)),
+            use_seq_ln=bool(getattr(getattr(config.heads, 'regression', None), 'use_seq_ln', True)),
+            reg_use_softplus=bool(getattr(getattr(config.heads, 'regression', None), 'use_softplus', True)),
+            seq_use_softplus=bool(getattr(getattr(config.heads, 'regression', None), 'seq_use_softplus', False))
         )
         
         # 初始化权重
@@ -859,10 +969,12 @@ class FusionTransformer(nn.Module):
 
         # 序列回归预测（在标准化域）
         seq_pred_norm = self.prediction_head.forward_seq(fused_repr)  # (B, T, N)
+        class_seq_pred = self.prediction_head.forward_class_seq(fused_repr)
+        gate = 0.2 + 0.8 * torch.clamp(class_seq_pred, min=0.0, max=1.0)
+        seq_pred_norm = seq_pred_norm * gate
 
-        # 反标准化到物理单位：优先使用外部提供的每设备尺度（例如训练集P95）
+        mu_pred = self.denorm_mu_head(fused_repr)
         if external_scale is not None:
-            # 接受形状为 (K,) 或 (1,1,K) 的尺度
             if external_scale.dim() == 1:
                 scale = external_scale.view(1, 1, -1).to(fused_repr.device)
             else:
@@ -870,17 +982,15 @@ class FusionTransformer(nn.Module):
             scale = torch.clamp(scale, min=1e-6)
             seq_pred = seq_pred_norm * scale
         else:
-            # 回退：使用可学习的 μ 与 σ² 进行反标准化
-            mu_pred = self.denorm_mu_head(fused_repr)                      # (B, T, N)
-            sigma2_pred = F.softplus(self.denorm_logvar_head(fused_repr))  # (B, T, N) ≥ 0
-            seq_pred = seq_pred_norm * torch.sqrt(sigma2_pred + self.denorm_eps) + mu_pred
+            sigma2_pred = F.softplus(self.denorm_logvar_head(fused_repr))
+            seq_pred = seq_pred_norm * torch.sqrt(sigma2_pred + self.denorm_eps)
 
         # 同步生成窗口级预测
         reg_cls_unknown = self.prediction_head(fused_repr)
         regression_pred, classification_pred = reg_cls_unknown[0], reg_cls_unknown[1]
         unknown_pred = reg_cls_unknown[2] if self.include_unknown else None
         # 序列级分类
-        class_seq_pred = self.prediction_head.forward_class_seq(fused_repr)
+        class_seq_pred = class_seq_pred
 
         return seq_pred, regression_pred, classification_pred, unknown_pred, class_seq_pred
 
@@ -948,3 +1058,15 @@ class TemperatureScaling(nn.Module):
         
         result = minimize_scalar(nll_loss, bounds=(0.1, 10.0), method='bounded')
         self.temperatures.data[device_idx] = result.x
+        class ZeroSoftplus(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.sp = nn.Softplus()
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.sp(x)
+class ZeroSoftplus(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.sp = nn.Softplus()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.sp(x)
