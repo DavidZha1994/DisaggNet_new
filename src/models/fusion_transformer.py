@@ -190,11 +190,7 @@ class TimeEncoder(nn.Module):
         self.input_projection: Optional[nn.Module] = None
         # TimeRPE 与 TokenStats 相关模块（延迟初始化）
         self.time_rpe: Optional[TimeRPE] = None
-        self.rpe_out_dim = d_model // 4
-        self.stats_proj: Optional[nn.Linear] = None
-        self.stats_out_dim = d_model // 4
-        self.concat_proj: Optional[nn.Linear] = None
-        self.norm_eps: float = float(getattr(config, 'norm_eps', 1e-6))
+        self.rpe_out_dim = d_model
 
         # 位置编码
         self.pos_encoding = PositionalEncoding(d_model)
@@ -227,39 +223,12 @@ class TimeEncoder(nn.Module):
             x = x.transpose(1, 2)
         else:
             x = self.input_projection(x)
-        x_raw = x
-
-        # —— TokenStats：对投影后的序列做逐通道 z-标准化，并生成统计侧信息 ——
-        # 计算均值与方差（时间维度）
-        mu = x.mean(dim=1)                             # (B, d_model)
-        var = x.var(dim=1, unbiased=False)             # (B, d_model)
-        var = torch.clamp(var, min=self.norm_eps)
-        std = torch.sqrt(var)
-        x = (x - mu.unsqueeze(1)) / (std.unsqueeze(1) + self.norm_eps)
-        x = torch.nan_to_num(x)
-
-        # 统计侧信息： [mu, log(var)] -> 线性 -> (B, stats_out_dim) -> 广播到序列
-        stats_vec = torch.cat([mu, torch.log(var + self.norm_eps)], dim=-1)  # (B, 2*d_model)
-        if self.stats_proj is None:
-            self.stats_proj = nn.Linear(2 * self.d_model, self.stats_out_dim).to(x.device)
-        stats_seq = self.stats_proj(stats_vec).unsqueeze(1).expand(-1, seq_len, -1)  # (B, T, stats_out_dim)
-
-        # —— TimeRPE：利用真实时间戳的周期位置编码（逐时间步），避免时间维均值广播 ——
-        rpe_seq = None
         if time_features is not None:
             fp = time_features.size(-1)
             if self.time_rpe is None:
                 self.time_rpe = TimeRPE(in_dim=fp, out_dim=self.rpe_out_dim).to(x.device)
-            rpe_seq = self.time_rpe(time_features)  # (B, T, rpe_out_dim)
-
-        # 拼接核心嵌入 + RPE + 统计侧信息 → 映射回 d_model
-        parts = [x, stats_seq, x_raw]
-        if rpe_seq is not None:
-            parts.append(rpe_seq)
-        concat = torch.cat(parts, dim=-1)  # (B, T, d_model + stats_out_dim + rpe_out_dim?)
-        if self.concat_proj is None:
-            self.concat_proj = nn.Linear(concat.size(-1), self.d_model).to(x.device)
-        x = self.concat_proj(concat)
+            rpe_seq = self.time_rpe(time_features)
+            x = x + rpe_seq
 
         # 位置编码（相对索引）
         x = x.transpose(0, 1)  # (seq_len, batch_size, d_model)
@@ -422,18 +391,15 @@ class AuxEncoder(nn.Module):
 
 
 class CrossAttentionFusion(nn.Module):
-    """交叉注意力融合（在MPS上使用安全注意力实现）"""
+    """交叉注意力融合（去除门控，简化为残差相加）"""
     
-    def __init__(self, d_model: int, n_heads: int = 8, dropout: float = 0.1, gated: bool = True, freq_proj_in: Optional[int] = None, bidirectional: bool = False):
+    def __init__(self, d_model: int, n_heads: int = 8, dropout: float = 0.1, freq_proj_in: Optional[int] = None, bidirectional: bool = False):
         super().__init__()
         
         self.d_model = d_model
-        self.gated = gated
         self.bidirectional = bidirectional
         
-        # 交叉注意力：时域作为Query，频域作为Key/Value（非因果）
         self.cross_attention = CausalMultiHeadAttention(d_model, n_heads, dropout, causal=False)
-        
         if bidirectional:
             self.reverse_cross_attention = CausalMultiHeadAttention(d_model, n_heads, dropout, causal=False)
         
@@ -442,96 +408,54 @@ class CrossAttentionFusion(nn.Module):
         else:
             self.freq_proj = None
         
-        if gated:
-            fusion_input_dim = d_model * 3 if bidirectional else d_model * 2
-            self.gate = nn.Sequential(
-                nn.Linear(fusion_input_dim, d_model),
-                nn.Sigmoid()
-            )
-        
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, time_repr: torch.Tensor, freq_repr: torch.Tensor) -> torch.Tensor:
-        # time_repr: (B, T, D), freq_repr: (B, D) 或 (B, T, D)
         if freq_repr is None:
             return time_repr
         
         batch_size, seq_len, d_model = time_repr.size()
-        
-        # 将频域表示扩展到序列长度
         if freq_repr.dim() == 2:
             freq_repr = freq_repr.unsqueeze(1).expand(-1, seq_len, -1)
-        
-        # 维度投射（如需要）
         if self.freq_proj is not None:
             freq_repr = self.freq_proj(freq_repr)
         
-        # 交叉注意力：时域->频域
         attn_output = self.cross_attention(time_repr, freq_repr, freq_repr)
-        
-        # 双向交叉注意力（可选）
         if self.bidirectional:
             reverse_attn_output = self.reverse_cross_attention(freq_repr, time_repr, time_repr)
-        
-        # 门控融合
-        if self.gated:
-            if self.bidirectional:
-                concat_repr = torch.cat([time_repr, attn_output, reverse_attn_output], dim=-1)
-            else:
-                concat_repr = torch.cat([time_repr, attn_output], dim=-1)
-            gate_weights = self.gate(concat_repr)
-            if self.bidirectional:
-                fused_repr = gate_weights * time_repr + (1 - gate_weights) * (attn_output + reverse_attn_output) / 2
-            else:
-                fused_repr = gate_weights * time_repr + (1 - gate_weights) * attn_output
+            fused_repr = time_repr + self.dropout((attn_output + reverse_attn_output) / 2)
         else:
-            if self.bidirectional:
-                fused_repr = time_repr + (attn_output + reverse_attn_output) / 2
-            else:
-                fused_repr = time_repr + attn_output
-        
-        # 残差连接和层归一化
-        output = self.norm(fused_repr + self.dropout(attn_output))
-        return output
+            fused_repr = time_repr + self.dropout(attn_output)
+        return self.norm(fused_repr)
 
 
 class MultiTaskHead(nn.Module):
-    """多任务预测头（回归+分类），使用安全注意力池化避免MPS崩溃"""
+    """预测头（仅回归），去除分类与路由门控"""
     
     def __init__(self, d_model: int, n_devices: int, hidden_dim: int = 128, 
-                 init_p: Optional[float] = None, enable_film: bool = False, 
-                 enable_routing: bool = False, include_unknown: bool = False,
-                 classification_enable: bool = True,
+                 include_unknown: bool = False,
                  regression_init_bias: float = 0.0, seq_emb_scale_init: float = 0.1,
                  use_seq_ln: bool = True,
-                 reg_use_softplus: bool = True,
-                 seq_use_softplus: bool = False):
+                 reg_use_softplus: bool = False,
+                 seq_use_softplus: bool = False,
+                 seq_init_bias: float = 0.0):
         super().__init__()
         
         self.d_model = d_model
         self.n_devices = n_devices
-        self.enable_film = enable_film
-        self.enable_routing = enable_routing
+        self.enable_film = False
+        self.enable_routing = False
         self.include_unknown = include_unknown
-        self.classification_enable = classification_enable
         
         # 使用安全注意力池化（非因果）
         self.attention_pooling = CausalMultiHeadAttention(d_model, n_heads=8, dropout=0.1, causal=False)
         
         self.device_embeddings = nn.Embedding(n_devices, d_model)
         
-        if enable_film:
-            self.film_gamma = nn.Linear(d_model, d_model)
-            self.film_beta = nn.Linear(d_model, d_model)
-        
-        if enable_routing:
-            self.routing_gate = nn.Sequential(
-                nn.Linear(d_model * 2, d_model),
-                nn.Tanh(),
-                nn.Linear(d_model, n_devices),
-                nn.Softmax(dim=-1)
-            )
+        self.film_gamma = None
+        self.film_beta = None
+        self.routing_gate = None
         
         self.regression_heads = nn.ModuleList([
             nn.Sequential(
@@ -553,69 +477,16 @@ class MultiTaskHead(nn.Module):
             )
         else:
             self.unknown_regression_head = None
+        self.classification_heads = None
+        self.seq_regressor = nn.Linear(d_model, n_devices)
         
-        if self.classification_enable:
-            self.classification_heads = nn.ModuleList([
-                nn.Sequential(
-                    nn.Linear(d_model, hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(0.1),
-                    nn.Linear(hidden_dim, 1),
-                    nn.Sigmoid()
-                ) for _ in range(n_devices)
-            ])
-        else:
-            self.classification_heads = None
-        self.seq_conv = nn.Conv1d(d_model, d_model, kernel_size=5, padding=2)
-        self.seq_tcn = nn.Sequential(
-            nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, dilation=1),
-            nn.GELU(),
-            nn.Conv1d(d_model, d_model, kernel_size=3, padding=2, dilation=2),
-            nn.GELU(),
-            nn.Conv1d(d_model, d_model, kernel_size=3, padding=4, dilation=4),
-            nn.GELU(),
-        )
-        self.seq_ln = nn.LayerNorm(d_model) if use_seq_ln else nn.Identity()
-        # 设备嵌入缩放，避免覆盖时间特征
-        self.seq_emb_scale = nn.Parameter(torch.tensor(seq_emb_scale_init))
-
-        # 序列Decoder（每设备查询，跨注意力到时序记忆）
-        self.dec_layers = nn.ModuleList([
-            nn.ModuleDict({
-                'self_attn': CausalMultiHeadAttention(d_model, n_heads=4, dropout=0.1, causal=True),
-                'cross_attn': CausalMultiHeadAttention(d_model, n_heads=4, dropout=0.1, causal=False),
-                'ffn': nn.Sequential(
-                    nn.Linear(d_model, d_model * 4), nn.GELU(), nn.Dropout(0.1), nn.Linear(d_model * 4, d_model), nn.Dropout(0.1)
-                ),
-                'norm1': nn.LayerNorm(d_model),
-                'norm2': nn.LayerNorm(d_model),
-                'norm3': nn.LayerNorm(d_model),
-            }) for _ in range(1)
-        ])
-        self.pos_encoding_seq = PositionalEncoding(d_model)
-        self.seq_out_heads = nn.ModuleList([
-            nn.Sequential(nn.Linear(d_model, 1), ZeroSoftplus() if seq_use_softplus else nn.Identity()) for _ in range(n_devices)
-        ])
-        
-        if init_p is not None and self.classification_enable:
-            if isinstance(init_p, (list, tuple)) or isinstance(init_p, ListConfig):
-                for i, head in enumerate(self.classification_heads):
-                    p = float(init_p[i]) if i < len(init_p) else float(init_p[-1])
-                    p = max(min(p, 1 - 1e-6), 1e-6)
-                    final_layer = head[-2]
-                    nn.init.constant_(final_layer.bias, math.log(p / (1 - p)))
-            else:
-                p = float(init_p)
-                p = max(min(p, 1 - 1e-6), 1e-6)
-                if self.classification_heads is not None:
-                    for head in self.classification_heads:
-                        final_layer = head[-2]
-                        nn.init.constant_(final_layer.bias, math.log(p / (1 - p)))
         try:
             for head in self.regression_heads:
                 nn.init.constant_(head[-2].bias, float(regression_init_bias))
             if self.unknown_regression_head is not None:
                 nn.init.constant_(self.unknown_regression_head[-2].bias, float(regression_init_bias))
+            for head in self.seq_out_heads:
+                nn.init.constant_(head[0].bias, float(seq_init_bias))
         except Exception:
             pass
 
@@ -631,34 +502,18 @@ class MultiTaskHead(nn.Module):
         global_repr_expanded = global_repr.unsqueeze(1).expand(-1, self.n_devices, -1)
         device_embeds_expanded = device_embeds.unsqueeze(0).expand(batch_size, -1, -1)
         
-        if self.enable_routing:
-            routing_input = torch.cat([global_repr_expanded, device_embeds_expanded], dim=-1)
-            routing_weights = self.routing_gate(routing_input)
-            device_repr = torch.bmm(routing_weights, device_embeds_expanded)
-            combined_repr = global_repr_expanded + device_repr
-        else:
-            combined_repr = global_repr_expanded + device_embeds_expanded
+        combined_repr = global_repr_expanded + device_embeds_expanded
         
-        if self.enable_film:
-            gamma = self.film_gamma(device_embeds_expanded)
-            beta = self.film_beta(device_embeds_expanded)
-            combined_repr = gamma * combined_repr + beta
+        
         
         regression_preds = []
-        classification_preds = []
         for i in range(self.n_devices):
             device_features = combined_repr[:, i, :]
             reg_pred = self.regression_heads[i](device_features)
             regression_preds.append(reg_pred)
-            if self.classification_heads is not None:
-                cls_pred = self.classification_heads[i](device_features)
-                classification_preds.append(cls_pred)
         
         regression_pred = torch.cat(regression_preds, dim=1)
-        if self.classification_heads is not None:
-            classification_pred = torch.cat(classification_preds, dim=1)
-        else:
-            classification_pred = torch.zeros(batch_size, self.n_devices, device=x.device)
+        classification_pred = None
         
         if self.unknown_regression_head is not None:
             unknown_pred = self.unknown_regression_head(global_repr)
@@ -675,53 +530,9 @@ class MultiTaskHead(nn.Module):
         Returns:
             seq_regression_pred: (batch_size, seq_len, n_devices)
         """
-        y = x.transpose(1,2)
-        y = self.seq_conv(y)
-        y = self.seq_tcn(y)
-        y = y.transpose(1,2)
-        y = self.seq_ln(y)  # memory: (B, T, D)
+        return self.seq_regressor(x)
 
-        B, T, D = y.size()
-        device_ids = torch.arange(self.n_devices, device=x.device)
-        device_embeds = self.device_embeddings(device_ids)  # (N, D)
-        seq_preds: List[torch.Tensor] = []
-        # 构造查询：位置编码 + 设备嵌入
-        base_q = torch.zeros(T, B, D, device=x.device)
-        base_q = self.pos_encoding_seq(base_q).transpose(0,1)  # (B, T, D)
-        for i in range(self.n_devices):
-            emb = device_embeds[i].view(1,1,-1).expand(B, T, -1)
-            q = base_q + self.seq_emb_scale * emb
-            for layer in self.dec_layers:
-                q_norm = layer['norm1'](q)
-                q = q + layer['self_attn'](q_norm, q_norm, q_norm)
-                q_norm = layer['norm2'](q)
-                q = q + layer['cross_attn'](q_norm, y, y)
-                q = q + layer['ffn'](layer['norm3'](q))
-            out = self.seq_out_heads[i](q)  # (B, T, 1)
-            seq_preds.append(out.squeeze(-1))
-        seq_regression_pred = torch.stack(seq_preds, dim=-1)  # (B, T, N)
-        return seq_regression_pred
-
-    def forward_class_seq(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        序列级分类预测（逐时间步的开关状态概率）。
-        Args:
-            x: (batch_size, seq_len, d_model)
-        Returns:
-            seq_class_pred: (batch_size, seq_len, n_devices)
-        """
-        seq_preds: List[torch.Tensor] = []
-        device_ids = torch.arange(self.n_devices, device=x.device)
-        device_embeds = self.device_embeddings(device_ids)
-        for i in range(self.n_devices):
-            emb = device_embeds[i].view(1, 1, -1).expand(x.size(0), x.size(1), -1)
-            if self.classification_heads is not None:
-                per_dev_seq = self.classification_heads[i](x + emb)
-                seq_preds.append(per_dev_seq.squeeze(-1))
-            else:
-                seq_preds.append(torch.zeros(x.size(0), x.size(1), device=x.device))
-        seq_class_pred = torch.stack(seq_preds, dim=-1)    # (B, T, N)
-        return seq_class_pred
+    
 
     def forward_with_embeddings(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         """
@@ -746,35 +557,23 @@ class MultiTaskHead(nn.Module):
         global_repr_expanded = global_repr.unsqueeze(1).expand(-1, self.n_devices, -1)  # (B, N, D)
         device_embeds_expanded = device_embeds.unsqueeze(0).expand(batch_size, -1, -1)  # (B, N, D)
 
-        # 融合
-        if self.enable_routing:
-            routing_input = torch.cat([global_repr_expanded, device_embeds_expanded], dim=-1)
-            routing_weights = self.routing_gate(routing_input)  # (B, N, N)
-            device_repr = torch.bmm(routing_weights, device_embeds_expanded)  # (B, N, D)
-            combined_repr = global_repr_expanded + device_repr
-        else:
-            combined_repr = global_repr_expanded + device_embeds_expanded
+        combined_repr = global_repr_expanded + device_embeds_expanded
 
-        if self.enable_film:
-            gamma = self.film_gamma(device_embeds_expanded)
-            beta = self.film_beta(device_embeds_expanded)
-            combined_repr = gamma * combined_repr + beta
+        
 
         # 作为嵌入返回（进行L2归一化以稳定对比/度量学习）
         pred_embeddings = torch.nn.functional.normalize(combined_repr, dim=-1)  # (B, N, D)
 
         # 多任务预测
         regression_preds = []
-        classification_preds = []
         for i in range(self.n_devices):
             device_features = combined_repr[:, i, :]  # (B, D)
             reg_pred = self.regression_heads[i](device_features)
             regression_preds.append(reg_pred)
-            cls_pred = self.classification_heads[i](device_features)
-            classification_preds.append(cls_pred)
+            pass
 
         regression_pred = torch.cat(regression_preds, dim=1)
-        classification_pred = torch.cat(classification_preds, dim=1)
+        classification_pred = None
 
         unknown_pred: Optional[torch.Tensor]
         if self.unknown_regression_head is not None:
@@ -817,16 +616,10 @@ class FusionTransformer(nn.Module):
                 hidden_dim=aux_hidden,
                 dropout=aux_dropout
             )
-            # 门控融合层 - 使用可学习权重而非固定门控
-            self.aux_gate = nn.Sequential(
-                nn.Linear(config.time_encoder.d_model, config.time_encoder.d_model),
-                nn.Sigmoid()
-            )
-            # 辅助特征权重参数
+            # 辅助特征权重参数（去除门控，保留线性加和）
             self.aux_weight = nn.Parameter(torch.tensor(aux_weight))
         else:
             self.aux_encoder = None
-            self.aux_gate = None
             self.aux_weight = None
         
         # 融合模块
@@ -837,7 +630,6 @@ class FusionTransformer(nn.Module):
                 d_model=config.time_encoder.d_model,
                 n_heads=8,
                 dropout=0.1,
-                gated=config.fusion.gated,
                 freq_proj_in=config.freq_encoder.proj_dim,
                 bidirectional=bidirectional
             )
@@ -845,38 +637,34 @@ class FusionTransformer(nn.Module):
             self.fusion = None
         
         # 多任务预测头
-        init_p = getattr(getattr(config, 'heads', None), 'classification', None)
-        init_p = getattr(init_p, 'init_p', None) if init_p is not None else None
         # Unknown/Residual 头开关（默认关闭，保持兼容）
         unknown_conf = getattr(getattr(config, 'heads', None), 'unknown', None)
         include_unknown = bool(getattr(unknown_conf, 'enable', True)) if unknown_conf is not None else True
         self.include_unknown = include_unknown
 
+        # 解析激活（兼容 use_softplus 与新的 activation/seq_activation）
+        _reg_act = str(getattr(getattr(config.heads, 'regression', None), 'activation', 'softplus')).lower()
+        _seq_act = str(getattr(getattr(config.heads, 'regression', None), 'seq_activation', _reg_act)).lower()
+        _reg_sp = bool(getattr(getattr(config.heads, 'regression', None), 'use_softplus', _reg_act == 'softplus'))
+        _seq_sp = bool(getattr(getattr(config.heads, 'regression', None), 'seq_use_softplus', _seq_act == 'softplus'))
+
         self.prediction_head = MultiTaskHead(
             d_model=config.time_encoder.d_model,
             n_devices=n_devices,
             hidden_dim=config.heads.regression.hidden,
-            init_p=init_p,
-            enable_film=getattr(getattr(config, 'heads', None), 'conditioning', None) is not None and \
-                        getattr(getattr(config.heads, 'conditioning', None), 'enable_film', False),
-            enable_routing=getattr(getattr(config, 'heads', None), 'routing', None) is not None and \
-                           getattr(getattr(config.heads, 'routing', None), 'enable', False),
             include_unknown=include_unknown,
-            classification_enable=bool(getattr(getattr(config.heads, 'classification', None), 'enable', True)),
             regression_init_bias=float(getattr(getattr(config.heads, 'regression', None), 'init_bias', 0.0)),
             seq_emb_scale_init=float(getattr(getattr(config.heads, 'regression', None), 'seq_emb_scale', 0.1)),
             use_seq_ln=bool(getattr(getattr(config.heads, 'regression', None), 'use_seq_ln', True)),
-            reg_use_softplus=bool(getattr(getattr(config.heads, 'regression', None), 'use_softplus', True)),
-            seq_use_softplus=bool(getattr(getattr(config.heads, 'regression', None), 'seq_use_softplus', False))
+            reg_use_softplus=_reg_sp,
+            seq_use_softplus=_seq_sp,
+            seq_init_bias=float(getattr(getattr(config.heads, 'regression', None), 'seq_init_bias', getattr(getattr(config.heads, 'regression', None), 'init_bias', 0.0)))
         )
         
         # 初始化权重
         self._init_weights()
 
-        # 输出侧 ProjStats，用于对序列回归结果进行反标准化（提升稳态与跨域泛化）
-        self.denorm_mu_head = nn.Linear(config.time_encoder.d_model, n_devices)
-        self.denorm_logvar_head = nn.Linear(config.time_encoder.d_model, n_devices)
-        self.denorm_eps = 1e-6
+        pass
     
     def _init_weights(self):
         """初始化模型权重"""
@@ -908,9 +696,7 @@ class FusionTransformer(nn.Module):
             aux_repr = self.aux_encoder(aux_features, aux_valid_mask)  # (batch_size, d_model)
             seq_len = time_repr.size(1)
             aux_seq = aux_repr.unsqueeze(1).expand(-1, seq_len, -1)
-            gate = self.aux_gate(aux_seq)
-            # 使用可学习权重控制辅助特征的贡献，避免与主干重复
-            time_repr = time_repr + self.aux_weight * gate * aux_seq
+            time_repr = time_repr + self.aux_weight * aux_seq
 
         # 频域编码（支持掩码）
         freq_repr = None
@@ -925,11 +711,11 @@ class FusionTransformer(nn.Module):
         
         # 多任务预测（窗口级）
         reg_cls_unknown = self.prediction_head(fused_repr)
-        regression_pred, classification_pred = reg_cls_unknown[0], reg_cls_unknown[1]
+        regression_pred = reg_cls_unknown[0]
         if not self.include_unknown:
-            return regression_pred, classification_pred, None
+            return regression_pred, None, None
         else:
-            return regression_pred, classification_pred, reg_cls_unknown[2]
+            return regression_pred, None, reg_cls_unknown[2]
 
     def forward_seq(self, time_features: torch.Tensor,
                     freq_features: Optional[torch.Tensor] = None,
@@ -956,8 +742,7 @@ class FusionTransformer(nn.Module):
             aux_repr = self.aux_encoder(aux_features, aux_valid_mask)
             seq_len = time_repr.size(1)
             aux_seq = aux_repr.unsqueeze(1).expand(-1, seq_len, -1)
-            gate = self.aux_gate(aux_seq)
-            time_repr = time_repr + self.aux_weight * gate * aux_seq
+            time_repr = time_repr + self.aux_weight * aux_seq
 
         # 频域编码（支持掩码）
         freq_repr = None
@@ -967,30 +752,21 @@ class FusionTransformer(nn.Module):
         # 融合
         fused_repr = self.fusion(time_repr, freq_repr) if self.fusion is not None else time_repr
 
-        # 序列回归预测（在标准化域）
-        seq_pred_norm = self.prediction_head.forward_seq(fused_repr)  # (B, T, N)
-        class_seq_pred = self.prediction_head.forward_class_seq(fused_repr)
-        gate = 0.2 + 0.8 * torch.clamp(class_seq_pred, min=0.0, max=1.0)
-        seq_pred_norm = seq_pred_norm * gate
-
-        mu_pred = self.denorm_mu_head(fused_repr)
-        if external_scale is not None:
-            if external_scale.dim() == 1:
-                scale = external_scale.view(1, 1, -1).to(fused_repr.device)
-            else:
-                scale = external_scale.to(fused_repr.device)
-            scale = torch.clamp(scale, min=1e-6)
-            seq_pred = seq_pred_norm * scale
-        else:
-            sigma2_pred = F.softplus(self.denorm_logvar_head(fused_repr))
-            seq_pred = seq_pred_norm * torch.sqrt(sigma2_pred + self.denorm_eps)
+        seq_pred = self.prediction_head.forward_seq(fused_repr)
+        class_seq_pred = None
 
         # 同步生成窗口级预测
         reg_cls_unknown = self.prediction_head(fused_repr)
-        regression_pred, classification_pred = reg_cls_unknown[0], reg_cls_unknown[1]
+        regression_pred = reg_cls_unknown[0]
+        classification_pred = None
         unknown_pred = reg_cls_unknown[2] if self.include_unknown else None
         # 序列级分类
         class_seq_pred = class_seq_pred
+
+        try:
+            pass
+        except Exception:
+            pass
 
         return seq_pred, regression_pred, classification_pred, unknown_pred, class_seq_pred
 
@@ -1010,8 +786,7 @@ class FusionTransformer(nn.Module):
             aux_repr = self.aux_encoder(aux_features, aux_valid_mask)
             seq_len = time_repr.size(1)
             aux_seq = aux_repr.unsqueeze(1).expand(-1, seq_len, -1)
-            gate = self.aux_gate(aux_seq)
-            time_repr = time_repr + self.aux_weight * gate * aux_seq
+            time_repr = time_repr + self.aux_weight * aux_seq
 
         # 频域编码
         freq_repr = None
@@ -1027,43 +802,13 @@ class FusionTransformer(nn.Module):
         # 预测并返回嵌入
         reg, cls, unk, emb = self.prediction_head.forward_with_embeddings(fused_repr)
         if not self.include_unknown:
-            return reg, cls, None, emb
+            return reg, None, None, emb
         else:
-            return reg, cls, unk, emb
+            return reg, None, unk, emb
 
 
 
 
-class TemperatureScaling(nn.Module):
-    """温度缩放校准"""
-    
-    def __init__(self, n_devices: int):
-        super().__init__()
-        self.temperatures = nn.Parameter(torch.ones(n_devices))
-    
-    def forward(self, logits: torch.Tensor) -> torch.Tensor:
-        # logits: (batch_size, n_devices)
-        # 返回缩放后的logits，概率由调用方再做sigmoid
-        return logits / self.temperatures.unsqueeze(0)
-    
-    def calibrate(self, logits: torch.Tensor, targets: torch.Tensor, device_idx: int) -> None:
-        """在验证集上校准温度参数"""
-        from scipy.optimize import minimize_scalar
-        
-        def nll_loss(temperature):
-            scaled_logits = logits[:, device_idx] / temperature
-            # 直接对logits使用BCEWithLogits以获得稳定的负对数似然
-            loss = F.binary_cross_entropy_with_logits(scaled_logits, targets[:, device_idx])
-            return loss.item()
-        
-        result = minimize_scalar(nll_loss, bounds=(0.1, 10.0), method='bounded')
-        self.temperatures.data[device_idx] = result.x
-        class ZeroSoftplus(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.sp = nn.Softplus()
-            def forward(self, x: torch.Tensor) -> torch.Tensor:
-                return self.sp(x)
 class ZeroSoftplus(nn.Module):
     def __init__(self):
         super().__init__()
