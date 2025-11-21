@@ -211,18 +211,28 @@ class NILMLightningModule(pl.LightningModule):
             try:
                 ts_mat = batch.get('timestamps')
                 target_seq = batch.get('target_seq')
+                mains_seq = batch.get('mains_seq')
                 if isinstance(pred_seq, torch.Tensor) and isinstance(target_seq, torch.Tensor):
                     b = int(pred_seq.size(0))
                     for i in range(b):
                         p = pred_seq[i].detach().cpu()
                         t = target_seq[i].detach().cpu()
+                        m = None
+                        try:
+                            if isinstance(mains_seq, torch.Tensor):
+                                mm = mains_seq[i].detach().cpu()
+                                if mm.dim() > 1:
+                                    mm = mm.squeeze()
+                                m = mm
+                        except Exception:
+                            m = None
                         if isinstance(ts_mat, torch.Tensor) and ts_mat.dim() == 2:
                             start_ts = float(ts_mat[i, 0].detach().cpu().item())
                             step = float(getattr(getattr(self.trainer, 'datamodule', None), 'resample_seconds', 5.0))
                         else:
                             start_ts = float(torch.tensor(0.0).item())
                             step = float(getattr(getattr(self.trainer, 'datamodule', None), 'resample_seconds', 5.0))
-                        self._val_buffers.append({'pred': p, 'true': t, 'start': start_ts, 'step': step})
+                        self._val_buffers.append({'pred': p, 'true': t, 'mains': m, 'start': start_ts, 'step': step})
             except Exception:
                 pass
         return {'val_loss': loss}
@@ -252,22 +262,40 @@ class NILMLightningModule(pl.LightningModule):
             step = float(bufs[0]['step'])
             start0 = float(bufs[0]['start'])
             timeline = np.arange(start0, start0 + total_len * step, step, dtype=np.float64)
+            mains_concat = np.full((total_len,), np.nan, dtype=np.float32)
             pred_concat = np.full((total_len, K), np.nan, dtype=np.float32)
             true_concat = np.full((total_len, K), np.nan, dtype=np.float32)
             pos = 0
             for d in bufs:
                 p = d['pred'].numpy().astype(np.float32)
                 t = d['true'].numpy().astype(np.float32)
+                m = d.get('mains')
                 ln = int(p.shape[0])
                 pred_concat[pos:pos+ln, :min(K, p.shape[1])] = p[:, :min(K, p.shape[1])]
                 true_concat[pos:pos+ln, :min(K, t.shape[1])] = t[:, :min(K, t.shape[1])]
+                if m is not None:
+                    mm = m.numpy().astype(np.float32)
+                    if mm.ndim > 1:
+                        mm = mm.squeeze()
+                    mains_concat[pos:pos+ln] = mm[:ln]
                 pos += ln
             titles = []
             try:
                 titles = [str(self.device_names[k]) for k in range(K)]
             except Exception:
                 titles = [f"Device_{k}" for k in range(K)]
-            fig = make_subplots(rows=K, cols=1, shared_xaxes=True, vertical_spacing=0.02, subplot_titles=titles)
+            fig = make_subplots(rows=K+1, cols=1, shared_xaxes=True, vertical_spacing=0.02, subplot_titles=["总功率"] + titles)
+            fig.add_trace(
+                go.Scatter(
+                    x=timeline,
+                    y=mains_concat,
+                    name="总功率",
+                    mode="lines",
+                    line=dict(color="#7f7f7f")
+                ),
+                row=1,
+                col=1,
+            )
             for k in range(K):
                 fig.add_trace(
                     go.Scatter(
@@ -275,9 +303,11 @@ class NILMLightningModule(pl.LightningModule):
                         y=true_concat[:, k],
                         name="目标功率",
                         mode="lines",
-                        line=dict(color="#2ca02c")
+                        line=dict(color="#2ca02c"),
+                        legendgroup="target",
+                        showlegend=True if k == 0 else False
                     ),
-                    row=k+1,
+                    row=k+2,
                     col=1,
                 )
                 fig.add_trace(
@@ -286,9 +316,11 @@ class NILMLightningModule(pl.LightningModule):
                         y=pred_concat[:, k],
                         name="预测功率",
                         mode="lines",
-                        line=dict(color="#ff7f0e")
+                        line=dict(color="#ff7f0e"),
+                        legendgroup="prediction",
+                        showlegend=True if k == 0 else False
                     ),
-                    row=k+1,
+                    row=k+2,
                     col=1,
                 )
             fig.update_layout(template="plotly_white", legend=dict(orientation="h"))
