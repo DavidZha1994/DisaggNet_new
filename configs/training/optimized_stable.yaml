@@ -25,11 +25,11 @@ logging:
 
 # 数据设置（稳定版）
 data:
-  batch_size: 64
+  batch_size: 2048
   num_workers: 0
-  pin_memory: false
+  pin_memory: true
   persistent_workers: false
-  prefetch_factor: 2
+  prefetch_factor: null
   window_size: 256
   device_names:
     - washing_machine
@@ -99,12 +99,12 @@ model:
 training:
   max_epochs: 320
   min_epochs: 1
-  precision: "auto"
+  precision: "bf16-mixed"
   log_every_n_steps: 10
   gradient_clip_val: 1.0
-  accumulate_grad_batches: 8
+  accumulate_grad_batches: 1
   check_val_every_n_epoch: 1
-  accelerator: "mps"
+  accelerator: "auto"
   devices: 1
   monitor_device_stats: false
   visualization:

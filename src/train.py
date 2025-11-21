@@ -251,6 +251,7 @@ class NILMLightningModule(pl.LightningModule):
             from pathlib import Path
             import plotly.graph_objects as go
             from plotly.subplots import make_subplots
+            import datetime as pydt
             bufs = list(self._val_buffers)
             self._val_buffers.clear()
             if len(bufs) == 0:
@@ -262,6 +263,11 @@ class NILMLightningModule(pl.LightningModule):
             step = float(bufs[0]['step'])
             start0 = float(bufs[0]['start'])
             timeline = np.arange(start0, start0 + total_len * step, step, dtype=np.float64)
+            try:
+                timeline_dt = timeline.astype('datetime64[s]')
+            except Exception:
+                # 回退：使用 Python datetime 列表
+                timeline_dt = [pydt.datetime.utcfromtimestamp(float(x)) for x in timeline.tolist()]
             mains_concat = np.full((total_len,), np.nan, dtype=np.float32)
             pred_concat = np.full((total_len, K), np.nan, dtype=np.float32)
             true_concat = np.full((total_len, K), np.nan, dtype=np.float32)
@@ -287,7 +293,7 @@ class NILMLightningModule(pl.LightningModule):
             fig = make_subplots(rows=K+1, cols=1, shared_xaxes=True, vertical_spacing=0.02, subplot_titles=["总功率"] + titles)
             fig.add_trace(
                 go.Scatter(
-                    x=timeline,
+                    x=timeline_dt,
                     y=mains_concat,
                     name="总功率",
                     mode="lines",
@@ -299,7 +305,7 @@ class NILMLightningModule(pl.LightningModule):
             for k in range(K):
                 fig.add_trace(
                     go.Scatter(
-                        x=timeline,
+                        x=timeline_dt,
                         y=true_concat[:, k],
                         name="目标功率",
                         mode="lines",
@@ -312,7 +318,7 @@ class NILMLightningModule(pl.LightningModule):
                 )
                 fig.add_trace(
                     go.Scatter(
-                        x=timeline,
+                        x=timeline_dt,
                         y=pred_concat[:, k],
                         name="预测功率",
                         mode="lines",
@@ -324,6 +330,10 @@ class NILMLightningModule(pl.LightningModule):
                     col=1,
                 )
             fig.update_layout(template="plotly_white", legend=dict(orientation="h"))
+            try:
+                fig.update_xaxes(tickformat="%Y-%m-%d %H:%M")
+            except Exception:
+                pass
             dm = getattr(self.trainer, 'datamodule', None)
             dataset_name = str(getattr(self.config, 'dataset', '') or '').lower()
             fold_id = int(getattr(dm, 'fold_id', 0)) if dm is not None else 0
@@ -414,9 +424,20 @@ def main(config: DictConfig) -> None:
 
     model = NILMLightningModule(config, device_info, device_names)
 
+    import platform
+    if platform.system() == "Darwin":
+        current_precision = str(getattr(config.training, "precision", ""))
+        if ("bf16" in current_precision) or ("16" in current_precision):
+            print("[Auto-Config] macOS (MPS) 调试模式：自动将精度回退到 32-true 以保证稳定性")
+            try:
+                config.training.precision = "32-true"
+            except Exception:
+                pass
+
     trainer = pl.Trainer(
-        accelerator='auto',
-        devices=1,
+        accelerator=getattr(config.training, 'accelerator', 'auto'),
+        devices=getattr(config.training, 'devices', 1),
+        precision=getattr(config.training, 'precision', 32),
         max_epochs=config.training.max_epochs,
         logger=logger,
         callbacks=[
@@ -448,8 +469,9 @@ def create_trainer(config: DictConfig, logger: TensorBoardLogger) -> pl.Trainer:
     es = EarlyStopping(monitor='val/loss/total', patience=5, mode='min')
     lrmon = LearningRateMonitor(logging_interval='epoch')
     trainer = pl.Trainer(
-        accelerator='auto',
-        devices=1,
+        accelerator=getattr(config.training, 'accelerator', 'auto'),
+        devices=getattr(config.training, 'devices', 1),
+        precision=getattr(config.training, 'precision', 32),
         max_epochs=config.training.max_epochs,
         logger=logger,
         callbacks=[mc, es, lrmon],
