@@ -12,7 +12,6 @@ from src.helpers.preprocessing import (
     UKDALE_DataBuilder,
     REFIT_DataBuilder,
     create_exogene as _helpers_create_exogene,
-    nilmdataset_to_tser as _helpers_nilmdataset_to_tser,
 )
 
 # reuse HIPE features and CV for frequency and splitting
@@ -357,12 +356,20 @@ class REFITUKDALEPipeline:
                     return 0
         start_ts = np.array([_to_epoch_seconds(sd) for sd in st_date_all["start_date"].tolist()], dtype=np.int64)
         end_ts = start_ts + int(self.ru.window_size) * int(step_s)
+        try:
+            house_ids = np.array(st_date_all.index.tolist(), dtype=np.int64)
+        except Exception:
+            try:
+                house_ids = np.array(st_date_all.index.tolist())
+            except Exception:
+                house_ids = np.zeros(len(start_ts), dtype=np.int64)
         windows_meta = pd.DataFrame({
             "window_idx": np.arange(len(start_ts), dtype=np.int64),
             "start_ts": start_ts,
             "end_ts": end_ts,
-            # 段ID：按连续时间分组（相邻窗起始差==stride*step_s 视为同段）
-            "segment_id": self._assign_segment_ids(start_ts, stride_seconds=int(self.ru.window_stride) * int(step_s)),
+            "house": house_ids,
+            # 段ID：按连续时间分组（相邻窗起始差==stride*step_s 且 house 不变 视为同段）
+            "segment_id": self._assign_segment_ids(start_ts, stride_seconds=int(self.ru.window_stride) * int(step_s), houses=house_ids),
         })
 
         # Walk-Forward CV（与 HIPE 相同接口）
@@ -396,6 +403,7 @@ class REFITUKDALEPipeline:
         os.makedirs(dataset_dir, exist_ok=True)
 
         import torch
+
         # 原始时域窗口（NaN 用窗均值填充）
         def _fill_na(win: np.ndarray) -> np.ndarray:
             m = np.nanmean(win, axis=1, keepdims=True)
@@ -433,6 +441,7 @@ class REFITUKDALEPipeline:
                 "start_iso": pd.to_datetime(windows_meta["start_ts"], unit="s").astype(str),
                 "end_iso": pd.to_datetime(windows_meta["end_ts"], unit="s").astype(str),
                 "segment_id": windows_meta["segment_id"].astype(int),
+                "house": windows_meta["house"].astype(int) if "house" in windows_meta.columns else 0,
             })
             df_meta.to_csv(os.path.join(dataset_dir, "windows_meta.csv"), index=False)
         except Exception:
@@ -492,8 +501,18 @@ class REFITUKDALEPipeline:
             # 每折标签与元数据
             labels_train = labels_all[train_idx].astype(np.float32)
             labels_val = labels_all[val_idx].astype(np.float32)
-            meta_train = [{"datetime_iso": str(start_iso_all[i]), "timestamp": str(start_iso_all[i])} for i in train_idx]
-            meta_val = [{"datetime_iso": str(start_iso_all[i]), "timestamp": str(start_iso_all[i])} for i in val_idx]
+            meta_train = [{
+                "datetime_iso": str(start_iso_all[i]),
+                "timestamp": str(start_iso_all[i]),
+                "segment_id": int(windows_meta.iloc[i]["segment_id"]),
+                "house": int(windows_meta.iloc[i]["house"]) if "house" in windows_meta.columns else 0,
+            } for i in train_idx]
+            meta_val = [{
+                "datetime_iso": str(start_iso_all[i]),
+                "timestamp": str(start_iso_all[i]),
+                "segment_id": int(windows_meta.iloc[i]["segment_id"]),
+                "house": int(windows_meta.iloc[i]["house"]) if "house" in windows_meta.columns else 0,
+            } for i in val_idx]
             torch.save({"labels": torch.from_numpy(labels_train).float(), "label_metadata": meta_train}, os.path.join(fold_dir, "train_labels.pt"))
             torch.save({"labels": torch.from_numpy(labels_val).float(), "label_metadata": meta_val}, os.path.join(fold_dir, "val_labels.pt"))
 
@@ -501,7 +520,7 @@ class REFITUKDALEPipeline:
             with open(os.path.join(fold_dir, "feature_names.json"), "w", encoding="utf-8") as f:
                 json.dump(aux_names, f, ensure_ascii=False, indent=2)
             with open(os.path.join(fold_dir, "raw_channel_names.json"), "w", encoding="utf-8") as f:
-                json.dump(["P_W", "missing_mask"], f, ensure_ascii=False, indent=2)
+                json.dump(["P_W", "dP_W", "missing_mask"], f, ensure_ascii=False, indent=2)
 
         # 总结
         self.summary_ = {
@@ -526,14 +545,20 @@ class REFITUKDALEPipeline:
         return self.summary_.copy()
 
     @staticmethod
-    def _assign_segment_ids(start_ts: np.ndarray, stride_seconds: int) -> np.ndarray:
+    def _assign_segment_ids(start_ts: np.ndarray, stride_seconds: int, houses: Optional[np.ndarray] = None) -> np.ndarray:
         seg = np.zeros_like(start_ts, dtype=np.int64)
         if start_ts.size == 0:
             return seg
         sid = 0
         seg[0] = sid
         for i in range(1, len(start_ts)):
-            if int(start_ts[i] - start_ts[i - 1]) == int(stride_seconds):
+            same_house = True
+            if houses is not None and len(houses) == len(start_ts):
+                try:
+                    same_house = bool(houses[i] == houses[i - 1])
+                except Exception:
+                    same_house = True
+            if same_house and int(start_ts[i] - start_ts[i - 1]) == int(stride_seconds):
                 seg[i] = sid
             else:
                 sid += 1

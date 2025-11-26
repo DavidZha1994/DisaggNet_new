@@ -152,6 +152,7 @@ def _reconstruct_gapfill_mask_over_timeline(
         global_filled[base_idx:e_idx] = np.maximum(global_filled[base_idx:e_idx], m[: e_idx - base_idx])
     return global_filled
 
+
 def _reconstruct_coverage_over_timeline(
     start_ts: np.ndarray,
     L: int,
@@ -169,6 +170,7 @@ def _reconstruct_coverage_over_timeline(
         end_idx = min(base_idx + L, timeline_ts.size)
         cov[base_idx:end_idx] = 1
     return cov
+
 
 def _reconstruct_device_missing_over_timeline(
     start_ts: np.ndarray,
@@ -262,8 +264,8 @@ def _plot_channel(ts: np.ndarray, y: np.ndarray, on_mask: np.ndarray, valid_mask
         segs = _contiguous_segments(miss_d.astype(bool))
         for s, e, _l in segs:
             # plot the same y over the segment with thicker line
-            sl_ts = dt_x[s:e+1]
-            sl_y = y_d[s:e+1]
+            sl_ts = dt_x[s:e + 1]
+            sl_y = y_d[s:e + 1]
             ax_p.plot(sl_ts, sl_y, color='black', linewidth=2.0)
     except Exception:
         pass
@@ -505,6 +507,7 @@ def qc_fold(fold_dir: str, output_dir: Optional[str] = None, plots: bool = False
     # Load per-fold labels metadata (datetime_iso) for window starts; fallback to empty if missing
     train_labels = _load_pt_obj(os.path.join(fold_dir, 'train_labels.pt'))
     val_labels = _load_pt_obj(os.path.join(fold_dir, 'val_labels.pt'))
+
     def _labels_to_ts(ld):
         if not ld or not isinstance(ld, dict):
             return np.array([], dtype=np.int64)
@@ -548,6 +551,7 @@ def qc_fold(fold_dir: str, output_dir: Optional[str] = None, plots: bool = False
     if train_raw is not None or val_raw is not None:
         # channel idx for P_kW
         p_idx = mains_idx
+
         def _win_valid_mask(raw_seq: Optional[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
             if raw_seq is None or raw_seq.size == 0:
                 return np.array([], dtype=np.int64), np.zeros_like(timeline_ts, dtype=np.uint8)
@@ -787,6 +791,7 @@ def qc_fold(fold_dir: str, output_dir: Optional[str] = None, plots: bool = False
             with np.errstate(invalid='ignore'):
                 y_main = np.nanmean(np.vstack([y_train, y_val]), axis=0) if (y_train.size and y_val.size) else (y_train if y_train.size else y_val)
             # 有效掩码（任意窗口在该点有效即记为1）
+
             def _aggregate_valid(starts_arr, raw_seq):
                 if starts_arr.size == 0 or raw_seq is None or raw_seq.size == 0:
                     return np.zeros_like(timeline_ts, dtype=np.uint8)
@@ -816,10 +821,66 @@ def qc_fold(fold_dir: str, output_dir: Optional[str] = None, plots: bool = False
         dm_train = _load_pt_obj(os.path.join(fold_dir, 'train_device_masks.pt'))
         dm_val = _load_pt_obj(os.path.join(fold_dir, 'val_device_masks.pt'))
         det_obj = _load_pt_obj(os.path.join(fold_dir, 'train_onoff_detected.pt'))
-        on_train = dm_train.get('onoff').detach().cpu().numpy() if (isinstance(dm_train, dict) and hasattr(dm_train.get('onoff'), 'detach')) else (dm_train.get('onoff').numpy() if isinstance(dm_train, dict) and hasattr(dm_train.get('onoff'), 'numpy') else None)
-        on_val = dm_val.get('onoff').detach().cpu().numpy() if (isinstance(dm_val, dict) and hasattr(dm_val.get('onoff'), 'detach')) else (dm_val.get('onoff').numpy() if isinstance(dm_val, dict) and hasattr(dm_val.get('onoff'), 'numpy') else None)
-        v_train = dm_train.get('valid').detach().cpu().numpy() if (isinstance(dm_train, dict) and hasattr(dm_train.get('valid'), 'detach')) else (dm_train.get('valid').numpy() if isinstance(dm_train, dict) and hasattr(dm_train.get('valid'), 'numpy') else None)
-        v_val = dm_val.get('valid').detach().cpu().numpy() if (isinstance(dm_val, dict) and hasattr(dm_val.get('valid'), 'detach')) else (dm_val.get('valid').numpy() if isinstance(dm_val, dict) and hasattr(dm_val.get('valid'), 'numpy') else None)
+        on_train = (
+            dm_train.get('onoff').detach().cpu().numpy()
+            if (
+                isinstance(dm_train, dict)
+                and hasattr(dm_train.get('onoff'), 'detach')
+            )
+            else (
+                dm_train.get('onoff').numpy()
+                if (
+                    isinstance(dm_train, dict)
+                    and hasattr(dm_train.get('onoff'), 'numpy')
+                )
+                else None
+            )
+        )
+        on_val = (
+            dm_val.get('onoff').detach().cpu().numpy()
+            if (
+                isinstance(dm_val, dict)
+                and hasattr(dm_val.get('onoff'), 'detach')
+            )
+            else (
+                dm_val.get('onoff').numpy()
+                if (
+                    isinstance(dm_val, dict)
+                    and hasattr(dm_val.get('onoff'), 'numpy')
+                )
+                else None
+            )
+        )
+        v_train = (
+            dm_train.get('valid').detach().cpu().numpy()
+            if (
+                isinstance(dm_train, dict)
+                and hasattr(dm_train.get('valid'), 'detach')
+            )
+            else (
+                dm_train.get('valid').numpy()
+                if (
+                    isinstance(dm_train, dict)
+                    and hasattr(dm_train.get('valid'), 'numpy')
+                )
+                else None
+            )
+        )
+        v_val = (
+            dm_val.get('valid').detach().cpu().numpy()
+            if (
+                isinstance(dm_val, dict)
+                and hasattr(dm_val.get('valid'), 'detach')
+            )
+            else (
+                dm_val.get('valid').numpy()
+                if (
+                    isinstance(dm_val, dict)
+                    and hasattr(dm_val.get('valid'), 'numpy')
+                )
+                else None
+            )
+        )
         Y_base = train_Y if train_Y is not None else np.empty((0, L, 0), dtype=np.float32)
         Y_base = np.concatenate([Y_base, val_Y], axis=0) if val_Y is not None else Y_base
         starts_Y = np.concatenate([
@@ -901,7 +962,6 @@ def qc_fold(fold_dir: str, output_dir: Optional[str] = None, plots: bool = False
         det_valid = None
         if isinstance(det_obj, dict) and det_obj.get('onoff') is not None:
             try:
-                import torch
                 raw_on = det_obj.get('onoff')
                 raw_val = det_obj.get('valid')
                 det_on = raw_on.detach().cpu().numpy() if hasattr(raw_on, 'detach') else (raw_on.numpy() if hasattr(raw_on, 'numpy') else np.asarray(raw_on))

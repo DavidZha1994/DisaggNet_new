@@ -10,6 +10,7 @@ PROJECT_ROOT = os.path.dirname(ROOT)
 
 st.set_page_config(page_title="REFIT/UKDALE Pipeline Viewer", layout="wide")
 
+
 # 读取训练配置中的可视化保存目录，避免与训练输出路径不一致
 def _get_viz_save_dir(project_root: str, default: str = "outputs/viz") -> str:
     try:
@@ -24,6 +25,7 @@ def _get_viz_save_dir(project_root: str, default: str = "outputs/viz") -> str:
     except Exception:
         pass
     return default
+
 
 def load_fold(dir_path: str):
     fold_dir = dir_path
@@ -44,6 +46,7 @@ def load_fold(dir_path: str):
     data["raw_channel_names"] = json.load(open(raw_names_fp)) if os.path.exists(raw_names_fp) else []
     return data
 
+
 def normalize_image(x: np.ndarray) -> np.ndarray:
     x = x.astype(np.float32)
     if not np.isfinite(x).any():
@@ -55,6 +58,7 @@ def normalize_image(x: np.ndarray) -> np.ndarray:
     y = (x - m) / (M - m)
     y = np.clip(y, 0.0, 1.0)
     return y
+
 
 st.title("REFIT/UKDALE 数据准备结果查看")
 
@@ -252,11 +256,14 @@ if os.path.isdir(fold_html_dir):
     rank_dirs = [d for d in os.listdir(fold_html_dir) if d.startswith("rank_") and os.path.isdir(os.path.join(fold_html_dir, d))]
     rank_choice = st.selectbox("选择进程/Rank", options=(rank_dirs if rank_dirs else ["rank_0"]))
     rank_dir = os.path.join(fold_html_dir, rank_choice)
-    # epoch HTML 列表
-    html_files = sorted([f for f in os.listdir(rank_dir) if f.endswith(".html")]) if os.path.isdir(rank_dir) else []
+    html_files = []
+    if os.path.isdir(rank_dir):
+        html_files = sorted([f for f in os.listdir(rank_dir) if f.endswith(".html")])
+    else:
+        html_files = sorted([f for f in os.listdir(fold_html_dir) if f.endswith(".html")])
     if html_files:
-        html_choice = st.selectbox("选择Epoch图", options=html_files, index=len(html_files)-1)
-        html_path = os.path.join(rank_dir, html_choice)
+        html_choice = st.selectbox("选择Epoch图", options=html_files, index=len(html_files) - 1)
+        html_path = os.path.join(rank_dir if os.path.isdir(rank_dir) else fold_html_dir, html_choice)
         try:
             import streamlit.components.v1 as components
             with open(html_path, "r", encoding="utf-8") as f:

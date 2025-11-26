@@ -3,12 +3,13 @@
 import os
 import json
 import torch
-import torch.nn.functional as F
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Union
 from sklearn.metrics import (
-    f1_score, matthews_corrcoef, precision_recall_curve, roc_auc_score,
-    confusion_matrix, classification_report
+    f1_score,
+    matthews_corrcoef,
+    precision_recall_curve,
+    roc_auc_score,
 )
 import warnings
 warnings.filterwarnings('ignore')
@@ -262,14 +263,14 @@ class NILMMetrics:
                     try:
                         mcc = matthews_corrcoef(y_true[:, i], y_pred_binary[:, i])
                         mcc_scores[device_name] = mcc if not np.isnan(mcc) else 0.0
-                    except:
+                    except Exception:
                         mcc_scores[device_name] = 0.0
             return mcc_scores
         else:
             try:
                 mcc = matthews_corrcoef(y_true.flatten(), y_pred_binary.flatten())
                 return mcc if not np.isnan(mcc) else 0.0
-            except:
+            except Exception:
                 return 0.0
     
     def precision_recall_auc(self, y_pred_proba: torch.Tensor, y_true: torch.Tensor,
@@ -289,7 +290,7 @@ class NILMMetrics:
                         from sklearn.metrics import average_precision_score
                         pr_auc = average_precision_score(y_true[:, i], y_pred_proba[:, i], sample_weight=w)
                         pr_auc_scores[device_name] = float(pr_auc)
-                    except:
+                    except Exception:
                         pr_auc_scores[device_name] = 0.0
             return pr_auc_scores
         else:
@@ -301,7 +302,7 @@ class NILMMetrics:
                         pr_auc = average_precision_score(y_true[:, i], y_pred_proba[:, i], sample_weight=w)
                         pr_auc_values.append(pr_auc)
                 return float(np.mean(pr_auc_values)) if pr_auc_values else 0.0
-            except:
+            except Exception:
                 return 0.0
     
     def roc_auc(self, y_pred_proba: torch.Tensor, y_true: torch.Tensor,
@@ -320,7 +321,7 @@ class NILMMetrics:
                     try:
                         roc_auc = roc_auc_score(y_true[:, i], y_pred_proba[:, i], sample_weight=w)
                         roc_auc_scores[device_name] = float(roc_auc)
-                    except:
+                    except Exception:
                         roc_auc_scores[device_name] = 0.5
             return roc_auc_scores
         else:
@@ -331,7 +332,7 @@ class NILMMetrics:
                         roc_auc = roc_auc_score(y_true[:, i], y_pred_proba[:, i], sample_weight=w)
                         roc_auc_values.append(roc_auc)
                 return float(np.mean(roc_auc_values)) if roc_auc_values else 0.5
-            except:
+            except Exception:
                 return 0.5
     
     def event_detection_metrics(self, y_pred_proba: torch.Tensor, y_true: torch.Tensor,
@@ -397,10 +398,12 @@ class NILMMetrics:
                     continue
                 
                 # 检查是否在容忍范围内
-                if (abs(true_start - pred_start) <= tolerance or 
-                    abs(true_end - pred_end) <= tolerance or
-                    (pred_start <= true_start <= pred_end) or
-                    (true_start <= pred_start <= true_end)):
+                if (
+                    abs(true_start - pred_start) <= tolerance
+                    or abs(true_end - pred_end) <= tolerance
+                    or (pred_start <= true_start <= pred_end)
+                    or (true_start <= pred_start <= true_end)
+                ):
                     tp += 1
                     matched_pred.add(j)
                     break
@@ -599,7 +602,7 @@ class DelayMetrics:
                 search_end = min(len(pred_signal), change_point + 20)
                 
                 for i in range(search_start, search_end):
-                    if i > 0 and pred_signal[i] != pred_signal[i-1]:
+                    if i > 0 and pred_signal[i] != pred_signal[i - 1]:
                         response_time = abs(i - change_point)
                         device_response_times.append(response_time)
                         break

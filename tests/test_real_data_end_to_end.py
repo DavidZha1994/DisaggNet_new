@@ -1,8 +1,5 @@
-import os
 import json
 from pathlib import Path
-
-import numpy as np
 import torch
 from omegaconf import OmegaConf
 
@@ -16,7 +13,7 @@ FOLD_ID = 0
 def _get_device_names_from_prepared(prepared_dir: str):
     mapping_path = Path(prepared_dir) / "device_name_to_id.json"
     if not mapping_path.exists():
-        raise FileNotFoundError(f"missing device_name_to_id.json at {mapping_path}")
+        raise FileNotFoundError("missing device_name_to_id.json")
     with open(mapping_path, "r") as f:
         mapping = json.load(f)
 
@@ -36,11 +33,17 @@ def _get_device_names_from_prepared(prepared_dir: str):
     device_names = []
     if key_is_int_like and not val_is_int_like:
         # id(str)->name(str)
-        pairs = sorted(((int(k), v) for k, v in mapping.items()), key=lambda kv: kv[0])
+        pairs = sorted(
+            ((int(k), v) for k, v in mapping.items()),
+            key=lambda kv: kv[0],
+        )
         device_names = [name for _, name in pairs]
     elif not key_is_int_like and val_is_int_like:
         # name->id
-        pairs = sorted(((v, k) for k, v in mapping.items()), key=lambda kv: kv[0])
+        pairs = sorted(
+            ((v, k) for k, v in mapping.items()),
+            key=lambda kv: kv[0],
+        )
         device_names = [name for _, name in pairs]
     else:
         # 回退：按键排序
@@ -51,10 +54,15 @@ def _get_device_names_from_prepared(prepared_dir: str):
     if seq_path.exists():
         import torch
         arr_t = torch.load(seq_path)
-        arr = arr_t.detach().cpu().numpy() if hasattr(arr_t, 'detach') else arr_t
+        arr = (
+            arr_t.detach().cpu().numpy()
+            if hasattr(arr_t, 'detach')
+            else arr_t
+        )
         n_devices_from_seq = arr.shape[-1]
         assert n_devices_from_seq == len(device_names), (
-            f"targets_seq设备维度({n_devices_from_seq})与映射设备数({len(device_names)})不一致")
+            f"targets_seq设备维度({n_devices_from_seq})与映射设备数({len(device_names)})不一致"
+        )
     return device_names
 
 
@@ -82,7 +90,13 @@ def _build_real_config(device_names):
                 'd_model': 64, 'n_heads': 4, 'num_layers': 2,
                 'dropout': 0.1, 'input_conv_embed': False, 'causal_mask': True
             },
-            'freq_encoder': {'enable': True, 'proj_dim': 32, 'conv1d_kernel': 3, 'small_transformer_layers': 0, 'dropout': 0.1},
+            'freq_encoder': {
+                'enable': True,
+                'proj_dim': 32,
+                'conv1d_kernel': 3,
+                'small_transformer_layers': 0,
+                'dropout': 0.1,
+            },
             'fusion': {'type': 'cross_attention', 'gated': True},
             'aux_encoder': {'enable': True, 'hidden': 32, 'dropout': 0.1},
             'heads': {
@@ -147,7 +161,10 @@ def test_datamodule_real_batch_shapes(prepared_dir):
 
     # target_power 维度与设备数一致（若为占位，则与states一致）
     assert train_batch['target_power'].shape[0] == B
-    assert train_batch['target_power'].shape[1] in (n_devices, train_batch['target_states'].shape[1])
+    assert train_batch['target_power'].shape[1] in (
+        n_devices,
+        train_batch['target_states'].shape[1],
+    )
 
 
 def test_lightningmodule_forward_and_training_step_real(prepared_dir):
@@ -215,7 +232,11 @@ def test_val_metrics_regression_only(prepared_dir):
     else:
         pred_power, pred_states = preds
 
-    metrics = lm._compute_metrics(batch, (pred_power, pred_states), stage='val')
+    metrics = lm._compute_metrics(
+        batch,
+        (pred_power, pred_states),
+        stage='val',
+    )
 
     # 回归指标应存在
     for k in ['mae', 'nde', 'sae', 'teca', 'score']:

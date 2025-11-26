@@ -408,13 +408,12 @@ def run_overfit_ukdale_simple(
 # --------------------------------------------------------
 def sweep_overfit_ukdale_simple():
     runs = [
-        # name,             opt,    lr,     max_steps, sched,      warmup, use_freq
-        ("adamw_cosine_3e-3_warm", "adamw", 3e-3, 2500, "cosine",  True,   False),
-        ("adamw_cosine_5e-3_warm", "adamw", 5e-3, 2500, "cosine",  True,   False),
-        ("adam_cosine_3e-3_warm",  "adam",  3e-3, 2500, "cosine",  True,   False),
-        ("radam_cosine_3e-3_warm", "radam", 3e-3, 2500, "cosine",  True,   False),
-        ("adamw_onecycle_3e-3",    "adamw", 3e-3, 2500, "onecycle",False,  False),
-        ("adamw_cosine_3e-3_nowm", "adamw", 3e-3, 2500, "cosine",  False,  False),
+        ("adamw_cosine_3e-3_warm", "adamw", 3e-3, 2500, "cosine", True, False),
+        ("adamw_cosine_5e-3_warm", "adamw", 5e-3, 2500, "cosine", True, False),
+        ("adam_cosine_3e-3_warm", "adam", 3e-3, 2500, "cosine", True, False),
+        ("radam_cosine_3e-3_warm", "radam", 3e-3, 2500, "cosine", True, False),
+        ("adamw_onecycle_3e-3", "adamw", 3e-3, 2500, "onecycle", False, False),
+        ("adamw_cosine_3e-3_nowm", "adamw", 3e-3, 2500, "cosine", False, False),
     ]
     for name, opt_name, lr, steps, sched, warm, use_freq in runs:
         print(f"=== Run: {name} ===")

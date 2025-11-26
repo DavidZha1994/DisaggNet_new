@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Optional, Tuple, Dict
+from typing import Optional, Dict
 
 import numpy as np
 import pandas as pd
@@ -36,10 +36,12 @@ def _get_config_defaults() -> Dict:
     return defaults
 
 
-def overlap_add(frames: np.ndarray,
-                 starts: Optional[np.ndarray],
-                 step_size: int,
-                 mask: Optional[np.ndarray] = None) -> np.ndarray:
+def overlap_add(
+    frames: np.ndarray,
+    starts: Optional[np.ndarray],
+    step_size: int,
+    mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
     """
     将窗口级帧重建为完整时间序列（重叠平均）。
     frames: [N, L] 或 [N, L, C]（需已选定通道后为 [N,L]）
@@ -217,17 +219,22 @@ def main():
         if isinstance(t_obj, dict):
             # 优先适配新版结构
             if 'targets_P' in t_obj:
-                targets_P = t_obj['targets_P']; picked_key = 'targets_P'
+                targets_P = t_obj['targets_P']
+                picked_key = 'targets_P'
             elif 'targets' in t_obj:
-                targets_P = t_obj['targets']; picked_key = 'targets'
+                targets_P = t_obj['targets']
+                picked_key = 'targets'
             else:
                 # 兼容：自动发现形状为 [N,L,D] 的张量键
                 for k, v in t_obj.items():
                     if isinstance(v, torch.Tensor) and v.ndim == 3:
-                        targets_P = v; picked_key = k; break
+                        targets_P = v
+                        picked_key = k
+                        break
         elif isinstance(t_obj, torch.Tensor):
             # 兼容：直接保存为张量 [N,L,D]
-            targets_P = t_obj; picked_key = '<tensor>'
+            targets_P = t_obj
+            picked_key = '<tensor>'
         if isinstance(targets_P, torch.Tensor):
             targets_P = targets_P.detach().cpu().numpy()
         if show_debug:

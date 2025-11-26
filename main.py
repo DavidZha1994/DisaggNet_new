@@ -26,15 +26,14 @@ import argparse
 import logging
 from pathlib import Path
 from typing import Optional, Dict, Any
-import yaml
-import platform
+import torch
+import pytorch_lightning as pl
+from omegaconf import DictConfig, OmegaConf
 
 # macOS: 统一 OpenMP 运行时，避免重复初始化错误
 if sys.platform == 'darwin':
     os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 
-# 强制 UTF-8 输出，修复 Windows 控制台中文乱码
-import locale
 os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
 os.environ.setdefault('PYTHONUTF8', '1')
 try:
@@ -51,21 +50,13 @@ if os.name == 'nt':
     except Exception:
         pass
 
-import torch
-import pytorch_lightning as pl
-from omegaconf import DictConfig, OmegaConf
 
 # 添加项目根目录到Python路径
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(project_root / "src"))
 
-# 导入项目模块
-from src.train import main as train_main
-from src.eval import main as eval_main
-from src.walk_forward import run_walk_forward_validation as walk_forward_main
-# 延迟导入 HPO 组件，避免在未使用时因可选依赖报错
-optuna_main = None
+# 项目模块在方法内部按需导入，避免 E402
 
 # 设置日志
 logging.basicConfig(
@@ -196,6 +187,7 @@ class UnifiedTrainingSystem:
                     logger.warning(f"更新配置参数失败 {key}={value}: {e}")
             
             # 调用训练函数
+            from src.train import main as train_main
             train_main(config)
             logger.info("训练完成")
             
@@ -254,6 +246,7 @@ class UnifiedTrainingSystem:
                 args.extend([f"--{key}", str(value)])
         
         # 调用Walk-Forward验证
+        from src.walk_forward import run_walk_forward_validation as walk_forward_main
         walk_forward_main(config, n_folds=n_folds)
     
     def evaluate_model(self, 
@@ -274,6 +267,7 @@ class UnifiedTrainingSystem:
                 output_path = Path(config.paths.output_dir) / "evaluation"
             
             # 调用评估函数
+            from src.eval import main as eval_main
             results = eval_main(config, checkpoint_path, output_path)
             logger.info("模型评估完成")
             return results
@@ -311,8 +305,6 @@ class UnifiedTrainingSystem:
         except Exception as e:
             logger.error(f"模型推理失败: {e}")
             raise
-    
-
     
     def stability_check(self, config_name: str = "optimized_stable") -> Dict[str, Any]:
         """训练稳定性检查"""
@@ -446,8 +438,6 @@ def main():
             
         elif args.command == "hpo":
             # 超参数优化
-            # 仅在需要时导入 optuna 相关代码
-            from src.hpo.optuna_runner import run_optimization as optuna_main
             kwargs = {k.replace('-', '_'): v for k, v in vars(args).items() 
                      if v is not None and k not in ['command', 'config', 'n_trials']}
             training_system.optimize_hyperparameters(

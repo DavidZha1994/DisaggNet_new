@@ -70,7 +70,7 @@ def prepared_dir(tmp_path_factory):
             x = rng.normal(0.0, 0.2, size=len(base_ts))
             for s in [200, 600, 1200, 1800, 2400, 3000, 3600, 4200]:
                 w = 120
-                x[s:s+w] += scale * (rng.random() * 0.5 + 0.5)
+                x[s:s + w] += scale * (rng.random() * 0.5 + 0.5)
             x = np.clip(x, 0.0, None)
             return x
         dev1 = mk_device(1, 1.5)
@@ -82,7 +82,7 @@ def prepared_dir(tmp_path_factory):
             "P_kW": mains_p,
             "Q_kvar": np.zeros_like(mains_p),
             "S_kVA": np.zeros_like(mains_p),
-            "PF": np.ones_like(mains_p)*0.95,
+            "PF": np.ones_like(mains_p) * 0.95,
         })
         mains_csv = raw_dst / "main.csv"
         mains_df.to_csv(mains_csv, index=False)
@@ -187,7 +187,7 @@ def hipe_raw_setup(tmp_path_factory):
             x = rng.normal(0.0, 0.2, size=len(base_ts))
             for s in [200, 600, 1200, 1800, 2400, 3000, 3600, 4200]:
                 w = 120
-                x[s:s+w] += scale * (rng.random() * 0.5 + 0.5)
+                x[s:s + w] += scale * (rng.random() * 0.5 + 0.5)
             x = np.clip(x, 0.0, None)
             return x
         dev1 = mk_device(1, 1.5)
@@ -199,7 +199,7 @@ def hipe_raw_setup(tmp_path_factory):
             "P_kW": mains_p,
             "Q_kvar": np.zeros_like(mains_p),
             "S_kVA": np.zeros_like(mains_p),
-            "PF": np.ones_like(mains_p)*0.95,
+            "PF": np.ones_like(mains_p) * 0.95,
         })
         mains_csv = raw_dst / "main.csv"
         mains_df.to_csv(mains_csv, index=False)

@@ -1,5 +1,4 @@
-import os
-from pathlib import Path
+
 
 import pytest
 import torch
@@ -38,7 +37,7 @@ def test_datamodule_batch_step_by_step(prepared_dir):
         print("power_scale_vec:", dm.power_scale_vec.tolist())
     tseq = batch.get("target_seq")
     if isinstance(tseq, torch.Tensor):
-        B,L,K = tseq.shape
+        B, L, K = tseq.shape
         flat = tseq.reshape(-1, K)
         p95 = torch.quantile(torch.clamp(flat, min=0.0), 0.95, dim=0)
         print("target_seq_p95:", p95.tolist())
@@ -50,13 +49,17 @@ def test_datamodule_batch_step_by_step(prepared_dir):
         assert batch["target_seq"].dim() == 3
     B, L, C = batch["time_features"].shape
     tseq = batch.get("target_seq")
-    sseq = batch.get("status_seq")
+    # status_seq is optional; do not bind unused
     tp = batch.get("target_power")
     tvm = batch.get("target_seq_valid_mask")
     m = None
     if isinstance(tvm, torch.Tensor):
         m = tvm.to(torch.float32)
-    if isinstance(tseq, torch.Tensor) and isinstance(tp, torch.Tensor) and tseq.size(0) == tp.size(0):
+    if (
+        isinstance(tseq, torch.Tensor)
+        and isinstance(tp, torch.Tensor)
+        and tseq.size(0) == tp.size(0)
+    ):
         if m is None:
             mean_seq = tseq.mean(dim=1)
         else:
@@ -91,18 +94,49 @@ def test_model_forward_seq_step_by_step(prepared_dir):
     tvm = batch.get("time_valid_mask")
     fs = batch.get("freq_features")
     fvm = batch.get("freq_valid_mask")
-    ext_scale = dm.power_scale_vec if isinstance(dm.power_scale_vec, torch.Tensor) else None
+    ext_scale = (
+        dm.power_scale_vec if isinstance(dm.power_scale_vec, torch.Tensor) else None
+    )
     time_repr = model.time_encoder(tf, None, mask=tvm)
     freq_repr = None
     if fs is not None:
-        freq_repr = model.freq_encoder(fs, fvm) if model.freq_encoder is not None else None
-    fused_repr = model.fusion(time_repr, freq_repr) if model.fusion is not None else time_repr
+        freq_repr = (
+            model.freq_encoder(fs, fvm)
+            if model.freq_encoder is not None
+            else None
+        )
+    fused_repr = (
+        model.fusion(time_repr, freq_repr)
+        if model.fusion is not None
+        else time_repr
+    )
     seq_pred_norm = model.prediction_head.forward_seq(fused_repr)
-    print("time_repr mean/std:", float(time_repr.mean()), float(time_repr.std()))
+    print(
+        "time_repr mean/std:",
+        float(time_repr.mean()),
+        float(time_repr.std()),
+    )
     if isinstance(freq_repr, torch.Tensor):
-        print("freq_repr mean/std:", float(freq_repr.mean()), float(freq_repr.std()))
-    print("seq_pred_norm mean/std:", float(seq_pred_norm.mean()), float(seq_pred_norm.std()))
-    out = model.forward_seq(tf, fs, None, batch.get("aux_features"), tvm, fvm, batch.get("aux_valid_mask"), ext_scale)
+        print(
+            "freq_repr mean/std:",
+            float(freq_repr.mean()),
+            float(freq_repr.std()),
+        )
+    print(
+        "seq_pred_norm mean/std:",
+        float(seq_pred_norm.mean()),
+        float(seq_pred_norm.std()),
+    )
+    out = model.forward_seq(
+        tf,
+        fs,
+        None,
+        batch.get("aux_features"),
+        tvm,
+        fvm,
+        batch.get("aux_valid_mask"),
+        ext_scale,
+    )
     pred_seq, reg_win, cls_win, unk_win, cls_seq = out
     assert pred_seq.shape[:2] == tf.shape[:2]
     assert pred_seq.shape[2] == len(device_names)
@@ -136,7 +170,10 @@ def test_train_losses_and_gradients_step_by_step(prepared_dir):
     if 'target_seq' not in batch:
         import pytest as _pytest
         _pytest.skip("缺少 target_seq 标签，跳过梯度检查（合成数据仅用于管道形状验证）")
-    pred_seq, total_loss = module._forward_and_compute_loss(batch, stage="train")
+    pred_seq, total_loss = module._forward_and_compute_loss(
+        batch,
+        stage="train",
+    )
     assert torch.isfinite(total_loss)
     assert total_loss.item() >= 0.0
     total_loss.backward()

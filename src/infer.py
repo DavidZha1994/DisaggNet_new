@@ -1,31 +1,24 @@
 """准实时推理模块"""
 
 import os
-import sys
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any, Union
+from typing import Dict, List, Tuple, Optional, Any
 from collections import deque
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 import json
 from omegaconf import DictConfig, OmegaConf
 import warnings
-warnings.filterwarnings('ignore')
 
-# 添加项目根目录到路径
-sys.path.append(str(Path(__file__).parent.parent))
-
-from src.train import NILMLightningModule
-from src.utils.metrics import ConsistencyMetrics
-from src.utils.conformal_prediction import MultiTaskConformalPredictor
-from src.utils.conformal_evaluation import ConformalEvaluator
-from src.utils.online_conformal_monitor import OnlineConformalMonitor, ConformalAlertSystem
-from src.inference.post_processing import InferencePostProcessor, create_post_processor, RECOMMENDED_POST_PROCESSING_CONFIGS
-from src.utils.prototypes import PrototypeLibrary
+from .train import NILMLightningModule
+from .utils.metrics import ConsistencyMetrics
+from .utils.conformal_evaluation import ConformalEvaluator
+from .utils.online_conformal_monitor import OnlineConformalMonitor, ConformalAlertSystem
+from .inference.post_processing import create_post_processor, RECOMMENDED_POST_PROCESSING_CONFIGS
 
 
 class CircularBuffer:
@@ -948,3 +941,4 @@ def main(config: DictConfig, model_path: str = None, data_path: str = None, outp
 
 # 注意：此脚本不应直接执行，请使用统一入口 main.py
 # 示例：python main.py infer --checkpoint-path=path/to/model.ckpt --data-path=path/to/data.csv
+warnings.filterwarnings('ignore')

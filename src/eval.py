@@ -1,25 +1,19 @@
 """模型评估脚本"""
 
 import os
-import sys
 import numpy as np
-import pandas as pd
 import torch
-import pytorch_lightning as pl
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
-from omegaconf import DictConfig, OmegaConf
+from typing import Dict, List, Optional, Any
+from omegaconf import DictConfig
 import json
 from datetime import datetime
 import warnings
+from .train import NILMLightningModule, load_device_info
+from .data.datamodule import NILMDataModule
+from .utils.metrics import NILMMetrics, ConsistencyMetrics, DelayMetrics
+
 warnings.filterwarnings('ignore')
-
-# 添加项目根目录到路径
-sys.path.append(str(Path(__file__).parent.parent))
-
-from src.train import NILMLightningModule, load_device_info
-from src.data.datamodule import NILMDataModule  # 使用新的工业级数据模块
-from src.utils.metrics import NILMMetrics, ConsistencyMetrics, DelayMetrics
 
 
 class ModelEvaluator:
@@ -113,7 +107,9 @@ class ModelEvaluator:
         targets = y_true_states.numpy()
         predictions = pred_power.numpy()
         
-        print(f"评估数据形状: predictions={predictions.shape}, targets={targets.shape}, mains={mains.shape}")
+        print(
+            f"评估数据形状: predictions={predictions.shape}, targets={targets.shape}"
+        )
         
         # 计算指标与状态策略对比
         results = self._compute_all_metrics(
@@ -184,7 +180,7 @@ class ModelEvaluator:
         print("计算延迟指标...")
         # 延迟指标：使用检测延迟并汇总平均
         per_device_delays = self.delay_metrics.detection_delay(
-            pred_probs, torch.from_numpy(targets)
+            torch.from_numpy(pred_proba), torch.from_numpy(targets)
         )
         finite_delays = [d for d in per_device_delays.values() if np.isfinite(d)]
         avg_delay = float(np.mean(finite_delays)) if finite_delays else float('inf')
@@ -650,7 +646,7 @@ class ModelEvaluator:
         with open(results_path, 'w') as f:
             json.dump(all_results, f, indent=2, default=str)
         
-        print(f"\n=== 评估完成 ===")
+        print("\n=== 评估完成 ===")
         print(f"结果保存至: {eval_output_dir}")
         
         return all_results

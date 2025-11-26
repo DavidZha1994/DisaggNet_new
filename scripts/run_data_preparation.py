@@ -28,6 +28,7 @@ if PROJECT_ROOT not in sys.path:
 
 # 注意：为避免不必要的依赖加载，在需要时再进行模块导入
 
+
 def setup_logging():
     """设置日志"""
     logging.basicConfig(
@@ -37,6 +38,7 @@ def setup_logging():
             logging.StreamHandler(sys.stdout)
         ]
     )
+
 
 def main():
     """主函数"""
@@ -108,13 +110,13 @@ def main():
                 return 1
             logger.info("开始运行 HIPE 数据准备流程")
             start_time = datetime.now()
-            results = pipeline.run_full_pipeline(args.data)
+            pipeline.run_full_pipeline(args.data)
             end_time = datetime.now()
             duration = end_time - start_time
             logger.info(f"HIPE 数据准备完成！耗时: {duration}")
-            print("\n" + "="*60)
+            print("\n" + "=" * 60)
             print("HIPE 数据准备运行成功！")
-            print("="*60)
+            print("=" * 60)
             print(f"输出目录: {pipeline.output_dir}")
             print(f"运行时间: {duration}")
             summary = pipeline.get_pipeline_summary()
@@ -137,9 +139,9 @@ def main():
             end_time = datetime.now()
             duration = end_time - start_time
             logger.info(f"{args.dataset.upper()} 数据准备完成！耗时: {duration}")
-            print("\n" + "="*60)
+            print("\n" + "=" * 60)
             print(f"{args.dataset.upper()} 数据准备运行成功！")
-            print("="*60)
+            print("=" * 60)
             print(f"输出目录: {pipeline.output_dir}")
             print(f"运行时间: {duration}")
             print_summary(summary)
@@ -154,12 +156,13 @@ def main():
             import traceback
             traceback.print_exc()
         return 1
+    
 
 def print_summary(summary):
     """打印流程摘要"""
-    print("\n" + "-"*40)
+    print("\n" + "-" * 40)
     print("流程摘要")
-    print("-"*40)
+    print("-" * 40)
 
     print(f"状态: {summary.get('status', 'unknown')}")
 
@@ -190,7 +193,7 @@ def print_summary(summary):
     # 段摘要
     if 'segments_summary' in summary:
         seg_summary = summary['segments_summary']
-        print(f"\n数据摘要:")
+        print("\n数据摘要:")
         print(f"  总段数: {seg_summary['total_segments']}")
         print(f"  总样本数: {seg_summary['total_samples']}")
         print(f"  设备数: {len(seg_summary['devices'])}")
@@ -205,6 +208,7 @@ def print_summary(summary):
     # 错误信息
     if 'error' in summary:
         print(f"\n错误信息: {summary['error']}")
+
 
 if __name__ == "__main__":
     exit(main())

@@ -300,7 +300,6 @@ def aggregate_aux_features(
         P_seq = X_seq[:, :, 0]
         Q_seq = X_seq[:, :, 1]
         PF_seq = X_seq[:, :, 3] if C >= 4 else np.full((N, L), np.nan, dtype=np.float32)
-        dP_seq = X_seq[:, :, 4] if C >= 5 else np.full((N, L), np.nan, dtype=np.float32)
         phi_seq = np.full((N, L), np.nan, dtype=np.float32)
         valid_pq = (~np.isnan(P_seq)) & (~np.isnan(Q_seq)) & (np.abs(P_seq) > 1e-6)
         phi_seq[valid_pq] = np.arctan2(Q_seq[valid_pq], P_seq[valid_pq])

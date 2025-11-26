@@ -3,8 +3,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Tuple, Optional, Union
-from omegaconf import DictConfig, ListConfig
+from typing import Tuple, Optional
+from omegaconf import DictConfig
 import math
 
 
@@ -503,9 +503,6 @@ class MultiTaskHead(nn.Module):
         device_embeds_expanded = device_embeds.unsqueeze(0).expand(batch_size, -1, -1)
         
         combined_repr = global_repr_expanded + device_embeds_expanded
-        
-        
-        
         regression_preds = []
         for i in range(self.n_devices):
             device_features = combined_repr[:, i, :]
@@ -532,8 +529,6 @@ class MultiTaskHead(nn.Module):
         """
         return self.seq_regressor(x)
 
-    
-
     def forward_with_embeddings(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         """
         与 forward 一致的计算流程，同时返回每设备的中间特征作为嵌入。
@@ -559,8 +554,6 @@ class MultiTaskHead(nn.Module):
 
         combined_repr = global_repr_expanded + device_embeds_expanded
 
-        
-
         # 作为嵌入返回（进行L2归一化以稳定对比/度量学习）
         pred_embeddings = torch.nn.functional.normalize(combined_repr, dim=-1)  # (B, N, D)
 
@@ -570,7 +563,6 @@ class MultiTaskHead(nn.Module):
             device_features = combined_repr[:, i, :]  # (B, D)
             reg_pred = self.regression_heads[i](device_features)
             regression_preds.append(reg_pred)
-            pass
 
         regression_pred = torch.cat(regression_preds, dim=1)
         classification_pred = None
@@ -582,8 +574,6 @@ class MultiTaskHead(nn.Module):
             unknown_pred = None
 
         return regression_pred, classification_pred, unknown_pred, pred_embeddings
-
-
 
 
 class FusionTransformer(nn.Module):
@@ -663,8 +653,6 @@ class FusionTransformer(nn.Module):
         
         # 初始化权重
         self._init_weights()
-
-        pass
     
     def _init_weights(self):
         """初始化模型权重"""
@@ -763,11 +751,6 @@ class FusionTransformer(nn.Module):
         # 序列级分类
         class_seq_pred = class_seq_pred
 
-        try:
-            pass
-        except Exception:
-            pass
-
         return seq_pred, regression_pred, classification_pred, unknown_pred, class_seq_pred
 
     def forward_with_embeddings(self, time_features: torch.Tensor, 
@@ -807,11 +790,10 @@ class FusionTransformer(nn.Module):
             return reg, None, unk, emb
 
 
-
-
 class ZeroSoftplus(nn.Module):
     def __init__(self):
         super().__init__()
         self.sp = nn.Softplus()
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.sp(x)

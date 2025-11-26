@@ -4,10 +4,9 @@ Conformal Prediction 评估和可视化工具
 """
 
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Optional, Any
 import torch
 from pathlib import Path
 import json
@@ -213,7 +212,6 @@ class ConformalEvaluator:
         bin_uppers = bin_boundaries[1:]
         
         ece = 0.0
-        total_samples = len(predicted_probs)
         
         for bin_lower, bin_upper in zip(bin_lowers, bin_uppers):
             # 找到在当前置信度区间内的样本
@@ -276,7 +274,7 @@ class ConformalEvaluator:
         
         # 添加数值标签
         for bar, coverage in zip(bars, coverages):
-            plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+            plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
                     f'{coverage:.3f}', ha='center', va='bottom')
         
         plt.xlabel('Device')
@@ -299,7 +297,7 @@ class ConformalEvaluator:
         
         # 添加数值标签
         for bar, width in zip(bars, widths):
-            plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(widths) * 0.01,
+            plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(widths) * 0.01,
                     f'{width:.2f}', ha='center', va='bottom')
         
         plt.xlabel('Device')

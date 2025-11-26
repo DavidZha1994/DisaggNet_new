@@ -4,8 +4,7 @@
 """
 
 import torch
-import numpy as np
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import logging
 
@@ -34,7 +33,7 @@ class PostProcessingConfig:
     
     # 能量守恒后处理
     enforce_conservation: bool = True   # 是否强制能量守恒
-    conservation_tolerance: float = 0.1 # 能量守恒容忍度
+    conservation_tolerance: float = 0.1  # 能量守恒容忍度
 
 
 class HysteresisFilter:
@@ -81,15 +80,19 @@ class HysteresisFilter:
                 # 应用滞回逻辑
                 if prev_state < 0.5:  # 前一状态为关闭
                     # 需要同时满足概率和功率的开启条件
-                    if (current_prob > self.config.switch_on_threshold and 
-                        current_power > self.config.power_on_threshold):
+                    if (
+                        current_prob > self.config.switch_on_threshold
+                        and current_power > self.config.power_on_threshold
+                    ):
                         new_state = 1.0
                     else:
                         new_state = 0.0
                 else:  # 前一状态为开启
                     # 需要同时满足概率和功率的关闭条件
-                    if (current_prob < self.config.switch_off_threshold and 
-                        current_power < self.config.power_off_threshold):
+                    if (
+                        current_prob < self.config.switch_off_threshold
+                        and current_power < self.config.power_off_threshold
+                    ):
                         new_state = 0.0
                     else:
                         new_state = 1.0
@@ -318,7 +321,7 @@ class TemporalSmoother:
             smoothed[:, d] = torch.conv1d(
                 predictions[:, d].unsqueeze(0).unsqueeze(0),
                 kernel.unsqueeze(0).unsqueeze(0),
-                padding=window_size//2
+                padding=window_size // 2
             ).squeeze()
             
         return smoothed

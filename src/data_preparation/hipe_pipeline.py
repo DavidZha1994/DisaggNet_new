@@ -45,7 +45,6 @@ from src.data_preparation.io import (
     find_mains_file as _io_find_mains_file,
     find_device_files as _io_find_device_files,
     extract_device_name as _io_extract_device_name,
-    safe_to_csv as _io_safe_to_csv,
     read_table as _io_read_table,
 )
 
@@ -169,7 +168,8 @@ class HIPEDataPreparationPipeline:
             tm = tqdm(total=1, desc=f"读取主端: {os.path.basename(mains_fp)}", unit="file")
         df_main = self._read_mains(mains_fp)
         if tqdm is not None:
-            tm.update(1); tm.close()
+            tm.update(1)
+            tm.close()
         # 可视化已移除
         dev_dfs, dev_names = self._read_devices(device_fps)
         # 导出毫秒级对齐漂移诊断，便于观察原始时间与网格对齐情况
@@ -217,6 +217,7 @@ class HIPEDataPreparationPipeline:
         L = self.hipe.window_length
         H = self.hipe.step_size
         segments_meta = self._create_segments_meta(df_merged)
+
         def _compute_segmented_starts(seg_df: pd.DataFrame, L_: int, H_: int) -> np.ndarray:
             ss: List[int] = []
             if seg_df is None or seg_df.empty:
@@ -425,6 +426,7 @@ class HIPEDataPreparationPipeline:
     ) -> None:
         # 顶层元数据与 CV 计划（文件名支持配置覆盖）
         files_cfg = (self.config.get("data_storage", {}).get("files") or {})
+
         def out_fp(name: str, default: str) -> str:
             return os.path.join(self.output_dir, files_cfg.get(name, default))
         # 恢复保存：cv_splits、label_map、labels 与设备映射
@@ -530,6 +532,7 @@ class HIPEDataPreparationPipeline:
             train_idx = part["train_indices"]
             val_idx = part["val_indices"]
             fold_files = (self.config.get("data_storage", {}).get("fold_files") or {})
+
             def fold_fp(name: str, default: str) -> str:
                 return os.path.join(fold_dir, fold_files.get(name, default))
 

@@ -1,4 +1,3 @@
-import os
 import logging
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -6,7 +5,6 @@ from typing import Optional, Dict, Any
 import yaml
 import optuna
 from omegaconf import DictConfig, OmegaConf
-from copy import deepcopy
 
 # 延迟导入训练主函数以避免循环引用问题
 from src.train import main as train_main

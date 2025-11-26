@@ -108,7 +108,7 @@ training:
   devices: 1
   monitor_device_stats: false
   visualization:
-    enable: false
+    enable: true
     plot_event_only: true
     max_plots_per_epoch: 10
     target_scale: 1.0

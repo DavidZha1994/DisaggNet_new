@@ -2,40 +2,29 @@
 
 import os
 import sys
-# macOS OpenMP workaround
 if sys.platform == 'darwin':
     os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
     ModelCheckpoint, EarlyStopping, LearningRateMonitor,
-    DeviceStatsMonitor
 )
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.utilities.model_summary import ModelSummary
-from pytorch_lightning.strategies import DDPStrategy
 from omegaconf import DictConfig, OmegaConf
 from typing import Dict, List, Tuple, Optional, Any
-import numpy as np
 from pathlib import Path
-import warnings
-warnings.filterwarnings('ignore')
-import json
-import matplotlib
-matplotlib.use('Agg')
 
-# 添加项目根目录到路径
-sys.path.append(str(Path(__file__).parent.parent))
 
-# 启用TF32优化
+from .data.datamodule import NILMDataModule
+from .models.fusion_transformer import FusionTransformer
+from .losses.losses import create_loss_function, RECOMMENDED_LOSS_CONFIGS
+from .utils.metrics import NILMMetrics
+from .utils.viz import save_validation_interactive_plot
+
+# 启用TF32优化（放在所有导入之后，避免 E402）
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("medium")
-
-from src.data.datamodule import NILMDataModule
-from src.models.fusion_transformer import FusionTransformer
-from src.losses.losses import create_loss_function, RECOMMENDED_LOSS_CONFIGS
-from src.utils.metrics import NILMMetrics
 
 
 class NILMLightningModule(pl.LightningModule):
@@ -73,6 +62,7 @@ class NILMLightningModule(pl.LightningModule):
 
         # 尺度策略：每设备尺度（训练集 P95），由 DataModule 提供
         self.power_scale: Optional[torch.Tensor] = None
+        self.max_power: Optional[torch.Tensor] = None
 
         # 可视化配置
         self.best_val_loss = float('inf')
@@ -80,7 +70,7 @@ class NILMLightningModule(pl.LightningModule):
         vis_cfg = getattr(getattr(config, 'training', None), 'visualization', None)
         self.enable_visualization = bool(getattr(vis_cfg, 'enable', False) if vis_cfg is not None else False)
         self.max_plots_per_epoch = int(getattr(vis_cfg, 'max_plots_per_epoch', 8))
-        self.vis_output_dir = str(getattr(vis_cfg, 'save_dir', Path('reports') / 'viz'))
+        self.vis_output_dir = str(getattr(vis_cfg, 'save_dir', Path('outputs') / 'viz'))
         self.enable_interactive = bool(getattr(vis_cfg, 'interactive', False) if vis_cfg is not None else False)
         self._val_buffers: List[Dict[str, Any]] = []
 
@@ -106,6 +96,18 @@ class NILMLightningModule(pl.LightningModule):
         scale = torch.clamp(self.power_scale, min=1.0).to(device)
         return scale.view(1, 1, -1)
 
+    def _ensure_max_power(self, device: torch.device, k: int) -> torch.Tensor:
+        if (self.max_power is None) or (self.max_power.numel() != k):
+            try:
+                dm = getattr(self.trainer, 'datamodule', None)
+                if dm is not None and hasattr(dm, 'max_power_vec') and isinstance(dm.max_power_vec, torch.Tensor):
+                    self.max_power = dm.max_power_vec.detach().clone().float()
+                else:
+                    self.max_power = torch.ones(k, dtype=torch.float32)
+            except Exception:
+                self.max_power = torch.ones(k, dtype=torch.float32)
+        return torch.clamp(self.max_power, min=1.0).to(device).view(1, 1, -1)
+
     def on_fit_start(self) -> None:
         """训练开始时载入尺度"""
         try:
@@ -113,13 +115,15 @@ class NILMLightningModule(pl.LightningModule):
             if dm is not None and hasattr(dm, 'power_scale_vec'):
                 self.power_scale = dm.power_scale_vec.detach().clone().float()
                 print(f"[Info] Per-device P95 scales loaded: {self.power_scale.tolist()}")
+            if dm is not None and hasattr(dm, 'max_power_vec'):
+                self.max_power = dm.max_power_vec.detach().clone().float()
+                print(f"[Info] Per-device max powers loaded: {self.max_power.tolist()}")
         except Exception as e:
             print(f"[Warning] Failed to load scales: {e}")
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, None]:
         """前向传播 (Inference)"""
         time_features = batch['time_features']
-        ext_scale = self._ensure_power_scale(time_features.device, self.n_devices)
         out = self.model.forward_seq(
             time_features,
             freq_features=batch.get('freq_features'),
@@ -128,33 +132,33 @@ class NILMLightningModule(pl.LightningModule):
             time_valid_mask=batch.get('time_valid_mask'),
             freq_valid_mask=batch.get('freq_valid_mask'),
             aux_valid_mask=batch.get('aux_valid_mask'),
-            external_scale=ext_scale
+            external_scale=None
         )
 
-        if isinstance(out, tuple):
-            pred_seq = out[0]
-        else:
-            pred_seq = out
+        pred_seq = out[0] if isinstance(out, tuple) else out
 
         mask_seq = batch.get('target_seq_valid_mask', None)
+        device = pred_seq.device
+        mp = self._ensure_max_power(device, self.n_devices)
+        pred_seq_norm = torch.clamp(pred_seq / mp, 0.0, 1.0)
         if isinstance(mask_seq, torch.Tensor):
             m = mask_seq
-            if m.dim() + 1 == pred_seq.dim():
+            if m.dim() + 1 == pred_seq_norm.dim():
                 m = m.unsqueeze(-1)
             m = (m > 0).float()
-            num = (pred_seq * m).sum(dim=1)
+            num = (pred_seq_norm * m).sum(dim=1)
             den = m.sum(dim=1).clamp_min(1.0)
-            pred_power = num / den
+            pred_power_norm = num / den
         else:
-            pred_power = pred_seq.mean(dim=1)
-
-        return pred_power, None
+            pred_power_norm = pred_seq_norm.mean(dim=1)
+        pred_power_watts = pred_power_norm * mp.view(1, -1)
+        return pred_power_watts, None
 
     def _forward_and_compute_loss(self, batch: Dict[str, torch.Tensor], stage: str) -> Tuple[torch.Tensor, torch.Tensor]:
         """计算联合损失"""
         tf = batch.get('time_features')
         device = tf.device
-        loss_scale = self._ensure_power_scale(device, self.n_devices)
+        mp = self._ensure_max_power(device, self.n_devices)
 
         out = self.model.forward_seq(
             tf,
@@ -164,7 +168,7 @@ class NILMLightningModule(pl.LightningModule):
             time_valid_mask=batch.get('time_valid_mask'),
             freq_valid_mask=batch.get('freq_valid_mask'),
             aux_valid_mask=batch.get('aux_valid_mask'),
-            external_scale=loss_scale
+            external_scale=None
         )
 
         if isinstance(out, tuple):
@@ -181,15 +185,17 @@ class NILMLightningModule(pl.LightningModule):
             valid = valid.unsqueeze(-1)
         valid = (valid > 0) if valid is not None else torch.ones_like(pred_seq, dtype=torch.bool)
 
+        pred_seq_norm = torch.clamp(pred_seq / mp, 0.0, 1.0)
         loss_reg = self.loss_fn.regression_seq_loss(
-            pred_seq, target_seq,
+            pred_seq_norm, target_seq,
             status_seq=batch.get('status_seq'),
             valid_mask=valid,
-            power_scale=loss_scale
+            power_scale=None
         )
 
+        pred_seq_watts = pred_seq_norm * mp
         loss_cons = self.loss_fn.conservation_loss(
-            batch.get('mains_seq'), pred_seq
+            batch.get('mains_seq'), pred_seq_watts
         )
 
         total_loss = loss_reg + loss_cons
@@ -206,7 +212,7 @@ class NILMLightningModule(pl.LightningModule):
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict:
         pred_seq, loss = self._forward_and_compute_loss(batch, 'val')
-        metrics = self._compute_metrics(batch, (pred_seq, None), stage='val')
+        self._compute_metrics(batch, (pred_seq, None), stage='val')
         if self.enable_interactive:
             try:
                 ts_mat = batch.get('timestamps')
@@ -215,8 +221,14 @@ class NILMLightningModule(pl.LightningModule):
                 if isinstance(pred_seq, torch.Tensor) and isinstance(target_seq, torch.Tensor):
                     b = int(pred_seq.size(0))
                     for i in range(b):
-                        p = pred_seq[i].detach().cpu()
-                        t = target_seq[i].detach().cpu()
+                        device = pred_seq.device
+                        mp3 = self._ensure_max_power(device, self.n_devices)  # (1,1,K)
+                        mp2 = mp3.view(1, -1)  # (1,K)
+                        # 归一化到 [0,1] 后再按最大功率反归一化为瓦特
+                        p_norm = torch.clamp(pred_seq[i] / mp2, 0.0, 1.0)
+                        t_norm = target_seq[i]
+                        p_w = (p_norm * mp2).detach().cpu().numpy().astype('float32')  # (L,K)
+                        t_w = (torch.clamp(t_norm, 0.0, 1.0) * mp2).detach().cpu().numpy().astype('float32')  # (L,K)
                         m = None
                         try:
                             if isinstance(mains_seq, torch.Tensor):
@@ -232,144 +244,101 @@ class NILMLightningModule(pl.LightningModule):
                         else:
                             start_ts = float(torch.tensor(0.0).item())
                             step = float(getattr(getattr(self.trainer, 'datamodule', None), 'resample_seconds', 5.0))
-                        self._val_buffers.append({'pred': p, 'true': t, 'mains': m, 'start': start_ts, 'step': step})
+                        self._val_buffers.append({'pred': torch.tensor(p_w), 'true': torch.tensor(t_w), 'mains': m, 'start': start_ts, 'step': step})
             except Exception:
                 pass
         return {'val_loss': loss}
 
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict:
         pred_seq, loss = self._forward_and_compute_loss(batch, 'test')
-        metrics = self._compute_metrics(batch, (pred_seq, None), stage='test')
+        self._compute_metrics(batch, (pred_seq, None), stage='test')
         return {'test_loss': loss}
 
     def on_validation_epoch_end(self) -> None:
         if not self.enable_interactive:
             return
+        bufs = list(self._val_buffers)
+        self._val_buffers.clear()
+        if len(bufs) == 0:
+            return
+        _tr = getattr(self, '_trainer', None)
+        dm = getattr(_tr, 'datamodule', None)
+        dataset_name = str(getattr(self.config, 'dataset', '') or '')
+        fold_id = int(getattr(dm, 'fold_id', 0)) if dm is not None else 0
+        ep = int(getattr(self, 'current_epoch', 0))
         try:
-            import numpy as np
-            import os
-            from pathlib import Path
-            import plotly.graph_objects as go
-            from plotly.subplots import make_subplots
-            import datetime as pydt
-            bufs = list(self._val_buffers)
-            self._val_buffers.clear()
-            if len(bufs) == 0:
-                return
-            bufs.sort(key=lambda d: d.get('start', 0.0))
-            K = int(bufs[0]['pred'].size(-1))
-            Ls = [int(x['pred'].size(0)) for x in bufs]
-            total_len = int(sum(Ls))
-            step = float(bufs[0]['step'])
-            start0 = float(bufs[0]['start'])
-            timeline = np.arange(start0, start0 + total_len * step, step, dtype=np.float64)
-            try:
-                timeline_dt = timeline.astype('datetime64[s]')
-            except Exception:
-                # 回退：使用 Python datetime 列表
-                timeline_dt = [pydt.datetime.utcfromtimestamp(float(x)) for x in timeline.tolist()]
-            mains_concat = np.full((total_len,), np.nan, dtype=np.float32)
-            pred_concat = np.full((total_len, K), np.nan, dtype=np.float32)
-            true_concat = np.full((total_len, K), np.nan, dtype=np.float32)
-            pos = 0
-            for d in bufs:
-                p = d['pred'].numpy().astype(np.float32)
-                t = d['true'].numpy().astype(np.float32)
-                m = d.get('mains')
-                ln = int(p.shape[0])
-                pred_concat[pos:pos+ln, :min(K, p.shape[1])] = p[:, :min(K, p.shape[1])]
-                true_concat[pos:pos+ln, :min(K, t.shape[1])] = t[:, :min(K, t.shape[1])]
-                if m is not None:
-                    mm = m.numpy().astype(np.float32)
-                    if mm.ndim > 1:
-                        mm = mm.squeeze()
-                    mains_concat[pos:pos+ln] = mm[:ln]
-                pos += ln
-            titles = []
-            try:
-                titles = [str(self.device_names[k]) for k in range(K)]
-            except Exception:
-                titles = [f"Device_{k}" for k in range(K)]
-            fig = make_subplots(rows=K+1, cols=1, shared_xaxes=True, vertical_spacing=0.02, subplot_titles=["总功率"] + titles)
-            fig.add_trace(
-                go.Scatter(
-                    x=timeline_dt,
-                    y=mains_concat,
-                    name="总功率",
-                    mode="lines",
-                    line=dict(color="#7f7f7f")
-                ),
-                row=1,
-                col=1,
+            mp = self._ensure_max_power(torch.device('cpu'), self.n_devices).view(-1).detach().cpu().numpy()
+            fp = save_validation_interactive_plot(
+                buffers=bufs,
+                device_names=self.device_names,
+                vis_output_dir=self.vis_output_dir,
+                dataset_name=dataset_name,
+                fold_id=fold_id,
+                epoch=ep,
+                max_power=mp,
             )
-            for k in range(K):
-                fig.add_trace(
-                    go.Scatter(
-                        x=timeline_dt,
-                        y=true_concat[:, k],
-                        name="目标功率",
-                        mode="lines",
-                        line=dict(color="#2ca02c"),
-                        legendgroup="target",
-                        showlegend=True if k == 0 else False
-                    ),
-                    row=k+2,
-                    col=1,
-                )
-                fig.add_trace(
-                    go.Scatter(
-                        x=timeline_dt,
-                        y=pred_concat[:, k],
-                        name="预测功率",
-                        mode="lines",
-                        line=dict(color="#ff7f0e"),
-                        legendgroup="prediction",
-                        showlegend=True if k == 0 else False
-                    ),
-                    row=k+2,
-                    col=1,
-                )
-            fig.update_layout(template="plotly_white", legend=dict(orientation="h"))
             try:
-                fig.update_xaxes(tickformat="%Y-%m-%d %H:%M")
+                import numpy as _np
+                total_len = int(_np.sum([int(x['pred'].size(0)) for x in bufs]))
+                K = int(bufs[0]['pred'].size(-1))
+                print(f"[Viz] 保存交互式验证图: {str(fp)} (len={total_len}, devices={K})")
             except Exception:
                 pass
-            dm = getattr(self.trainer, 'datamodule', None)
-            dataset_name = str(getattr(self.config, 'dataset', '') or '').lower()
-            fold_id = int(getattr(dm, 'fold_id', 0)) if dm is not None else 0
-            rank_dir = Path(self.vis_output_dir) / "val_interactive" / dataset_name / f"fold_{fold_id}" / f"rank_0"
-            Path(rank_dir).mkdir(parents=True, exist_ok=True)
-            ep = int(getattr(self, 'current_epoch', 0))
-            fp = Path(rank_dir) / f"epoch_{ep:04d}.html"
-            import plotly.io as pio
-            pio.write_html(fig, file=str(fp), include_plotlyjs='cdn', auto_open=False)
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                print("[Viz] 交互式验证图保存失败:", str(e))
+            except Exception:
+                pass
 
     def _compute_metrics(self, batch: Dict[str, torch.Tensor], preds: Tuple, stage: str) -> Dict:
         """计算指标 (MAE, NDE, SAE)"""
         try:
-            pred_seq = preds[0]
-            pred_power = pred_seq.mean(dim=1)
+            pred0 = preds[0]
+            device = pred0.device
+            mp = self._ensure_max_power(device, self.n_devices)
 
+            if pred0.dim() == 3:
+                valid = batch.get('target_seq_valid_mask')
+                if isinstance(valid, torch.Tensor) and valid.dim() + 1 == pred0.dim():
+                    valid = valid.unsqueeze(-1)
+                valid_f = (valid > 0).float() if isinstance(valid, torch.Tensor) else None
+                pred_seq_norm = torch.clamp(pred0 / mp, 0.0, 1.0)
+                if isinstance(valid_f, torch.Tensor):
+                    num = (pred_seq_norm * valid_f).sum(dim=1)
+                    den = valid_f.sum(dim=1).clamp_min(1.0)
+                    pred_power_norm = num / den
+                else:
+                    pred_power_norm = pred_seq_norm.mean(dim=1)
+                pred_power_watts = pred_power_norm * mp.view(1, -1)
+            else:
+                # 已是 (B, K) 的窗口级功率（应为瓦特）
+                pred_power_watts = pred0
             y_true = batch.get('target_power')
             if y_true is None:
                 return {}
 
-            K_common = min(pred_power.size(1), y_true.size(1))
-            pred_power = pred_power[:, :K_common]
+            K_common = min(pred_power_watts.size(1), y_true.size(1))
+            pred_power_watts = pred_power_watts[:, :K_common]
             y_true = y_true[:, :K_common]
 
-            res = self.nilm_metrics.compute_regression_metrics(
-                pred_power, y_true,
-                power_scale=self.power_scale[:K_common] if self.power_scale is not None else None
+            # 仅回归指标
+            dummy_cls_pred = torch.zeros_like(y_true)
+            dummy_cls_true = torch.zeros_like(y_true)
+            res = self.nilm_metrics.compute_all_metrics(
+                y_pred_power=pred_power_watts,
+                y_pred_proba=dummy_cls_pred,
+                y_true_power=y_true,
+                y_true_states=dummy_cls_true,
+                optimize_thresholds=False,
+                classification_enabled=False,
+                sample_weights=None,
             )
 
             for k, v in res.items():
                 self._safe_log(f'{stage}/metrics/{k}', v, on_epoch=True)
 
             return res
-        except Exception as e:
+        except Exception:
             return {}
 
     def configure_optimizers(self):
@@ -403,7 +372,7 @@ def load_device_info(config: DictConfig) -> Tuple[Dict, List[str]]:
     """加载设备信息"""
     try:
         names = list(config.data.device_names)
-    except:
+    except Exception:
         names = ['device_1']
 
     info = {}
@@ -417,8 +386,20 @@ def main(config: DictConfig) -> None:
     pl.seed_everything(config.get('seed', 42))
 
     datamodule = NILMDataModule(config)
+    try:
+        datamodule.setup('fit')
+    except Exception:
+        pass
 
-    device_info, device_names = load_device_info(config)
+    # 优先使用数据集真实设备映射名称
+    try:
+        if hasattr(datamodule, 'device_names') and datamodule.device_names:
+            device_names = list(datamodule.device_names)
+        else:
+            _info, device_names = load_device_info(config)
+    except Exception:
+        _info, device_names = load_device_info(config)
+    device_info, _ = load_device_info(config)
 
     logger = TensorBoardLogger("outputs", name="nilm_experiment")
 

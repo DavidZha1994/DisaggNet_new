@@ -47,22 +47,18 @@ class NILMLoss:
                             status_seq: Optional[torch.Tensor], valid_mask: Optional[torch.Tensor],
                             power_scale: Optional[torch.Tensor]) -> torch.Tensor:
         B, L, K = pred_seq.size()
-        device = pred_seq.device
-        scale = self._ensure_scale(power_scale, device, K)
-        pred_n = pred_seq / scale
-        target_n = target_seq / scale
         if valid_mask is None:
-            valid_mask = torch.ones_like(pred_n, dtype=torch.bool)
+            valid_mask = torch.ones_like(pred_seq, dtype=torch.bool)
         valid_f = valid_mask.float()
         loss_fn = torch.nn.HuberLoss(reduction='none', delta=self.huber_delta)
-        base_loss = loss_fn(pred_n, target_n)
-        weight_map = torch.ones_like(pred_n)
+        base_loss = loss_fn(pred_seq, target_seq)
+        weight_map = torch.ones_like(pred_seq)
         if isinstance(status_seq, torch.Tensor):
             weight_map = weight_map + (torch.clamp(status_seq, 0.0, 1.0) * self.active_boost)
-            off_mask = (status_seq < 0.5) & (pred_n.abs() > self.active_threshold_rel)
-            off_penalty = torch.abs(pred_n) * off_mask.float() * self.off_penalty_weight
+            off_mask = (status_seq < 0.5) & (pred_seq.abs() > self.active_threshold_rel)
+            off_penalty = torch.abs(pred_seq) * off_mask.float() * self.off_penalty_weight
         else:
-            off_penalty = torch.zeros_like(pred_n)
+            off_penalty = torch.zeros_like(pred_seq)
         total_pixel_loss = (base_loss * weight_map) + off_penalty
         loss_val = (total_pixel_loss * valid_f).sum() / valid_f.sum().clamp(min=1.0)
         return loss_val
@@ -72,13 +68,10 @@ class NILMLoss:
                                        power_scale: Optional[torch.Tensor]) -> torch.Tensor:
         B, L, K = pred_seq.size()
         device = pred_seq.device
-        scale = self._ensure_scale(power_scale, device, K)
-        pred_n = pred_seq / scale
-        target_n = target_seq / scale
-        valid = valid_mask if isinstance(valid_mask, torch.Tensor) else torch.ones_like(pred_n, dtype=torch.bool)
+        valid = valid_mask if isinstance(valid_mask, torch.Tensor) else torch.ones_like(pred_seq, dtype=torch.bool)
         valid = valid.to(torch.bool)
         delta = self.huber_delta
-        resid = torch.abs(pred_n - target_n)
+        resid = torch.abs(pred_seq - target_seq)
         huber_el = torch.where(resid < delta, 0.5 * resid ** 2, delta * (resid - 0.5 * delta))
         if isinstance(status_seq, torch.Tensor):
             huber_el = huber_el * (1.0 + torch.clamp(status_seq, 0.0, 1.0) * self.active_boost)
@@ -87,12 +80,11 @@ class NILMLoss:
         huber_loss_k = huber_el.sum(dim=(0, 1)) / denom
         off_pen_k = torch.zeros(K, device=device)
         if isinstance(status_seq, torch.Tensor):
-            off_mask = (status_seq < 0.5) & (pred_n.abs() > self.active_threshold_rel) & valid
-            off_mag = torch.where(off_mask, torch.abs(pred_n), torch.zeros_like(pred_n))
+            off_mask = (status_seq < 0.5) & (pred_seq.abs() > self.active_threshold_rel) & valid
+            off_mag = torch.where(off_mask, torch.abs(pred_seq), torch.zeros_like(pred_seq))
             denom_off = off_mask.float().sum(dim=(0, 1)).clamp(min=1.0)
             off_pen_k = off_mag.sum(dim=(0, 1)) / denom_off
         return huber_loss_k + self.off_penalty_weight * off_pen_k
-
 
     def conservation_loss(self, mains_seq: Optional[torch.Tensor], pred_seq: torch.Tensor,
                           target_seq: Optional[torch.Tensor] = None,
@@ -104,8 +96,13 @@ class NILMLoss:
         loss_violation = violation.mean()
         return loss_violation * self.conservation_weight
 
-    def unknown_residual_loss(self, mains_seq: Optional[torch.Tensor], pred_seq: torch.Tensor,
-                               unknown_win: Optional[torch.Tensor], status_seq: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def unknown_residual_loss(
+        self,
+        mains_seq: Optional[torch.Tensor],
+        pred_seq: torch.Tensor,
+        unknown_win: Optional[torch.Tensor],
+        status_seq: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if not (isinstance(mains_seq, torch.Tensor) and isinstance(unknown_win, torch.Tensor)):
             return torch.tensor(0.0, device=pred_seq.device)
         sum_per_t = pred_seq.sum(dim=2)

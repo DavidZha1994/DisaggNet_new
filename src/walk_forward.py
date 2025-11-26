@@ -4,21 +4,16 @@ import logging
 import pickle
 import yaml
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Optional
 from dataclasses import dataclass
 from datetime import datetime
 
 import pandas as pd
 import numpy as np
-import torch
-import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from .data.datamodule import NILMDataModule  # 使用新的工业级数据模块
 from .train import NILMLightningModule, create_trainer, setup_logging
-from .models.fusion_transformer import FusionTransformer
-from .utils.metrics import NILMMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +166,9 @@ class WalkForwardValidator:
         start_time = data_df[timestamp_col].min()
         end_time = data_df[timestamp_col].max()
         total_duration = end_time - start_time
+        logger.info(
+            f"Data time range: {start_time} -> {end_time} ({total_duration})"
+        )
         
         # 计算折叠参数
         num_folds = self.wf_config.num_folds

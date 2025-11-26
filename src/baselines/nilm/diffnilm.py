@@ -322,7 +322,9 @@ class DiffNILM(nn.Module):
     """
     Diffusion backbone directly taken from NuWave
 
-    Argument for conditioning wav_l (i.e. low resolution sound in NuWave paper) is simply replaced by agg (aggregate load curve) and encoding (timestamp information), the two conditioning variable used for diffusion in DiffNILM
+    Argument for conditioning wav_l (low-resolution sound in NuWave) is
+    replaced by agg (aggregate load curve) and encoding (timestamp info),
+    the two conditioning variables used for diffusion in DiffNILM.
     """
 
     def sample_continuous_noise_level(self, step):

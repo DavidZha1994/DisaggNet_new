@@ -5,8 +5,7 @@ Conformal Prediction 不确定性量化模块
 
 import numpy as np
 import torch
-import torch.nn as nn
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple
 from abc import ABC, abstractmethod
 import logging
 from pathlib import Path

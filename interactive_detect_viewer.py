@@ -1,5 +1,5 @@
 import os
-from typing import List, Tuple, Optional
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -26,7 +26,6 @@ def _load_pt(fp: str):
 
 def _to_numpy(x):
     try:
-        import torch
         if hasattr(x, 'detach'):
             return x.detach().cpu().numpy()
         if hasattr(x, 'numpy'):
@@ -116,9 +115,9 @@ def _enforce_min_runs(state: np.ndarray, min_on_pts: int, min_off_pts: int) -> n
         need = min_on_pts if v == 1 else min_off_pts
         if length < need:
             if a > 0:
-                out[a:b+1] = out[a - 1]
+                out[a:b + 1] = out[a - 1]
             elif b < (out.size - 1):
-                out[a:b+1] = out[b + 1]
+                out[a:b + 1] = out[b + 1]
     return out
 
 # 已移除所有 HMM 识别和预览逻辑，查看器只读取并展示检测脚本生成的掩码
@@ -143,11 +142,16 @@ def load_detection_fold(fold_dir: str):
         starts_sec = (pd.to_datetime(ser_iso, errors='coerce').astype('int64') // 1_000_000_000).to_numpy(dtype=np.int64) if len(ser_iso) > 0 else np.array([], dtype=np.int64)
 
         # 窗口维度
-        tP = obj.get('targets_P'); tQ = obj.get('targets_Q'); tS = obj.get('targets_S')
-        onP = obj.get('onoff_P'); vP = obj.get('valid_P')
-        onQ = obj.get('onoff_Q'); vQ = obj.get('valid_Q')
-        onS = obj.get('onoff_S'); vS = obj.get('valid_S')
-        import torch
+        tP = obj.get('targets_P')
+        tQ = obj.get('targets_Q')
+        tS = obj.get('targets_S')
+        onP = obj.get('onoff_P')
+        vP = obj.get('valid_P')
+        onQ = obj.get('onoff_Q')
+        vQ = obj.get('valid_Q')
+        onS = obj.get('onoff_S')
+        vS = obj.get('valid_S')
+
         def to_np(x):
             if x is None:
                 return None
@@ -155,10 +159,15 @@ def load_detection_fold(fold_dir: str):
                 return (x.detach().cpu().numpy() if hasattr(x, 'detach') else x)
             except Exception:
                 return x
-        tP = to_np(tP); tQ = to_np(tQ); tS = to_np(tS)
-        onP = to_np(onP); vP = to_np(vP)
-        onQ = to_np(onQ); vQ = to_np(vQ)
-        onS = to_np(onS); vS = to_np(vS)
+        tP = to_np(tP)
+        tQ = to_np(tQ)
+        tS = to_np(tS)
+        onP = to_np(onP)
+        vP = to_np(vP)
+        onQ = to_np(onQ)
+        vQ = to_np(vQ)
+        onS = to_np(onS)
+        vS = to_np(vS)
         if tP is None:
             raise ValueError('train_targets_seq 缺少 targets_P。')
         N, L, K = tP.shape
@@ -272,7 +281,7 @@ def load_detection_fold(fold_dir: str):
 
 
 st.sidebar.title("交互配置")
-default_fold = os.path.join(os.getcwd(), 'Data', 'prepared','hipe', 'fold_2')
+default_fold = os.path.join(os.getcwd(), 'Data', 'prepared', 'hipe', 'fold_2')
 fold_dir = st.sidebar.text_input("Fold 目录", value=default_fold)
 
 try:

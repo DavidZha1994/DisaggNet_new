@@ -1,4 +1,3 @@
-import os
 import math
 import torch
 from omegaconf import OmegaConf
@@ -34,7 +33,11 @@ def make_config(reg_w: float = 1.0, cls_w: float = 0.0):
             "fusion": {"type": "none", "gated": False},
             "aux_encoder": {"enable": False},
             "heads": {
-                "regression": {"hidden": 128, "init_bias": -4.0, "seq_emb_scale": 0.05},
+                "regression": {
+                    "hidden": 128,
+                    "init_bias": -4.0,
+                    "seq_emb_scale": 0.05,
+                },
                 "conditioning": {"enable_film": False, "dropout": 0.0},
                 "classification": {"enable": False, "init_p": [0.1]},
                 "unknown": {"enable": False},
@@ -89,7 +92,11 @@ def make_batch(B: int = 2, L: int = 64, K: int = 5, device: str = "cpu"):
 
 def grad_norm_on_reg_head(module: NILMLightningModule):
     head = module.model.prediction_head.regression_heads[0]
-    return float(head[-2].weight.grad.norm().item() if head[-2].weight.grad is not None else 0.0)
+    return float(
+        head[-2].weight.grad.norm().item()
+        if head[-2].weight.grad is not None
+        else 0.0
+    )
 
 
 def test_regression_weight_scales_gradients():
@@ -101,7 +108,11 @@ def test_regression_weight_scales_gradients():
     cfg1.loss.shape_loss_weight = 0.0
     cfg1.loss.derivative_loss_weight = 0.0
     cfg1.loss.edge_focus_weight = 0.0
-    m1 = NILMLightningModule(cfg1, {"accelerator": "cpu"}, cfg1.data.device_names)
+    m1 = NILMLightningModule(
+        cfg1,
+        {"accelerator": "cpu"},
+        cfg1.data.device_names,
+    )
     m1.power_scale = torch.tensor([100.0, 150.0, 200.0, 250.0, 50.0]).float()
     batch = make_batch(device="cpu")
     m1.zero_grad()
@@ -117,7 +128,11 @@ def test_regression_weight_scales_gradients():
     cfg10.loss.shape_loss_weight = 0.0
     cfg10.loss.derivative_loss_weight = 0.0
     cfg10.loss.edge_focus_weight = 0.0
-    m10 = NILMLightningModule(cfg10, {"accelerator": "cpu"}, cfg10.data.device_names)
+    m10 = NILMLightningModule(
+        cfg10,
+        {"accelerator": "cpu"},
+        cfg10.data.device_names,
+    )
     m10.power_scale = m1.power_scale.clone()
     batch2 = make_batch(device="cpu")
     m10.zero_grad()
@@ -132,7 +147,11 @@ def test_regression_weight_scales_gradients():
 def test_external_scale_applied_in_forward_seq():
     torch.manual_seed(1)
     cfg = make_config(reg_w=1.0, cls_w=0.0)
-    module = NILMLightningModule(cfg, {"accelerator": "cpu"}, cfg.data.device_names)
+    module = NILMLightningModule(
+        cfg,
+        {"accelerator": "cpu"},
+        cfg.data.device_names,
+    )
     tf = torch.randn(2, 32, 4).float()
     ones = torch.ones(1, 1, len(cfg.data.device_names)).float()
     big = 1000.0 * ones

@@ -10,15 +10,15 @@ Cross Validation Module
 """
 
 import numpy as np
-import polars as pl
 import pandas as pd
 from .io import safe_to_csv
-from typing import List, Dict, Tuple, Iterator, Optional
+from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class CVFold:
@@ -34,6 +34,7 @@ class CVFold:
     train_segments: List[int] = None
     val_segments: List[int] = None
     test_segments: List[int] = None
+
 
 class WalkForwardCV:
     """Walk-Forward交叉验证器"""
@@ -77,8 +78,6 @@ class WalkForwardCV:
         
         # 计算每折的时间跨度
         cv_span = cv_end - global_start
-        fold_span = cv_span // self.n_folds
-        val_span_seconds = self.val_span_days * 24 * 3600
         min_train_seconds = self.min_train_days * 24 * 3600
         
         folds = []
@@ -156,14 +155,18 @@ class WalkForwardCV:
                     train_segments.append(segment['segment_id'])
                 
                 # 验证集：段完全在验证时间窗口内
-                elif (segment_start >= fold.val_start_ts and 
-                      segment_end <= fold.val_end_ts):
+                elif (
+                    segment_start >= fold.val_start_ts
+                    and segment_end <= fold.val_end_ts
+                ):
                     val_segments.append(segment['segment_id'])
                 
                 # 测试集：段完全在测试时间窗口内
-                elif (fold.test_start_ts is not None and
-                      segment_start >= fold.test_start_ts and
-                      segment_end <= fold.test_end_ts):
+                elif (
+                    fold.test_start_ts is not None
+                    and segment_start >= fold.test_start_ts
+                    and segment_end <= fold.test_end_ts
+                ):
                     test_segments.append(segment['segment_id'])
             
             else:
@@ -172,8 +175,10 @@ class WalkForwardCV:
                     train_segments.append(segment['segment_id'])
                 elif segment_start >= fold.val_start_ts and segment_start < fold.val_end_ts:
                     val_segments.append(segment['segment_id'])
-                elif (fold.test_start_ts is not None and 
-                      segment_start >= fold.test_start_ts):
+                elif (
+                    fold.test_start_ts is not None
+                    and segment_start >= fold.test_start_ts
+                ):
                     test_segments.append(segment['segment_id'])
         
         fold.train_segments = train_segments
@@ -210,10 +215,14 @@ class WalkForwardCV:
         else:
             # 时间点分割
             train_mask = metadata['end_ts'] <= fold.train_end_ts
-            val_mask = ((metadata['start_ts'] >= fold.val_start_ts) & 
-                       (metadata['end_ts'] <= fold.val_end_ts))
-            test_mask = ((metadata['start_ts'] >= fold.test_start_ts) & 
-                        (metadata['end_ts'] <= fold.test_end_ts)) if fold.test_start_ts else np.zeros(len(metadata), dtype=bool)
+            val_mask = (
+                (metadata['start_ts'] >= fold.val_start_ts)
+                & (metadata['end_ts'] <= fold.val_end_ts)
+            )
+            test_mask = (
+                (metadata['start_ts'] >= fold.test_start_ts)
+                & (metadata['end_ts'] <= fold.test_end_ts)
+            ) if fold.test_start_ts else np.zeros(len(metadata), dtype=bool)
         
         # 创建数据集
         train_dataset = {
