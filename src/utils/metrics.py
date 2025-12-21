@@ -418,77 +418,66 @@ class NILMMetrics:
                           optimize_thresholds: bool = True,
                           classification_enabled: bool = True,
                           sample_weights: Optional[torch.Tensor] = None) -> Dict[str, Union[float, Dict[str, float]]]:
-        """计算所有指标"""
-        metrics = {}
-        
-        # 优化阈值（仅分类启用时）
+        overall: Dict[str, float] = {}
         if classification_enabled and optimize_thresholds:
             try:
                 self.optimize_thresholds(y_pred_proba, y_true_states)
             except Exception:
                 pass
-        
-        # 回归指标（支持样本权重）
-        metrics['mae'] = self.mean_absolute_error(y_pred_power, y_true_power, sample_weights=sample_weights)
-        metrics['mae_per_device'] = self.mean_absolute_error(y_pred_power, y_true_power, per_device=True, sample_weights=sample_weights)
-        metrics['nde'] = self.normalized_disaggregation_error(y_pred_power, y_true_power, sample_weights=sample_weights)
-        metrics['nde_per_device'] = self.normalized_disaggregation_error(y_pred_power, y_true_power, per_device=True, sample_weights=sample_weights)
-        metrics['sae'] = self.signal_aggregate_error(y_pred_power, y_true_power, sample_weights=sample_weights)
-        metrics['teca'] = self.total_energy_correctly_assigned(y_pred_power, y_true_power, sample_weights=sample_weights)
-        metrics['teca_per_device'] = self.total_energy_correctly_assigned(y_pred_power, y_true_power, per_device=True, sample_weights=sample_weights)
-        
-        # 分类指标（可选，支持样本权重）
+        overall['mae'] = self.mean_absolute_error(y_pred_power, y_true_power, sample_weights=sample_weights)  # type: ignore
+        overall['nde'] = self.normalized_disaggregation_error(y_pred_power, y_true_power, sample_weights=sample_weights)  # type: ignore
+        overall['sae'] = self.signal_aggregate_error(y_pred_power, y_true_power, sample_weights=sample_weights)  # type: ignore
+        overall['teca'] = self.total_energy_correctly_assigned(y_pred_power, y_true_power, sample_weights=sample_weights)  # type: ignore
         if classification_enabled:
             try:
-                metrics['f1'] = self.f1_score(y_pred_proba, y_true_states, sample_weights=sample_weights)
-                metrics['f1_per_device'] = self.f1_score(y_pred_proba, y_true_states, per_device=True, sample_weights=sample_weights)
-                metrics['mcc'] = self.matthews_correlation_coefficient(y_pred_proba, y_true_states)
-                metrics['mcc_per_device'] = self.matthews_correlation_coefficient(y_pred_proba, y_true_states, per_device=True)
-                metrics['pr_auc'] = self.precision_recall_auc(y_pred_proba, y_true_states, sample_weights=sample_weights)
-                metrics['pr_auc_per_device'] = self.precision_recall_auc(y_pred_proba, y_true_states, per_device=True, sample_weights=sample_weights)
-                metrics['roc_auc'] = self.roc_auc(y_pred_proba, y_true_states, sample_weights=sample_weights)
-                metrics['roc_auc_per_device'] = self.roc_auc(y_pred_proba, y_true_states, per_device=True, sample_weights=sample_weights)
-                # 事件检测指标（不采用样本权重）
-                metrics['event_metrics'] = self.event_detection_metrics(y_pred_proba, y_true_states)
+                overall['f1'] = self.f1_score(y_pred_proba, y_true_states, sample_weights=sample_weights)  # type: ignore
+                overall['mcc'] = self.matthews_correlation_coefficient(y_pred_proba, y_true_states)  # type: ignore
+                overall['pr_auc'] = self.precision_recall_auc(y_pred_proba, y_true_states, sample_weights=sample_weights)  # type: ignore
+                overall['roc_auc'] = self.roc_auc(y_pred_proba, y_true_states, sample_weights=sample_weights)  # type: ignore
             except Exception:
                 pass
-        
-        # 综合评分（会根据已有指标自动加权）
-        metrics['score'] = self._compute_composite_score(metrics)
-        
+        overall['score'] = self._compute_composite_score(overall)
+        dev_mae = self.mean_absolute_error(y_pred_power, y_true_power, per_device=True, sample_weights=sample_weights)
+        dev_nde = self.normalized_disaggregation_error(y_pred_power, y_true_power, per_device=True, sample_weights=sample_weights)
+        dev_teca = self.total_energy_correctly_assigned(y_pred_power, y_true_power, per_device=True, sample_weights=sample_weights)
+        metrics: Dict[str, Union[float, Dict[str, float]]] = {'overall': overall}
+        for i, name in enumerate(self.device_names):
+            d: Dict[str, float] = {}
+            try:
+                d['mae'] = float(dev_mae[name]) if isinstance(dev_mae, dict) else float(dev_mae[i])  # type: ignore
+            except Exception:
+                pass
+            try:
+                d['nde'] = float(dev_nde[name]) if isinstance(dev_nde, dict) else float(dev_nde[i])  # type: ignore
+            except Exception:
+                pass
+            try:
+                d['teca'] = float(dev_teca[name]) if isinstance(dev_teca, dict) else float(dev_teca[i])  # type: ignore
+            except Exception:
+                pass
+            metrics[name] = d
         return metrics
     
-    def _compute_composite_score(self, metrics: Dict) -> float:
-        """计算综合评分"""
-        # 权重配置
+    def _compute_composite_score(self, metrics: Dict[str, float]) -> float:
         weights = {
-            'mae': -0.2,  # 负权重，越小越好
-            'nde': -0.2,
+            'mae': -0.25,
+            'nde': -0.25,
             'sae': -0.1,
-            'teca': 0.2,  # 正权重，越大越好
+            'teca': 0.4,
             'f1': 0.3,
             'mcc': 0.2,
             'pr_auc': 0.2
         }
-        
         score = 0.0
-        total_weight = 0.0
-        
-        for metric_name, weight in weights.items():
-            if metric_name in metrics:
-                value = metrics[metric_name]
-                if isinstance(value, (int, float)) and not np.isnan(value):
-                    if weight < 0:
-                        # 对于越小越好的指标，使用负指数变换
-                        normalized_value = np.exp(-value)
-                    else:
-                        # 对于越大越好的指标，直接使用
-                        normalized_value = value
-                    
-                    score += abs(weight) * normalized_value
-                    total_weight += abs(weight)
-        
-        return score / total_weight if total_weight > 0 else 0.0
+        total = 0.0
+        for k, w in weights.items():
+            if k in metrics:
+                v = metrics[k]
+                if isinstance(v, (int, float)) and not np.isnan(v):
+                    nv = np.exp(-v) if w < 0 else v
+                    score += abs(w) * nv
+                    total += abs(w)
+        return score / total if total > 0 else 0.0
 
 
 class ConsistencyMetrics:

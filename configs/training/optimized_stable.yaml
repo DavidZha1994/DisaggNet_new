@@ -25,12 +25,13 @@ logging:
 
 # 数据设置（稳定版）
 data:
-  batch_size: 2048
+  batch_size: 32
   num_workers: 0
   pin_memory: true
   persistent_workers: false
   prefetch_factor: null
   window_size: 256
+  normalize_total_power_to_watts: true
   device_names:
     - washing_machine
     - dishwasher
@@ -40,24 +41,20 @@ data:
 
 # 模型设置（融合Transformer）
 model:
-  d_model: 256
-  n_heads: 8
-  num_layers: 4
-  dropout: 0.0
-  calibration:
-    enable: true
+  efficient_attention: true
   time_encoder:
-    d_model: 256
+    d_model: 96
     n_heads: 8
-    num_layers: 4
-    dropout: 0.0
+    num_layers: 3
+    dropout: 0.2
     input_conv_embed: true
     causal_mask: true
+    use_efficient_attention: true
     multi_scale_inputs:
       enable: false
       windows: [2, 4, 16, 64]
   freq_encoder:
-    enable: false
+    enable: true
     proj_dim: 256
     conv1d_kernel: 3
     dropout: 0.0
@@ -65,8 +62,10 @@ model:
     num_layers: 1
     n_heads: 4
     return_sequence: false
+    use_efficient_attention: true
   fusion:
-    type: "none"
+    type: "cross_attention"
+    bidirectional: true
     gated: false
   aux_encoder:
     enable: false
@@ -76,30 +75,21 @@ model:
     regression:
       hidden: 192
       init_bias: 0.0
-      seq_emb_scale: 1.0
       use_softplus: false
       seq_use_softplus: true
-      seq_init_bias: 0.1
       activation: "identity"
       seq_activation: "identity"
-      use_seq_ln: true
-    conditioning:
-      enable_film: false
-      dropout: 0.0
-    classification:
-      enable: false
-      init_p: []
+      gating_strength: 0.6
+      gate_temperature: 0.9
+      calib_strength: 0.15
     unknown:
-      enable: false
-
-    routing:
       enable: false
 
 # 训练设置（稳定优化）
 training:
-  max_epochs: 320
+  max_epochs: 25
   min_epochs: 1
-  precision: "bf16-mixed"
+  precision: "32-true"
   log_every_n_steps: 10
   gradient_clip_val: 1.0
   accumulate_grad_batches: 1
@@ -117,13 +107,13 @@ training:
     save_dir: "outputs/viz"
   optimizer:
     name: "adamw"
-    lr: 3e-3
+    lr: 3e-4
     weight_decay: 0.0
     betas: [0.9, 0.999]
   scheduler:
     name: "cosine"
-    warmup_steps: 20
-    T_max: 320
+    warmup_steps: 2
+    T_max: 25
     eta_min: 1e-6
   checkpoint:
     dirpath: "outputs/checkpoints"
@@ -132,11 +122,12 @@ training:
     mode: "min"
     save_top_k: 1
   early_stopping:
-    enable: false
-    monitor: "val/loss"
-    patience: 15
+    enable: true
+    monitor: "val/loss/total"
+    patience: 10
     mode: "min"
-    min_delta: 0.001
+    min_delta: 0.0
+    start_epoch: 23
   masking:
     window_strategy: "none"
     min_valid_ratio_time: 0.5
@@ -153,7 +144,7 @@ loss:
   type: peak_aware
   regression_weight: 1.0
   classification_weight: 0.0
-  conservation_weight: 0.1
+  conservation_weight: 0.4
   consistency_weight: 0.0
   nonneg_penalty_weight: 0.3
   # weights tuning
@@ -166,27 +157,24 @@ loss:
   # 窗口尺度策略：与 overfit 脚本一致
   scale_strategy: window_quantile
   # Peak-Aware 参数（与脚本一致）
-  peak_aware_active_w: 3.0
-  peak_aware_peak_q: 0.95
-  peak_aware_aw: 20.0
-  peak_aware_pw: 40.0
-  peak_aware_weighted_weight: 2.0
-  peak_aware_shape_weight: 1.0
+  peak_focus_top_p: 0.1
+  peak_focus_weight: 0.6
   # 关闭其他归一化项权重
-  active_threshold_rel: 0.02
-  off_penalty_weight: 0.0
+  active_threshold_rel: 0.015
+  off_penalty_weight: 1.2
   rel_loss_weight: 0.0
   shape_loss_weight: 0.0
-  derivative_loss_weight: 0.0
-  edge_focus_weight: 0.0
+  derivative_loss_weight: 0.10
+  edge_focus_weight: 0.40
   edge_focus_thr_rel: 0.03
   multiscale_shapes: []
-  # 稀有设备学习增强
-  rare_active_alpha: 1.0
-  rare_active_floor: 1.0
-  # 近似常开的设备（如冰箱）关闭期样本增强
-  rare_neg_alpha: 1.0
-  rare_neg_floor: 1.0
+  exclusive_penalty_weight: 0.15
+  sparsity_weight: 0.02
+  allocation_weight: 0.15
+  allocation_blend_alpha: 0.0
+  event_count_weight: 0.20
+  active_amplitude_weight: 0.45
+  shape_variance_weight: 0.15
   # 移除分类相关设置
   off_penalty_rel_threshold: 0.02
   # 课程式权重（翻转）：先回归，后分类
@@ -195,20 +183,20 @@ loss:
   cls_start_epoch: 20
   unknown_start_epoch: 20
   unknown_ramp_epochs: 10
-  cons_start_epoch: 5
-  cons_ramp_epochs: 10
-  off_start_epoch: 10
-  off_ramp_epochs: 10
-  peak_ramp_start: 12
+  cons_start_epoch: 2
+  cons_ramp_epochs: 8
+  off_start_epoch: 0
+  off_ramp_epochs: 6
+  peak_ramp_start: 10
   peak_ramp_epochs: 6
   peak_target_weight: 1.5
-  edge_ramp_start: 12
+  edge_ramp_start: 10
   edge_ramp_epochs: 6
   edge_target_weight: 1.2
-  derivative_ramp_start: 12
+  derivative_ramp_start: 10
   derivative_ramp_epochs: 6
   derivative_target_weight: 1.2
-  shape_ramp_start: 12
+  shape_ramp_start: 10
   shape_ramp_epochs: 6
   shape_target_weight: 0.8
   active_boost_start_epoch: 0
@@ -222,13 +210,14 @@ evaluation:
 
 # 不平衡处理
 imbalance_handling:
-  use_weighted_sampling: false
+  use_weighted_sampling: true
   pos_weight_auto: false
-  sampling_strategy: "none"
+  sampling_strategy: "oversample"
   pos_count_inverse_enable: false
-  event_boost: 0.0
-  early_oversample_epochs: 0
-  early_event_boost: 0.0
+  event_boost: 5.0
+  early_oversample_epochs: 8
+  early_event_boost: 1.5
+  validity_min_ratio: 0.75
 
 # Walk-Forward 交叉验证（优化版本）
 walk_forward:

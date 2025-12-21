@@ -122,8 +122,16 @@ class REFITUKDALEPipeline:
 
         self.ru.dataset = ds_name
         self.ru.data_path = data_path
-        # 输出目录：若脚本外设置则使用外部；否则回退默认
-        self.output_dir = self.ru.result_path or self.output_dir or "Data/prepared"
+        # 输出目录：优先 prep_config.data_storage.output_directory，其次 RUConfig.result_path，最后默认
+        try:
+            ds_cfg = (self.prep_cfg.get("data_storage", {}) or {})
+            out_dir_cfg = str(ds_cfg.get("output_directory", "") or "").strip()
+        except Exception:
+            out_dir_cfg = ""
+        if out_dir_cfg:
+            self.output_dir = out_dir_cfg
+        else:
+            self.output_dir = self.ru.result_path or self.output_dir or "Data/prepared"
         os.makedirs(self.output_dir, exist_ok=True)
 
         # 合并数据集定义（来自 prep_config.yaml 的 datasets 节点）
@@ -431,6 +439,8 @@ class REFITUKDALEPipeline:
             dev_map = {name: i for i, name in enumerate(device_names)}
             with open(os.path.join(dataset_dir, "device_name_to_id.json"), "w", encoding="utf-8") as f:
                 json.dump(dev_map, f, ensure_ascii=False, indent=2)
+            with open(os.path.join(dataset_dir, "device_names.json"), "w", encoding="utf-8") as f:
+                json.dump(device_names, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
 
@@ -447,6 +457,22 @@ class REFITUKDALEPipeline:
         except Exception:
             pass
 
+        # 保存交叉验证计划（所有折的窗口划分）
+        try:
+            rows = []
+            for fold in folds:
+                tr_ds, va_ds, _ = cv.split_windows(windows_dataset, fold)
+                tr_idx = tr_ds["metadata"]["window_idx"].to_numpy(dtype=np.int64)
+                va_idx = va_ds["metadata"]["window_idx"].to_numpy(dtype=np.int64)
+                for w in tr_idx.tolist():
+                    rows.append({"fold_id": int(fold.fold_id), "split": "train", "window_idx": int(w)})
+                for w in va_idx.tolist():
+                    rows.append({"fold_id": int(fold.fold_id), "split": "val", "window_idx": int(w)})
+            cv_plan_df = pd.DataFrame(rows)
+            cv_plan_df.to_csv(os.path.join(dataset_dir, "cv_plan.csv"), index=False)
+        except Exception:
+            pass
+
         # 遍历每个折并保存
         for fold in folds:
             fold_dir = os.path.join(dataset_dir, f"fold_{fold.fold_id}")
@@ -455,6 +481,9 @@ class REFITUKDALEPipeline:
             train_ds, val_ds, _ = cv.split_windows(windows_dataset, fold)
             train_idx = train_ds["metadata"]["window_idx"].to_numpy(dtype=np.int64)
             val_idx = val_ds["metadata"]["window_idx"].to_numpy(dtype=np.int64)
+            # 保存绝对窗口索引（供 DataModule 使用泄露检查与对齐）
+            torch.save(torch.from_numpy(train_idx), os.path.join(fold_dir, "train_indices.pt"))
+            torch.save(torch.from_numpy(val_idx), os.path.join(fold_dir, "val_indices.pt"))
 
             # 原始时域窗口 + 缺失掩码（作为额外通道）
             miss_all = _missing_mask(raw_all)  # [N,L]
@@ -521,6 +550,12 @@ class REFITUKDALEPipeline:
                 json.dump(aux_names, f, ensure_ascii=False, indent=2)
             with open(os.path.join(fold_dir, "raw_channel_names.json"), "w", encoding="utf-8") as f:
                 json.dump(["P_W", "dP_W", "missing_mask"], f, ensure_ascii=False, indent=2)
+            # 设备顺序文件（列表形式，与 device_name_to_id.json 相互补充）
+            try:
+                with open(os.path.join(fold_dir, "device_names.json"), "w", encoding="utf-8") as f:
+                    json.dump(device_names, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
 
         # 总结
         self.summary_ = {

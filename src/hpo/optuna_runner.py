@@ -1,281 +1,276 @@
-import logging
-from pathlib import Path
+import os
+import sys
 from typing import Optional, Dict, Any
 
-import yaml
+import torch
 import optuna
+import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.loggers import TensorBoardLogger
 
-# 延迟导入训练主函数以避免循环引用问题
-from src.train import main as train_main
+from src.train import NILMLightningModule, load_device_info
+from src.data.datamodule import NILMDataModule
+from src.train import DeferredEarlyStopping
 
-logger = logging.getLogger(__name__)
+try:
+    from optuna.integration.pytorch_lightning import PyTorchLightningPruningCallback as _PLPrunerBase
+except Exception:
+    from optuna.integration import PyTorchLightningPruningCallback as _PLPrunerBase
 
 
-def _apply_trial_params_to_config(trial: optuna.Trial, cfg: DictConfig) -> Dict[str, Any]:
-    """根据试验建议更新配置，并返回建议参数字典。
+class OptunaPruningCallback(_PLPrunerBase, pl.Callback):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-    仅选择与稳定训练相关、对性能影响显著且在 macOS MPS 下安全的超参数。
-    """
-    params: Dict[str, Any] = {}
 
-    # 优化器超参数
-    params["training.optimizer.lr"] = trial.suggest_float("training.optimizer.lr", 5e-6, 5e-4, log=True)
-    cfg.training.optimizer.lr = params["training.optimizer.lr"]
+def _clone_config(config: DictConfig) -> DictConfig:
+    return OmegaConf.create(OmegaConf.to_container(config, resolve=True))
 
-    params["training.optimizer.weight_decay"] = trial.suggest_float("training.optimizer.weight_decay", 1e-6, 2e-2, log=True)
-    cfg.training.optimizer.weight_decay = params["training.optimizer.weight_decay"]
 
-    # 优化器类型
-    params["training.optimizer.name"] = trial.suggest_categorical("training.optimizer.name", ["adam", "adamw"])
-    cfg.training.optimizer.name = params["training.optimizer.name"]
+def _load_space(space_config_path: Optional[str]) -> DictConfig:
+    if space_config_path and os.path.exists(space_config_path):
+        return OmegaConf.load(space_config_path)
+    default_path = os.path.join("configs", "hpo", "space_optimized_stable.yaml")
+    if os.path.exists(default_path):
+        return OmegaConf.load(default_path)
+    return OmegaConf.create({})
 
-    # 梯度与累计
-    params["training.gradient_clip_val"] = trial.suggest_float("training.gradient_clip_val", 0.5, 2.0)
-    cfg.training.gradient_clip_val = params["training.gradient_clip_val"]
 
-    params["training.accumulate_grad_batches"] = trial.suggest_categorical("training.accumulate_grad_batches", [1, 2])
-    cfg.training.accumulate_grad_batches = params["training.accumulate_grad_batches"]
-
-    # 批大小（受内存限制）
-    params["data.batch_size"] = trial.suggest_categorical("data.batch_size", [8, 12, 16])
-    cfg.data.batch_size = params["data.batch_size"]
-
-    # 模型结构（MPS 友好范围）
-    params["model.d_model"] = trial.suggest_categorical("model.d_model", [192, 256])
-    cfg.model.d_model = params["model.d_model"]
-    if hasattr(cfg.model, "time_encoder"):
-        cfg.model.time_encoder.d_model = params["model.d_model"]
-
-    params["model.n_heads"] = trial.suggest_categorical("model.n_heads", [4, 8])
-    cfg.model.n_heads = params["model.n_heads"]
-    if hasattr(cfg.model, "time_encoder"):
-        cfg.model.time_encoder.n_heads = params["model.n_heads"]
-
-    params["model.dropout"] = trial.suggest_float("model.dropout", 0.1, 0.3)
-    cfg.model.dropout = params["model.dropout"]
-    if hasattr(cfg.model, "time_encoder"):
-        cfg.model.time_encoder.dropout = params["model.dropout"]
-
-    # 层数
-    params["model.num_layers"] = trial.suggest_int("model.num_layers", 4, 10)
-    cfg.model.num_layers = params["model.num_layers"]
-    if hasattr(cfg.model, "time_encoder"):
-        cfg.model.time_encoder.num_layers = params["model.num_layers"]
-
-    # 频域编码器
-    params["model.freq_encoder.enable"] = trial.suggest_categorical("model.freq_encoder.enable", [True, False])
-    cfg.model.freq_encoder.enable = params["model.freq_encoder.enable"]
-    if cfg.model.freq_encoder.enable:
-        params["model.freq_encoder.proj_dim"] = trial.suggest_categorical("model.freq_encoder.proj_dim", [96, 128, 160])
-        cfg.model.freq_encoder.proj_dim = params["model.freq_encoder.proj_dim"]
-
-        params["model.freq_encoder.small_transformer_layers"] = trial.suggest_int("model.freq_encoder.small_transformer_layers", 0, 2)
-        # 已移除小型Transformer层，保持为0
-        cfg.model.freq_encoder.small_transformer_layers = 0
-
-        params["model.freq_encoder.dropout"] = trial.suggest_float("model.freq_encoder.dropout", 0.05, 0.2)
-        cfg.model.freq_encoder.dropout = params["model.freq_encoder.dropout"]
-
-    # 回归头
-    params["model.heads.regression.hidden"] = trial.suggest_categorical("model.heads.regression.hidden", [64, 96, 128])
-    cfg.model.heads.regression.hidden = params["model.heads.regression.hidden"]
-
-    params["model.heads.regression.dropout"] = trial.suggest_float("model.heads.regression.dropout", 0.05, 0.25)
-    cfg.model.heads.regression.dropout = params["model.heads.regression.dropout"]
-
-    # 调度器及预热
-    params["training.scheduler.name"] = trial.suggest_categorical("training.scheduler.name", ["cosine", "onecycle", "none"])
-    cfg.training.scheduler.name = params["training.scheduler.name"]
-    params["training.scheduler.warmup_steps"] = trial.suggest_int("training.scheduler.warmup_steps", 0, 2000)
-    cfg.training.scheduler.warmup_steps = params["training.scheduler.warmup_steps"]
-
-    # —— 损失函数相关（与 NILMLoss 对齐）——
-    if not hasattr(cfg, "loss"):
-        cfg.loss = OmegaConf.create({})
-    params["loss.huber_delta"] = trial.suggest_float("loss.huber_delta", 0.5, 2.0)
-    cfg.loss.huber_delta = params["loss.huber_delta"]
-
-    params["loss.active_threshold_rel"] = trial.suggest_float("loss.active_threshold_rel", 0.01, 0.10)
-    cfg.loss.active_threshold_rel = params["loss.active_threshold_rel"]
-
-    params["loss.off_penalty_weight"] = trial.suggest_float("loss.off_penalty_weight", 0.0, 0.5)
-    cfg.loss.off_penalty_weight = params["loss.off_penalty_weight"]
-
-    # 仅在 NILMLoss 中可选使用
-    params["loss.rel_loss_weight"] = trial.suggest_float("loss.rel_loss_weight", 1.0, 2.5)
-    cfg.loss.rel_loss_weight = params["loss.rel_loss_weight"]
-
-    params["loss.classification_loss_type"] = trial.suggest_categorical("loss.classification_loss_type", ["focal", "bce"])
-    cfg.loss.classification_loss_type = params["loss.classification_loss_type"]
-    if cfg.loss.classification_loss_type == "focal":
-        params["loss.focal_alpha"] = trial.suggest_float("loss.focal_alpha", 0.25, 0.75)
-        cfg.loss.focal_alpha = params["loss.focal_alpha"]
-        params["loss.focal_gamma"] = trial.suggest_float("loss.focal_gamma", 1.0, 3.0)
-        cfg.loss.focal_gamma = params["loss.focal_gamma"]
-
-    # —— 评估阈值方法 ——
+def _apply_trial(cfg: DictConfig, trial: optuna.Trial, space: Optional[DictConfig] = None) -> DictConfig:
+    if not hasattr(cfg, "training"):
+        cfg.training = OmegaConf.create({})
+    if not hasattr(cfg.training, "optimizer"):
+        cfg.training.optimizer = OmegaConf.create({})
+    if not hasattr(cfg.training, "scheduler"):
+        cfg.training.scheduler = OmegaConf.create({})
+    if not hasattr(cfg, "data"):
+        cfg.data = OmegaConf.create({})
+    if not hasattr(cfg, "model"):
+        cfg.model = OmegaConf.create({})
+    if not hasattr(cfg.model, "time_encoder"):
+        cfg.model.time_encoder = OmegaConf.create({})
+    if not hasattr(cfg.model, "freq_encoder"):
+        cfg.model.freq_encoder = OmegaConf.create({})
+    if not hasattr(cfg.model, "fusion"):
+        cfg.model.fusion = OmegaConf.create({})
+    if not hasattr(cfg.model, "heads"):
+        cfg.model.heads = OmegaConf.create({})
+    if not hasattr(cfg.model.heads, "regression"):
+        cfg.model.heads.regression = OmegaConf.create({})
+    if not hasattr(cfg.training, "early_stopping"):
+        cfg.training.early_stopping = OmegaConf.create({})
     if not hasattr(cfg, "evaluation"):
         cfg.evaluation = OmegaConf.create({})
-    params["evaluation.threshold_method"] = trial.suggest_categorical("evaluation.threshold_method", ["f1", "youden", "optimal"])
-    cfg.evaluation.threshold_method = params["evaluation.threshold_method"]
+    if not hasattr(cfg.training, "visualization"):
+        cfg.training.visualization = OmegaConf.create({})
 
-    return params
-
-
-def _objective_builder(base_config: DictConfig, hpo_dir: Path, trial_epochs: int = 1):
-    """创建 Optuna 目标函数，基于 best_val_loss 进行最小化。"""
-
-    def objective(trial: optuna.Trial) -> float:
-        # 深拷贝配置，避免污染原配置
-        cfg: DictConfig = OmegaConf.create(OmegaConf.to_container(base_config, resolve=True))
-
-        # 将试验编号注入实验名，便于输出文件检索
-        if not hasattr(cfg, "experiment"):
-            cfg.experiment = OmegaConf.create({"name": f"optuna_trial_{trial.number}"})
+    if space and hasattr(space, "search_space") and hasattr(space.search_space, "training") and hasattr(space.search_space.training, "max_epochs"):
+        me = space.search_space.training.max_epochs
+        if isinstance(me, dict) and me.get("type") == "int":
+            low = int(me.get("low", 18))
+            high = int(me.get("high", 30))
+            cfg.training.max_epochs = int(trial.suggest_int("max_epochs", low, high))
         else:
-            cfg.experiment.name = f"optuna_trial_{trial.number}"
+            cfg.training.max_epochs = int(getattr(cfg.training, "max_epochs", 25))
+    else:
+        cfg.training.max_epochs = int(min(int(getattr(cfg.training, "max_epochs", 25)), 25))
+    cfg.training.min_epochs = int(getattr(cfg.training, "min_epochs", 1))
+    cfg.training.check_val_every_n_epoch = int(getattr(cfg.training, "check_val_every_n_epoch", 1))
+    cfg.training.log_every_n_steps = int(getattr(cfg.training, "log_every_n_steps", 10))
+    cfg.training.early_stopping.enable = True
+    cfg.training.early_stopping.start_epoch = 0
+    cfg.training.early_stopping.patience = int(min(int(getattr(cfg.training.early_stopping, "patience", 5)), 3))
+    cfg.training.early_stopping.min_delta = float(getattr(cfg.training.early_stopping, "min_delta", 0.0))
+    cfg.training.early_stopping.monitor = str(getattr(cfg.training.early_stopping, "monitor", "val/loss/total"))
+    cfg.training.visualization.enable = True
+    cfg.training.visualization.interactive = True
+    cfg.evaluation.test_after_training = False
 
-        # 控制试验轮数与日志/可视化，提升试验效率
-        try:
-            cfg.training.max_epochs = min(getattr(cfg.training, "max_epochs", 100), max(1, trial_epochs))
-            if hasattr(cfg.training, "min_epochs"):
-                cfg.training.min_epochs = 1
-            cfg.training.check_val_every_n_epoch = 1
-            if hasattr(cfg.training, "visualization"):
-                cfg.training.visualization.interactive = False
-                cfg.training.visualization.enable = False
-        except Exception:
-            pass
+    if space and hasattr(space, "search_space"):
+        ss = space.search_space
+        lr_def = getattr(getattr(getattr(ss, "training", None), "optimizer", None), "lr", None)
+        wd_def = getattr(getattr(getattr(ss, "training", None), "optimizer", None), "weight_decay", None)
+        clip_def = getattr(getattr(ss, "training", None), "gradient_clip_val", None)
+        accum_def = getattr(getattr(ss, "training", None), "accumulate_grad_batches", None)
+        bs_def = getattr(getattr(ss, "data", None), "batch_size", None)
+        te_layers_def = getattr(getattr(getattr(ss, "model", None), "time_encoder", None), "num_layers", None)
+        te_dropout_def = getattr(getattr(getattr(ss, "model", None), "time_encoder", None), "dropout", None)
+        te_d_model_def = getattr(getattr(getattr(ss, "model", None), "time_encoder", None), "d_model", None)
+        te_n_heads_def = getattr(getattr(getattr(ss, "model", None), "time_encoder", None), "n_heads", None)
+        fusion_bidir_def = getattr(getattr(getattr(ss, "model", None), "fusion", None), "bidirectional", None)
+        head_hidden_def = getattr(getattr(getattr(getattr(ss, "model", None), "heads", None), "regression", None), "hidden", None)
+        reg_sp_def = getattr(getattr(getattr(getattr(ss, "model", None), "heads", None), "regression", None), "use_softplus", None)
+        seq_sp_def = getattr(getattr(getattr(getattr(ss, "model", None), "heads", None), "regression", None), "seq_use_softplus", None)
+        freq_proj_def = getattr(getattr(getattr(ss, "model", None), "freq_encoder", None), "proj_dim", None)
+    else:
+        lr_def = {"type": "float_log", "low": 1e-5, "high": 3e-3}
+        wd_def = {"type": "float_log", "low": 1e-8, "high": 5e-3}
+        clip_def = {"type": "float", "low": 0.0, "high": 1.0}
+        accum_def = {"type": "choice", "values": [1, 2, 4]}
+        bs_def = {"type": "choice", "values": [32, 64, 128]}
+        te_layers_def = {"type": "int", "low": 2, "high": 4}
+        te_dropout_def = {"type": "float", "low": 0.0, "high": 0.3}
+        te_d_model_def = {"type": "choice", "values": [128, 256, 384]}
+        te_n_heads_def = {"type": "choice", "values": [8]}
+        fusion_bidir_def = {"type": "choice", "values": [False, True]}
+        head_hidden_def = {"type": "choice", "values": [192, 256, 384]}
+        reg_sp_def = {"type": "choice", "values": [False, True]}
+        seq_sp_def = {"type": "choice", "values": [False, True]}
+        freq_proj_def = {"type": "choice", "values": [192, 256, 384]}
 
-        # 应用试验参数
-        params = _apply_trial_params_to_config(trial, cfg)
+    def _suggest(name, spec):
+        t = spec.get("type")
+        if t == "float_log":
+            return trial.suggest_float(name, float(spec["low"]), float(spec["high"]), log=True)
+        if t == "float":
+            return trial.suggest_float(name, float(spec["low"]), float(spec["high"]))
+        if t == "int":
+            return trial.suggest_int(name, int(spec["low"]), int(spec["high"]))
+        if t == "choice":
+            return trial.suggest_categorical(name, list(spec["values"]))
+        if t == "fixed":
+            return spec["value"]
+        return None
 
-        # 保存试验配置以便复现
-        trial_cfg_dir = hpo_dir / "trial_configs"
-        trial_cfg_dir.mkdir(parents=True, exist_ok=True)
-        with open(trial_cfg_dir / f"trial_{trial.number}.yaml", "w", encoding="utf-8") as f:
-            yaml.safe_dump(OmegaConf.to_container(cfg, resolve=True), f, allow_unicode=True)
+    lr = _suggest("lr", lr_def)
+    wd = _suggest("weight_decay", wd_def)
+    clip = _suggest("gradient_clip_val", clip_def)
+    accum = _suggest("accumulate_grad_batches", accum_def)
+    bs = _suggest("batch_size", bs_def)
+    te_layers = _suggest("time_layers", te_layers_def)
+    te_dropout = _suggest("time_dropout", te_dropout_def)
+    te_d_model = _suggest("time_d_model", te_d_model_def)
+    te_n_heads = _suggest("time_n_heads", te_n_heads_def)
+    fusion_bidir = _suggest("fusion_bidirectional", fusion_bidir_def)
+    head_hidden = _suggest("head_hidden", head_hidden_def)
+    freq_proj = _suggest("freq_proj_dim", freq_proj_def)
+    reg_softplus = _suggest("reg_use_softplus", reg_sp_def)
+    seq_softplus = _suggest("seq_use_softplus", seq_sp_def)
 
-        # 运行训练
-        try:
-            train_main(cfg)
-        except Exception as e:
-            logger.error(f"试验 {trial.number} 训练失败: {e}")
-            # 返回较大损失，避免影响搜索过程
-            return float("inf")
-
-        # 检索输出结果文件（形如 outputs/DisaggNet_<dataset>_optuna_trial_N_results.yaml）
-        outputs_dir = Path(getattr(cfg.paths, "output_dir", "outputs"))
-        result_file: Optional[Path] = None
-        pattern = f"{cfg.project_name}_*_optuna_trial_{trial.number}_results.yaml"
-        for p in outputs_dir.glob(pattern):
-            result_file = p
-            break
-
-        if result_file is None:
-            # 兜底：在整个 outputs 下搜索
-            matches = list(outputs_dir.glob(f"**/*optuna_trial_{trial.number}_results.yaml"))
-            if matches:
-                result_file = matches[0]
-
-        if result_file is None or not result_file.exists():
-            logger.warning(f"未找到试验 {trial.number} 的结果文件，返回高损失")
-            return float("inf")
-
-        with open(result_file, "r", encoding="utf-8") as f:
-            results = yaml.safe_load(f) or {}
-
-        best_val = results.get("best_val_loss")
-        if best_val is None:
-            # 兼容可能的字段名
-            best_val = results.get("best_loss") or results.get("val_loss")
-        if best_val is None:
-            logger.warning(f"试验 {trial.number} 结果文件缺少 best_val_loss 字段，返回高损失")
-            return float("inf")
-
-        # 记录试验结果与参数
-        trial_result_dir = hpo_dir / "trial_results"
-        trial_result_dir.mkdir(parents=True, exist_ok=True)
-        with open(trial_result_dir / f"trial_{trial.number}_result.yaml", "w", encoding="utf-8") as f:
-            yaml.safe_dump({"params": params, "best_val_loss": float(best_val)}, f, allow_unicode=True)
-
-        return float(best_val)
-
-    return objective
-
-
-def _merge_best_params(base_cfg: DictConfig, best_params: Dict[str, Any]) -> DictConfig:
-    """将最佳参数应用到基础配置，返回新的配置。"""
-    cfg = OmegaConf.create(OmegaConf.to_container(base_cfg, resolve=True))
-    for k, v in best_params.items():
-        try:
-            # 支持嵌套键（以点号分割）
-            keys = k.split(".")
-            target = cfg
-            for key in keys[:-1]:
-                if not hasattr(target, key):
-                    setattr(target, key, OmegaConf.create({}))
-                target = getattr(target, key)
-            setattr(target, keys[-1], v)
-        except Exception:
-            pass
+    cfg.training.optimizer.name = "adamw"
+    cfg.training.optimizer.lr = float(lr)
+    cfg.training.optimizer.weight_decay = float(wd)
+    cfg.training.gradient_clip_val = float(clip)
+    cfg.training.accumulate_grad_batches = int(accum)
+    cfg.data.batch_size = int(bs)
+    cfg.model.time_encoder.d_model = int(te_d_model)
+    cfg.model.time_encoder.n_heads = int(te_n_heads)
+    cfg.model.time_encoder.num_layers = int(te_layers)
+    cfg.model.time_encoder.dropout = float(te_dropout)
+    cfg.model.time_encoder.input_conv_embed = bool(getattr(cfg.model.time_encoder, "input_conv_embed", True))
+    cfg.model.time_encoder.causal_mask = bool(getattr(cfg.model.time_encoder, "causal_mask", True))
+    cfg.model.freq_encoder.enable = bool(getattr(cfg.model.freq_encoder, "enable", True))
+    cfg.model.freq_encoder.proj_dim = int(freq_proj)
+    cfg.model.fusion.type = "cross_attention"
+    cfg.model.fusion.bidirectional = bool(fusion_bidir)
+    cfg.model.heads.regression.hidden = int(head_hidden)
+    cfg.model.heads.regression.use_softplus = bool(reg_softplus)
+    cfg.model.heads.regression.seq_use_softplus = bool(seq_softplus)
+    if sys.platform == "darwin":
+        prec = str(getattr(cfg.training, "precision", "32-true"))
+        if ("bf16" in prec) or ("16" in prec):
+            cfg.training.precision = "32-true"
+    if hasattr(space, "stability") and bool(getattr(space.stability, "use_efficient_attention", True)):
+        setattr(cfg.model, "efficient_attention", True)
+        setattr(cfg.model.time_encoder, "use_efficient_attention", True)
+        setattr(cfg.model.freq_encoder, "use_efficient_attention", True)
+    try:
+        study = "hpo"
+        if hasattr(space, "optuna") and hasattr(space.optuna, "study_name"):
+            study = str(getattr(space.optuna, "study_name"))
+        vis_dir = os.path.join("outputs", "viz", "hpo", study, f"trial_{trial.number}")
+        cfg.training.visualization.save_dir = vis_dir
+    except Exception:
+        pass
     return cfg
 
 
-def run_optimization(config: DictConfig, n_trials: int = 50, timeout: Optional[int] = None, study_name: Optional[str] = None) -> Dict[str, Any]:
-    """运行 Optuna 超参数优化，返回优化摘要。
-
-    - 使用 TPE 采样器最小化验证损失（best_val_loss）。
-    - 每个试验运行较少 epoch（默认 1）以快速探索。
-    - 输出：最佳参数与合并配置保存至 outputs/hpo。
-    """
-
-    # 输出目录与 HPO 目录
-    outputs_dir = Path(getattr(config.paths, "output_dir", "outputs"))
-    hpo_dir = outputs_dir / "hpo"
-    hpo_dir.mkdir(parents=True, exist_ok=True)
-
-    # 创建/加载 study（持久化到 SQLite）
-    study_name = study_name or f"{getattr(config, 'project_name', 'DisaggNet')}_optuna"
-    storage = f"sqlite:///{hpo_dir / 'optuna_studies.db'}"
-    sampler = optuna.samplers.TPESampler(multivariate=True)
-    pruner = optuna.pruners.MedianPruner(n_warmup_steps=2, n_startup_trials=2)
-
-    study = optuna.create_study(
-        study_name=study_name,
-        direction="minimize",
-        storage=storage,
-        load_if_exists=True,
-        sampler=sampler,
-        pruner=pruner,
+def _build_trainer(cfg: DictConfig, logger: TensorBoardLogger, trial: Optional[optuna.Trial]) -> pl.Trainer:
+    monitor = str(getattr(getattr(cfg.training, "early_stopping", None), "monitor", "val/loss/total"))
+    mode = str(getattr(getattr(cfg.training, "early_stopping", None), "mode", "min"))
+    patience = int(getattr(getattr(cfg.training, "early_stopping", None), "patience", 3))
+    min_delta = float(getattr(getattr(cfg.training, "early_stopping", None), "min_delta", 0.0))
+    start_epoch = int(getattr(getattr(cfg.training, "early_stopping", None), "start_epoch", 0))
+    callbacks = [
+        ModelCheckpoint(monitor=monitor, mode=mode, save_top_k=1, filename="best-model"),
+        LearningRateMonitor(logging_interval="epoch"),
+    ]
+    if bool(getattr(getattr(cfg.training, "early_stopping", None), "enable", True)):
+        callbacks.append(DeferredEarlyStopping(monitor=monitor, patience=patience, mode=mode, min_delta=min_delta, start_epoch=start_epoch))
+    if trial is not None:
+        callbacks.append(OptunaPruningCallback(trial, monitor))
+    trainer = pl.Trainer(
+        accelerator=getattr(cfg.training, "accelerator", "auto"),
+        devices=getattr(cfg.training, "devices", 1),
+        precision=getattr(cfg.training, "precision", 32),
+        min_epochs=int(getattr(cfg.training, "min_epochs", 1)),
+        max_epochs=int(getattr(cfg.training, "max_epochs", 10)),
+        logger=logger,
+        callbacks=callbacks,
+        check_val_every_n_epoch=int(getattr(cfg.training, "check_val_every_n_epoch", 1)),
+        log_every_n_steps=int(getattr(cfg.training, "log_every_n_steps", 10)),
+        enable_checkpointing=True,
     )
+    return trainer
 
-    # 构建目标函数（快速试验：1 epoch）
-    objective = _objective_builder(config, hpo_dir, trial_epochs=1)
 
-    logger.info(f"开始 Optuna 超参优化：trials={n_trials}, study='{study_name}'")
+def _objective_factory(base_config: DictConfig, space: Optional[DictConfig]):
+    def objective(trial: optuna.Trial) -> float:
+        cfg = _clone_config(base_config)
+        cfg = _apply_trial(cfg, trial, space)
+        pl.seed_everything(int(getattr(cfg, "seed", getattr(getattr(cfg, "reproducibility", None), "seed", 42))))
+        dm = NILMDataModule(cfg)
+        try:
+            dm.setup("fit")
+        except Exception:
+            pass
+        device_info, device_names = load_device_info(cfg)
+        if space and hasattr(space, "logging"):
+            save_dir = str(getattr(space.logging, "save_dir", "logs/tensorboard/hpo"))
+            name = str(getattr(space.logging, "name", "hpo"))
+        else:
+            save_dir = "logs/tensorboard/hpo"
+            name = "hpo"
+        version = f"trial_{trial.number}"
+        logger = TensorBoardLogger(save_dir, name=name, version=version)
+        module = NILMLightningModule(cfg, device_info, device_names)
+        trainer = _build_trainer(cfg, logger, trial)
+        trainer.fit(module, dm)
+        metrics = getattr(trainer, "callback_metrics", {}) or {}
+        monitor = str(getattr(getattr(cfg.training, "early_stopping", None), "monitor", "val/loss/total"))
+        val = None
+        if monitor in metrics:
+            val = metrics[monitor]
+        elif "val/loss/total" in metrics:
+            val = metrics["val/loss/total"]
+        elif "val_loss" in metrics:
+            val = metrics["val_loss"]
+        if isinstance(val, torch.Tensor):
+            return float(val.detach().cpu().item())
+        if isinstance(val, (int, float)):
+            return float(val)
+        return float("inf")
+    return objective
+
+
+def run_optimization(config: DictConfig, n_trials: int = 20, timeout: Optional[int] = None, study_name: Optional[str] = None, storage: Optional[str] = None, space_config: Optional[str] = None) -> Dict[str, Any]:
+    if sys.platform == "darwin":
+        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    space = _load_space(space_config)
+    direction = "minimize"
+    warm = 2
+    if hasattr(space, "optuna") and hasattr(space.optuna, "warmup_steps"):
+        warm = int(getattr(space.optuna, "warmup_steps", 2))
+    pruner = optuna.pruners.MedianPruner(n_warmup_steps=warm)
+    if storage is None and hasattr(space, "optuna") and hasattr(space.optuna, "storage"):
+        storage = str(getattr(space.optuna, "storage"))
+    if study_name is None and hasattr(space, "optuna") and hasattr(space.optuna, "study_name"):
+        study_name = str(getattr(space.optuna, "study_name"))
+    objective = _objective_factory(config, space)
+    if storage:
+        os.makedirs(os.path.dirname(storage.replace("sqlite:///", "")), exist_ok=True)
+    study = optuna.create_study(direction=direction, study_name=study_name, storage=storage, load_if_exists=True, pruner=pruner)
     study.optimize(objective, n_trials=n_trials, timeout=timeout)
-
-    if not study.best_trial:
-        logger.warning("Optuna 未获得有效试验结果")
-        return {"success": False, "message": "No valid trials"}
-
-    best_params = study.best_trial.params
-    best_value = study.best_value
-
-    # 仅保存最佳参数，不生成新的配置文件（基于现有 optimized_stable.yaml 调参）
-    best_params_path = hpo_dir / "best_params.yaml"
-    with open(best_params_path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(best_params, f, allow_unicode=True)
-
-    summary = {
-        "success": True,
-        "study_name": study_name,
-        "best_value": float(best_value),
-        "best_params_path": str(best_params_path),
-        "best_params": best_params,
-    }
-
-    logger.info(f"Optuna 完成：best_val_loss={best_value:.6f}, 保存至 {best_params_path}")
-    return summary
+    best = {"value": study.best_value, "params": study.best_trial.params, "number": study.best_trial.number}
+    return best

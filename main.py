@@ -221,7 +221,14 @@ class UnifiedTrainingSystem:
         # 调用HPO（在此处进行局部导入，避免全局 None 覆盖）
         try:
             from src.hpo.optuna_runner import run_optimization
-            run_optimization(config, n_trials=n_trials, timeout=timeout)
+            run_optimization(
+                config,
+                n_trials=n_trials,
+                timeout=timeout,
+                study_name=kwargs.get("study_name"),
+                storage=kwargs.get("storage"),
+                space_config=kwargs.get("space_config"),
+            )
         except Exception as e:
             logger.error(f"超参数优化调用失败: {e}")
             raise
@@ -389,6 +396,8 @@ def create_parser() -> argparse.ArgumentParser:
     hpo_parser.add_argument("--n-trials", type=int, default=50, help="试验次数")
     hpo_parser.add_argument("--timeout", type=int, help="超时时间(秒)")
     hpo_parser.add_argument("--study-name", help="研究名称")
+    hpo_parser.add_argument("--storage", help="Optuna存储(例如 sqlite:///outputs/hpo/optuna.db)")
+    hpo_parser.add_argument("--space-config", help="搜索空间配置文件路径")
     
     # Walk-Forward验证
     wf_parser = subparsers.add_parser("walk-forward", help="Walk-Forward验证")

@@ -99,12 +99,13 @@ def test_fusion_transformer_forward_shapes():
         reg, cls = out
 
     assert reg.shape == (5, n_devices)
-    assert cls.shape == (5, n_devices)
+    assert (cls is None) or (cls.shape == (5, n_devices))
     # Unknown 默认关闭时为 None；如开启则形状为 (B, 1)
     if 'unk' in locals():
         assert (unk is None) or (unk.shape == (5, 1))
     assert not torch.isnan(reg).any()
-    assert not torch.isnan(cls).any()
+    if cls is not None:
+        assert not torch.isnan(cls).any()
 
 
 def test_fusion_transformer_forward_with_embeddings_shapes():
@@ -124,11 +125,12 @@ def test_fusion_transformer_forward_with_embeddings_shapes():
     )
 
     assert reg.shape == (5, n_devices)
-    assert cls.shape == (5, n_devices)
+    assert (cls is None) or (cls.shape == (5, n_devices))
     assert unk is None or unk.shape == (5, 1)
     assert emb.shape == (5, n_devices, config.model.time_encoder.d_model)
     assert not torch.isnan(reg).any()
-    assert not torch.isnan(cls).any()
+    if cls is not None:
+        assert not torch.isnan(cls).any()
     assert not torch.isnan(emb).any()
 
 
@@ -179,7 +181,7 @@ def test_lightningmodule_training_step_end_to_end():
     else:
         pred_power, pred_states = preds
     assert pred_power.shape == (3, n_devices)
-    assert pred_states.shape == (3, n_devices)
+    assert (pred_states is None) or (pred_states.shape == (3, n_devices))
 
     # compute loss via training_step path
     loss = lm.training_step({

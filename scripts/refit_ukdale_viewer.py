@@ -252,18 +252,10 @@ except Exception:
     st.caption(f"HTML根目录: {base_html_root}")
 fold_html_dir = os.path.join(base_html_root, fold_choice)
 if os.path.isdir(fold_html_dir):
-    # rank 选择
-    rank_dirs = [d for d in os.listdir(fold_html_dir) if d.startswith("rank_") and os.path.isdir(os.path.join(fold_html_dir, d))]
-    rank_choice = st.selectbox("选择进程/Rank", options=(rank_dirs if rank_dirs else ["rank_0"]))
-    rank_dir = os.path.join(fold_html_dir, rank_choice)
-    html_files = []
-    if os.path.isdir(rank_dir):
-        html_files = sorted([f for f in os.listdir(rank_dir) if f.endswith(".html")])
-    else:
-        html_files = sorted([f for f in os.listdir(fold_html_dir) if f.endswith(".html")])
-    if html_files:
-        html_choice = st.selectbox("选择Epoch图", options=html_files, index=len(html_files) - 1)
-        html_path = os.path.join(rank_dir if os.path.isdir(rank_dir) else fold_html_dir, html_choice)
+    direct_html = sorted([f for f in os.listdir(fold_html_dir) if f.endswith(".html")])
+    if direct_html:
+        html_choice = st.selectbox("选择Epoch图", options=direct_html, index=len(direct_html) - 1)
+        html_path = os.path.join(fold_html_dir, html_choice)
         try:
             import streamlit.components.v1 as components
             with open(html_path, "r", encoding="utf-8") as f:
@@ -272,6 +264,21 @@ if os.path.isdir(fold_html_dir):
         except Exception as e:
             st.error(f"嵌入HTML失败：{e}")
     else:
-        st.info("该fold目录下暂未生成验证交互HTML。完成一次验证epoch后将自动生成。")
+        rank_dirs = [d for d in os.listdir(fold_html_dir) if d.startswith("rank_") and os.path.isdir(os.path.join(fold_html_dir, d))]
+        rank_choice = st.selectbox("选择进程/Rank", options=(rank_dirs if rank_dirs else ["rank_0"]))
+        rank_dir = os.path.join(fold_html_dir, rank_choice)
+        html_files = sorted([f for f in os.listdir(rank_dir) if f.endswith(".html")]) if os.path.isdir(rank_dir) else []
+        if html_files:
+            html_choice = st.selectbox("选择Epoch图", options=html_files, index=len(html_files) - 1)
+            html_path = os.path.join(rank_dir, html_choice)
+            try:
+                import streamlit.components.v1 as components
+                with open(html_path, "r", encoding="utf-8") as f:
+                    html_content = f.read()
+                components.html(html_content, height=900, scrolling=True)
+            except Exception as e:
+                st.error(f"嵌入HTML失败：{e}")
+        else:
+            st.info("该fold目录下暂未生成验证交互HTML。完成一次验证epoch后将自动生成。")
 else:
     st.info("尚未找到验证交互HTML根目录。请运行训练以生成对应文件。")

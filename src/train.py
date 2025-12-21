@@ -5,6 +5,7 @@ import sys
 if sys.platform == 'darwin':
     os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 import torch
+import torch.nn.functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
     ModelCheckpoint, EarlyStopping, LearningRateMonitor,
@@ -19,12 +20,32 @@ from .data.datamodule import NILMDataModule
 from .models.fusion_transformer import FusionTransformer
 from .losses.losses import create_loss_function, RECOMMENDED_LOSS_CONFIGS
 from .utils.metrics import NILMMetrics
+from .utils.prototypes import PrototypeLibrary
 from .utils.viz import save_validation_interactive_plot
 
 # 启用TF32优化（放在所有导入之后，避免 E402）
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("medium")
+
+class DeferredEarlyStopping(EarlyStopping):
+    def __init__(self, start_epoch: int = 0, **kwargs):
+        super().__init__(**kwargs)
+        self.start_epoch = int(start_epoch or 0)
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        try:
+            if int(getattr(trainer, "current_epoch", 0)) < self.start_epoch:
+                return
+        except Exception:
+            pass
+        return super().on_validation_epoch_end(trainer, pl_module)
+    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        try:
+            if int(getattr(trainer, "current_epoch", 0)) < self.start_epoch:
+                return
+        except Exception:
+            pass
+        return super().on_validation_end(trainer, pl_module)
 
 
 class NILMLightningModule(pl.LightningModule):
@@ -63,6 +84,7 @@ class NILMLightningModule(pl.LightningModule):
         # 尺度策略：每设备尺度（训练集 P95），由 DataModule 提供
         self.power_scale: Optional[torch.Tensor] = None
         self.max_power: Optional[torch.Tensor] = None
+        self.per_device_boost: Optional[torch.Tensor] = None
 
         # 可视化配置
         self.best_val_loss = float('inf')
@@ -73,6 +95,22 @@ class NILMLightningModule(pl.LightningModule):
         self.vis_output_dir = str(getattr(vis_cfg, 'save_dir', Path('outputs') / 'viz'))
         self.enable_interactive = bool(getattr(vis_cfg, 'interactive', False) if vis_cfg is not None else False)
         self._val_buffers: List[Dict[str, Any]] = []
+        # 度量学习（原型库）最小实现
+        try:
+            ml_cfg = getattr(getattr(config, 'aux_training', None), 'metric_learning', None)
+            self.metric_learning_enable = bool(getattr(ml_cfg, 'enable', False)) if ml_cfg is not None else False
+        except Exception:
+            self.metric_learning_enable = False
+        self.prototype_library = PrototypeLibrary(n_devices=self.n_devices, embed_dim=config.model.time_encoder.d_model) if self.metric_learning_enable else None
+        # 记录基线损失权重（用于课程式调整）
+        self._base_loss_weights = {
+            'peak_focus_weight': float(getattr(getattr(config, 'loss', None), 'peak_focus_weight', getattr(self.loss_fn, 'peak_focus_weight', 0.0))),
+            'edge_focus_weight': float(getattr(getattr(config, 'loss', None), 'edge_focus_weight', getattr(self.loss_fn, 'edge_focus_weight', 0.0))),
+            'derivative_loss_weight': float(getattr(getattr(config, 'loss', None), 'derivative_loss_weight', getattr(self.loss_fn, 'derivative_loss_weight', 0.0))),
+            'conservation_weight': float(getattr(getattr(config, 'loss', None), 'conservation_weight', getattr(self.loss_fn, 'conservation_weight', 0.0))),
+            'off_penalty_weight': float(getattr(getattr(config, 'loss', None), 'off_penalty_weight', getattr(self.loss_fn, 'off_penalty_weight', 0.0))),
+            'active_boost': float(getattr(getattr(config, 'loss', None), 'active_boost', getattr(self.loss_fn, 'active_boost', 2.0))),
+        }
 
     def _safe_log(self, name: str, value: Any, **kwargs) -> None:
         """安全日志记录"""
@@ -118,8 +156,112 @@ class NILMLightningModule(pl.LightningModule):
             if dm is not None and hasattr(dm, 'max_power_vec'):
                 self.max_power = dm.max_power_vec.detach().clone().float()
                 print(f"[Info] Per-device max powers loaded: {self.max_power.tolist()}")
+            # 自适应稀疏设备损失增强：基于数据的激活稀疏度，限幅且不依赖手动参数
+            try:
+                rb = getattr(dm, 'rarity_boost_vec', None)
+                if isinstance(rb, torch.Tensor) and rb.numel() == self.n_devices:
+                    base = float(getattr(self.loss_fn, 'active_boost', 2.0))
+                    boost = torch.clamp(rb.detach().clone().float(), min=1.0, max=4.0) * base
+                    self.per_device_boost = boost
+                    print(f"[Info] Adaptive per-device boost: {self.per_device_boost.tolist()}")
+            except Exception:
+                pass
+            try:
+                K = int(self.n_devices)
+                dev_names = list(self.device_names)
+                amp = torch.ones(K, dtype=torch.float32)
+                evt = torch.ones(K, dtype=torch.float32)
+                var = torch.ones(K, dtype=torch.float32)
+                off_w = torch.ones(K, dtype=torch.float32)
+                excl_w = torch.ones(K, dtype=torch.float32)
+                dw_idx = next((i for i, n in enumerate(dev_names) if str(n).lower().strip() == "dishwasher"), None)
+                fr_idx = next((i for i, n in enumerate(dev_names) if "fridge" in str(n).lower()), None)
+                if dw_idx is not None:
+                    amp[dw_idx] = 1.5
+                    evt[dw_idx] = 1.4
+                    var[dw_idx] = 1.4
+                if fr_idx is not None:
+                    excl_w[fr_idx] = 0.5
+                    off_w[fr_idx] = 2.5
+                self.loss_fn.per_device_amplitude_scale = amp
+                self.loss_fn.per_device_event_scale = evt
+                self.loss_fn.per_device_variance_scale = var
+                self.loss_fn.per_device_off_scale = off_w
+                self.loss_fn.exclusive_device_weight = excl_w
+                print(f"[LossCfg] per_device_amplitude_scale={amp.tolist()} per_device_event_scale={evt.tolist()} per_device_variance_scale={var.tolist()} per_device_off_scale={off_w.tolist()} exclusive_device_weight={excl_w.tolist()}")
+            except Exception as e:
+                try:
+                    print("[LossCfg] Failed to set per-device loss scales:", str(e))
+                except Exception:
+                    pass
         except Exception as e:
             print(f"[Warning] Failed to load scales: {e}")
+        # 初始应用课程式权重
+        try:
+            self._apply_loss_weight_schedule(epoch=int(getattr(self, 'current_epoch', 0)))
+        except Exception:
+            pass
+
+    def _linear_ramp(self, base: float, target: float, start_epoch: int, ramp_epochs: int, epoch: int) -> float:
+        if ramp_epochs <= 0:
+            return base if epoch < start_epoch else target
+        if epoch < start_epoch:
+            return base
+        if epoch >= start_epoch + ramp_epochs:
+            return target
+        a = (epoch - start_epoch) / float(max(ramp_epochs, 1))
+        return base + a * (target - base)
+
+    def _apply_loss_weight_schedule(self, epoch: int) -> None:
+        """按配置对损失权重进行线性ramp"""
+        cfg = getattr(self, 'config', None)
+        lc = getattr(cfg, 'loss', None)
+        if lc is None:
+            return
+        # 读取目标权重与起始/时长
+        peak_target = float(getattr(lc, 'peak_target_weight', getattr(self.loss_fn, 'peak_focus_weight', 0.0)))
+        peak_start = int(getattr(lc, 'peak_ramp_start', 0))
+        peak_epochs = int(getattr(lc, 'peak_ramp_epochs', 0))
+        edge_target = float(getattr(lc, 'edge_target_weight', getattr(self.loss_fn, 'edge_focus_weight', 0.0)))
+        edge_start = int(getattr(lc, 'edge_ramp_start', 0))
+        edge_epochs = int(getattr(lc, 'edge_ramp_epochs', 0))
+        der_target = float(getattr(lc, 'derivative_target_weight', getattr(self.loss_fn, 'derivative_loss_weight', 0.0)))
+        der_start = int(getattr(lc, 'derivative_ramp_start', 0))
+        der_epochs = int(getattr(lc, 'derivative_ramp_epochs', 0))
+        cons_start = int(getattr(lc, 'cons_start_epoch', 0))
+        cons_epochs = int(getattr(lc, 'cons_ramp_epochs', 0))
+        cons_target = float(getattr(lc, 'conservation_weight', getattr(self.loss_fn, 'conservation_weight', 0.0)))
+        off_start = int(getattr(lc, 'off_start_epoch', 0))
+        off_epochs = int(getattr(lc, 'off_ramp_epochs', 0))
+        off_target = float(getattr(lc, 'off_penalty_weight', getattr(self.loss_fn, 'off_penalty_weight', 0.0)))
+        ab_start = int(getattr(lc, 'active_boost_start_epoch', 0))
+        ab_epochs = int(getattr(lc, 'active_boost_ramp_epochs', 0))
+        ab_target = float(getattr(lc, 'active_boost', getattr(self.loss_fn, 'active_boost', 2.0)))
+
+        # 基线
+        base = self._base_loss_weights
+        # 计算ramp值
+        self.loss_fn.peak_focus_weight = self._linear_ramp(base['peak_focus_weight'], peak_target, peak_start, peak_epochs, epoch)
+        self.loss_fn.edge_focus_weight = self._linear_ramp(base['edge_focus_weight'], edge_target, edge_start, edge_epochs, epoch)
+        self.loss_fn.derivative_loss_weight = self._linear_ramp(base['derivative_loss_weight'], der_target, der_start, der_epochs, epoch)
+        self.loss_fn.conservation_weight = self._linear_ramp(base['conservation_weight'], cons_target, cons_start, cons_epochs, epoch)
+        self.loss_fn.off_penalty_weight = self._linear_ramp(base['off_penalty_weight'], off_target, off_start, off_epochs, epoch)
+        self.loss_fn.active_boost = self._linear_ramp(base['active_boost'], ab_target, ab_start, ab_epochs, epoch)
+        # 日志
+        self._safe_log('train/weights/peak', self.loss_fn.peak_focus_weight, on_epoch=True)
+        self._safe_log('train/weights/edge', self.loss_fn.edge_focus_weight, on_epoch=True)
+        self._safe_log('train/weights/derivative', self.loss_fn.derivative_loss_weight, on_epoch=True)
+        self._safe_log('train/weights/conservation', self.loss_fn.conservation_weight, on_epoch=True)
+        self._safe_log('train/weights/off_penalty', self.loss_fn.off_penalty_weight, on_epoch=True)
+        self._safe_log('train/weights/active_boost', self.loss_fn.active_boost, on_epoch=True)
+
+    def on_train_epoch_start(self) -> None:
+        """每个epoch开始时应用课程式权重"""
+        try:
+            ep = int(getattr(self, 'current_epoch', 0))
+            self._apply_loss_weight_schedule(epoch=ep)
+        except Exception:
+            pass
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, None]:
         """前向传播 (Inference)"""
@@ -136,23 +278,26 @@ class NILMLightningModule(pl.LightningModule):
         )
 
         pred_seq = out[0] if isinstance(out, tuple) else out
-
-        mask_seq = batch.get('target_seq_valid_mask', None)
+        # 优先使用联合有效掩码：设备目标有效 & 时间有效
+        per_dev_mask = batch.get('target_seq_per_device_valid_mask', None)
+        time_mask = batch.get('time_valid_mask', None)
+        if isinstance(per_dev_mask, torch.Tensor) and isinstance(time_mask, torch.Tensor):
+            m = (per_dev_mask > 0) & time_mask.unsqueeze(-1)
+        else:
+            m = batch.get('target_seq_valid_mask', None)
         device = pred_seq.device
         mp = self._ensure_max_power(device, self.n_devices)
         pred_seq_norm = torch.clamp(pred_seq / mp, 0.0, 1.0)
-        if isinstance(mask_seq, torch.Tensor):
-            m = mask_seq
-            if m.dim() + 1 == pred_seq_norm.dim():
-                m = m.unsqueeze(-1)
-            m = (m > 0).float()
-            num = (pred_seq_norm * m).sum(dim=1)
-            den = m.sum(dim=1).clamp_min(1.0)
+        if isinstance(m, torch.Tensor):
+            mf = (m > 0).float()
+            num = (pred_seq_norm * mf).sum(dim=1)
+            den = mf.sum(dim=1).clamp_min(1.0)
             pred_power_norm = num / den
         else:
             pred_power_norm = pred_seq_norm.mean(dim=1)
         pred_power_watts = pred_power_norm * mp.view(1, -1)
-        return pred_power_watts, None
+        pred_states = torch.zeros_like(pred_power_watts)
+        return pred_power_watts, pred_states
 
     def _forward_and_compute_loss(self, batch: Dict[str, torch.Tensor], stage: str) -> Tuple[torch.Tensor, torch.Tensor]:
         """计算联合损失"""
@@ -173,36 +318,110 @@ class NILMLightningModule(pl.LightningModule):
 
         if isinstance(out, tuple):
             pred_seq = out[0]
+            reg_win_pred = out[1]
+            cls_seq_pred = out[4] if len(out) >= 5 else None
         else:
             pred_seq = out
+            reg_win_pred = None
+            cls_seq_pred = None
 
         target_seq = batch.get('target_seq')
         if target_seq is None:
             return pred_seq, torch.tensor(0.0, device=device)
 
-        valid = batch.get('target_seq_valid_mask')
-        if isinstance(valid, torch.Tensor) and valid.dim() + 1 == pred_seq.dim():
-            valid = valid.unsqueeze(-1)
-        valid = (valid > 0) if valid is not None else torch.ones_like(pred_seq, dtype=torch.bool)
+        # 设备维对齐
+        try:
+            Kp = int(pred_seq.size(-1))
+            Kt = int(target_seq.size(-1))
+            if Kp != Kt:
+                Kc = min(Kp, Kt)
+                pred_seq = pred_seq[:, :, :Kc]
+                target_seq = target_seq[:, :, :Kc]
+                if isinstance(reg_win_pred, torch.Tensor) and int(reg_win_pred.size(-1)) != Kc:
+                    reg_win_pred = reg_win_pred[:, :Kc]
+                try:
+                    if isinstance(out, tuple):
+                        cls_seq_pred = out[4] if len(out) >= 5 else None
+                    if isinstance(cls_seq_pred, torch.Tensor) and int(cls_seq_pred.size(-1)) != Kc:
+                        cls_seq_pred = cls_seq_pred[:, :, :Kc]
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-        pred_seq_norm = torch.clamp(pred_seq / mp, 0.0, 1.0)
+        # 联合有效掩码：设备目标有效 & 时间有效
+        per_dev_mask = batch.get('target_seq_per_device_valid_mask')
+        time_mask = batch.get('time_valid_mask')
+        if isinstance(per_dev_mask, torch.Tensor) and isinstance(time_mask, torch.Tensor):
+            valid = (per_dev_mask > 0) & time_mask.unsqueeze(-1)
+        else:
+            fallback = batch.get('target_seq_valid_mask')
+            if isinstance(fallback, torch.Tensor) and fallback.dim() + 1 == pred_seq.dim():
+                fallback = fallback.unsqueeze(-1)
+            valid = (fallback > 0) if isinstance(fallback, torch.Tensor) else torch.ones_like(pred_seq, dtype=torch.bool)
+
+        # 匹配 mp 设备维
+        mp_c = mp[:, :, :pred_seq.size(-1)]
+        # 融合分配门控（如可用）：seq_pred_alloc = gate * mains；按配置进行线性混合
+        blend_alpha = float(getattr(getattr(self.config, 'loss', None), 'allocation_blend_alpha', 0.0) or 0.0)
+        if isinstance(cls_seq_pred, torch.Tensor) and isinstance(batch.get('mains_seq'), torch.Tensor) and blend_alpha > 0.0:
+            ms = batch['mains_seq']
+            if ms.dim() == 1:
+                ms = ms.view(1, -1)
+            seq_pred_alloc = cls_seq_pred * ms.unsqueeze(-1)
+            pred_seq_watts_raw = (1.0 - blend_alpha) * pred_seq + blend_alpha * seq_pred_alloc
+        else:
+            pred_seq_watts_raw = pred_seq
+        pred_seq_norm = torch.clamp(pred_seq_watts_raw / mp_c, 0.0, 1.0)
+        target_seq_norm = torch.clamp(target_seq / mp_c, 0.0, 1.0)
+        # 每设备尺度（P95），用于相对阈值与归一化惩罚
+        pscale = self._ensure_power_scale(device, self.n_devices)
+        pscale_c = pscale[:, :, :pred_seq.size(-1)]
         loss_reg = self.loss_fn.regression_seq_loss(
-            pred_seq_norm, target_seq,
+            pred_seq_norm, target_seq_norm,
             status_seq=batch.get('status_seq'),
             valid_mask=valid,
-            power_scale=None
+            power_scale=pscale_c,
+            per_device_boost=self.per_device_boost
         )
 
-        pred_seq_watts = pred_seq_norm * mp
+        # 辅助窗口级监督（回归头）：用目标序列的时间均值作为窗口目标
+        loss_win = torch.tensor(0.0, device=device)
+        if isinstance(reg_win_pred, torch.Tensor):
+            m_float = valid.float()
+            num = (target_seq_norm * m_float).sum(dim=1)
+            den = m_float.sum(dim=1).clamp_min(1.0)
+            win_target_norm = num / den
+            reg_win_norm = reg_win_pred / mp_c.view(1, -1)
+            hl = torch.nn.HuberLoss(reduction='mean', delta=self.loss_fn.huber_delta)
+            loss_win = hl(reg_win_norm, win_target_norm)
+
+        pred_seq_watts = pred_seq_norm * mp_c
         loss_cons = self.loss_fn.conservation_loss(
-            batch.get('mains_seq'), pred_seq_watts
+            batch.get('mains_seq'), pred_seq_watts,
+            valid_mask=(time_mask if isinstance(time_mask, torch.Tensor) else None)
         )
+        excl_pen = self.loss_fn.device_exclusive_penalty(pred_seq_norm, valid)
+        sparse_pen = self.loss_fn.sparsity_gate_penalty(cls_seq_pred, valid)
+        alloc_dist = self.loss_fn.allocation_distribution_loss(cls_seq_pred, target_seq_norm, valid)
+        ev_pen = self.loss_fn.event_count_penalty(pred_seq_norm, batch.get('status_seq'), valid)
+        amp_pen = self.loss_fn.active_amplitude_loss(pred_seq_norm, target_seq_norm, batch.get('status_seq'), valid)
+        var_pen = self.loss_fn.shape_variance_loss(pred_seq_norm, target_seq_norm, valid)
 
-        total_loss = loss_reg + loss_cons
+        total_loss = self.loss_fn.regression_weight * (loss_reg + loss_win) + loss_cons + excl_pen + sparse_pen + alloc_dist + ev_pen + amp_pen + var_pen
 
         self._safe_log(f'{stage}/loss/total', total_loss, on_step=True, on_epoch=True, prog_bar=True)
         self._safe_log(f'{stage}/loss/regression', loss_reg, on_step=False, on_epoch=True)
         self._safe_log(f'{stage}/loss/conservation', loss_cons, on_step=False, on_epoch=True)
+        try:
+            self._safe_log(f'{stage}/loss/exclusive', excl_pen, on_epoch=True)
+            self._safe_log(f'{stage}/loss/sparsity', sparse_pen, on_epoch=True)
+            self._safe_log(f'{stage}/loss/allocation_kl', alloc_dist, on_epoch=True)
+            self._safe_log(f'{stage}/loss/event_count', ev_pen, on_epoch=True)
+            self._safe_log(f'{stage}/loss/active_amplitude', amp_pen, on_epoch=True)
+            self._safe_log(f'{stage}/loss/shape_variance', var_pen, on_epoch=True)
+        except Exception:
+            pass
 
         return pred_seq, total_loss
 
@@ -218,6 +437,7 @@ class NILMLightningModule(pl.LightningModule):
                 ts_mat = batch.get('timestamps')
                 target_seq = batch.get('target_seq')
                 mains_seq = batch.get('mains_seq')
+                time_valid_mask = batch.get('time_valid_mask')
                 if isinstance(pred_seq, torch.Tensor) and isinstance(target_seq, torch.Tensor):
                     b = int(pred_seq.size(0))
                     for i in range(b):
@@ -226,9 +446,12 @@ class NILMLightningModule(pl.LightningModule):
                         mp2 = mp3.view(1, -1)  # (1,K)
                         # 归一化到 [0,1] 后再按最大功率反归一化为瓦特
                         p_norm = torch.clamp(pred_seq[i] / mp2, 0.0, 1.0)
-                        t_norm = target_seq[i]
+                        try:
+                            tn = target_seq[i] / mp2
+                            t_w = (torch.clamp(tn, 0.0, 1.0) * mp2).detach().cpu().numpy().astype('float32')
+                        except Exception:
+                            t_w = (torch.clamp(target_seq[i], 0.0, 1.0) * mp2).detach().cpu().numpy().astype('float32')
                         p_w = (p_norm * mp2).detach().cpu().numpy().astype('float32')  # (L,K)
-                        t_w = (torch.clamp(t_norm, 0.0, 1.0) * mp2).detach().cpu().numpy().astype('float32')  # (L,K)
                         m = None
                         try:
                             if isinstance(mains_seq, torch.Tensor):
@@ -244,7 +467,16 @@ class NILMLightningModule(pl.LightningModule):
                         else:
                             start_ts = float(torch.tensor(0.0).item())
                             step = float(getattr(getattr(self.trainer, 'datamodule', None), 'resample_seconds', 5.0))
-                        self._val_buffers.append({'pred': torch.tensor(p_w), 'true': torch.tensor(t_w), 'mains': m, 'start': start_ts, 'step': step})
+                        # 传递时间有效掩码（用于可视化时屏蔽无效主表数据）
+                        vmask = None
+                        try:
+                            if isinstance(time_valid_mask, torch.Tensor):
+                                vmask = time_valid_mask[i].detach().cpu()
+                                if vmask.dim() > 1:
+                                    vmask = vmask.squeeze()
+                        except Exception:
+                            vmask = None
+                        self._val_buffers.append({'pred': torch.tensor(p_w), 'true': torch.tensor(t_w), 'mains': m, 'valid': vmask, 'start': start_ts, 'step': step})
             except Exception:
                 pass
         return {'val_loss': loss}
@@ -298,9 +530,14 @@ class NILMLightningModule(pl.LightningModule):
             mp = self._ensure_max_power(device, self.n_devices)
 
             if pred0.dim() == 3:
-                valid = batch.get('target_seq_valid_mask')
-                if isinstance(valid, torch.Tensor) and valid.dim() + 1 == pred0.dim():
-                    valid = valid.unsqueeze(-1)
+                per_dev_mask = batch.get('target_seq_per_device_valid_mask')
+                time_mask = batch.get('time_valid_mask')
+                if isinstance(per_dev_mask, torch.Tensor) and isinstance(time_mask, torch.Tensor):
+                    valid = (per_dev_mask > 0) & time_mask.unsqueeze(-1)
+                else:
+                    valid = batch.get('target_seq_valid_mask')
+                    if isinstance(valid, torch.Tensor) and valid.dim() + 1 == pred0.dim():
+                        valid = valid.unsqueeze(-1)
                 valid_f = (valid > 0).float() if isinstance(valid, torch.Tensor) else None
                 pred_seq_norm = torch.clamp(pred0 / mp, 0.0, 1.0)
                 if isinstance(valid_f, torch.Tensor):
@@ -333,35 +570,76 @@ class NILMLightningModule(pl.LightningModule):
                 classification_enabled=False,
                 sample_weights=None,
             )
+            ov = res.get('overall', {}) if isinstance(res, dict) else {}
+            for mk in ('mae', 'nde', 'sae', 'teca', 'score'):
+                if mk in ov:
+                    self._safe_log(f'{stage}/metrics/{mk}', ov[mk], on_epoch=True)
 
-            for k, v in res.items():
-                self._safe_log(f'{stage}/metrics/{k}', v, on_epoch=True)
-
-            return res
+            return ov
         except Exception:
             return {}
 
     def configure_optimizers(self):
         """配置优化器"""
-        opt_cfg = self.config.training.optimizer
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=opt_cfg.lr,
-            weight_decay=opt_cfg.weight_decay
-        )
+        opt_cfg = getattr(self.config.training, 'optimizer', None)
+        lr = float(getattr(opt_cfg, 'lr', 1e-4)) if opt_cfg is not None else 1e-4
+        wd = float(getattr(opt_cfg, 'weight_decay', 0.0)) if opt_cfg is not None else 0.0
+        optimizer = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=wd)
+        sch_cfg = getattr(self.config.training, 'scheduler', None)
+        name = str(getattr(sch_cfg, 'name', 'plateau')).lower() if sch_cfg is not None else 'plateau'
+        if name == 'cosine':
+            T_max = int(getattr(sch_cfg, 'T_max', getattr(self.config.training, 'max_epochs', 25)))
+            eta_min = float(getattr(sch_cfg, 'eta_min', 1e-6))
+            warmup_steps = int(getattr(sch_cfg, 'warmup_steps', 0))
+            sched_main = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max, eta_min=eta_min)
+            if warmup_steps > 0:
+                sched_warm = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.2, total_iters=warmup_steps)
+                scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[sched_warm, sched_main], milestones=[warmup_steps])
+            else:
+                scheduler = sched_main
+            return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
+        else:
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "monitor": "val/loss/total",
+                    "interval": "epoch"
+                },
+            }
 
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=3
+    def forward_with_embeddings(self, batch: Dict[str, torch.Tensor]):
+        tf = batch.get('time_features')
+        out = self.model.forward_with_embeddings(
+            time_features=tf,
+            freq_features=batch.get('freq_features'),
+            time_positional=batch.get('time_positional'),
+            aux_features=batch.get('aux_features'),
+            time_valid_mask=batch.get('time_valid_mask'),
+            freq_valid_mask=batch.get('freq_valid_mask'),
+            aux_valid_mask=batch.get('aux_valid_mask'),
         )
+        reg, cls, unk, emb = out
+        if cls is None:
+            B = tf.size(0)
+            cls = torch.zeros(B, self.n_devices, device=tf.device, dtype=reg.dtype)
+        return reg, cls, unk, emb
 
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val/loss/total",
-                "interval": "epoch"
-            },
-        }
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        try:
+            if self.metric_learning_enable and self.prototype_library is not None:
+                checkpoint['prototype_library_state'] = self.prototype_library.state_dict()
+        except Exception:
+            pass
+
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        try:
+            state = checkpoint.get('prototype_library_state', None)
+            if self.metric_learning_enable and self.prototype_library is not None and state is not None:
+                self.prototype_library.load_state_dict(state)
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------------------------
@@ -419,15 +697,25 @@ def main(config: DictConfig) -> None:
         accelerator=getattr(config.training, 'accelerator', 'auto'),
         devices=getattr(config.training, 'devices', 1),
         precision=getattr(config.training, 'precision', 32),
+        min_epochs=int(getattr(config.training, 'min_epochs', 1)),
         max_epochs=config.training.max_epochs,
         logger=logger,
-        callbacks=[
-            ModelCheckpoint(monitor='val/loss/total', mode='min', save_top_k=1, filename='best-model'),
-            EarlyStopping(monitor='val/loss/total', patience=5, mode='min'),
-            LearningRateMonitor(logging_interval='epoch')
-        ],
-        check_val_every_n_epoch=1,
-        log_every_n_steps=10
+        callbacks=(lambda cfg: (
+            (lambda monitor, mode, patience, min_delta, enable_es, start_epoch: (
+                [ModelCheckpoint(monitor=monitor, mode=mode, save_top_k=1, filename='best-model')] +
+                ([DeferredEarlyStopping(monitor=monitor, patience=patience, mode=mode, min_delta=min_delta, start_epoch=start_epoch)] if enable_es else []) +
+                [LearningRateMonitor(logging_interval='epoch')]
+            ))(
+                str(getattr(getattr(cfg.training, 'early_stopping', None), 'monitor', 'val/loss/total')),
+                str(getattr(getattr(cfg.training, 'early_stopping', None), 'mode', 'min')),
+                int(getattr(getattr(cfg.training, 'early_stopping', None), 'patience', 5)),
+                float(getattr(getattr(cfg.training, 'early_stopping', None), 'min_delta', 0.0)),
+                bool(getattr(getattr(cfg.training, 'early_stopping', None), 'enable', True)),
+                int(getattr(getattr(cfg.training, 'early_stopping', None), 'start_epoch', 0))
+            )
+        ))(config),
+        check_val_every_n_epoch=int(getattr(config.training, 'check_val_every_n_epoch', 1)),
+        log_every_n_steps=int(getattr(config.training, 'log_every_n_steps', 10))
     )
 
     trainer.fit(model, datamodule)
@@ -446,18 +734,27 @@ def setup_logging(config: DictConfig, output_dir: Path) -> TensorBoardLogger:
 
 
 def create_trainer(config: DictConfig, logger: TensorBoardLogger) -> pl.Trainer:
-    mc = ModelCheckpoint(monitor='val/loss/total', mode='min', save_top_k=1, filename='best-model')
-    es = EarlyStopping(monitor='val/loss/total', patience=5, mode='min')
+    monitor = str(getattr(getattr(config.training, 'early_stopping', None), 'monitor', 'val/loss/total'))
+    mode = str(getattr(getattr(config.training, 'early_stopping', None), 'mode', 'min'))
+    patience = int(getattr(getattr(config.training, 'early_stopping', None), 'patience', 5))
+    min_delta = float(getattr(getattr(config.training, 'early_stopping', None), 'min_delta', 0.0))
+    enable_es = bool(getattr(getattr(config.training, 'early_stopping', None), 'enable', True))
+    start_epoch = int(getattr(getattr(config.training, 'early_stopping', None), 'start_epoch', 0))
+    mc = ModelCheckpoint(monitor=monitor, mode=mode, save_top_k=1, filename='best-model')
     lrmon = LearningRateMonitor(logging_interval='epoch')
+    callbacks = [mc, lrmon]
+    if enable_es:
+        callbacks.append(DeferredEarlyStopping(monitor=monitor, patience=patience, mode=mode, min_delta=min_delta, start_epoch=start_epoch))
     trainer = pl.Trainer(
         accelerator=getattr(config.training, 'accelerator', 'auto'),
         devices=getattr(config.training, 'devices', 1),
         precision=getattr(config.training, 'precision', 32),
+        min_epochs=int(getattr(config.training, 'min_epochs', 1)),
         max_epochs=config.training.max_epochs,
         logger=logger,
-        callbacks=[mc, es, lrmon],
-        check_val_every_n_epoch=1,
-        log_every_n_steps=10,
+        callbacks=callbacks,
+        check_val_every_n_epoch=int(getattr(config.training, 'check_val_every_n_epoch', 1)),
+        log_every_n_steps=int(getattr(config.training, 'log_every_n_steps', 10)),
         enable_checkpointing=True,
     )
     return trainer

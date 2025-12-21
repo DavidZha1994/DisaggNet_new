@@ -6,6 +6,12 @@ import torch.nn.functional as F
 from typing import Tuple, Optional
 from omegaconf import DictConfig
 import math
+try:
+    import xformers.ops as xops
+    _HAS_XFORMERS = True
+except Exception:
+    xops = None
+    _HAS_XFORMERS = False
 
 
 class PositionalEncoding(nn.Module):
@@ -66,7 +72,7 @@ class TimeRPE(nn.Module):
 class CausalMultiHeadAttention(nn.Module):
     """因果/通用多头注意力（在MPS上禁用SDPA，使用安全实现）"""
     
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, causal: bool = True):
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, causal: bool = True, use_efficient_attention: bool = False):
         super().__init__()
         assert d_model % n_heads == 0
         
@@ -74,6 +80,7 @@ class CausalMultiHeadAttention(nn.Module):
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
         self.causal = causal
+        self.use_efficient_attention = bool(use_efficient_attention)
         
         self.w_q = nn.Linear(d_model, d_model)
         self.w_k = nn.Linear(d_model, d_model)
@@ -115,10 +122,27 @@ class CausalMultiHeadAttention(nn.Module):
             additional_mask = key_invalid.unsqueeze(1).unsqueeze(1).expand(-1, self.n_heads, q_len, -1)
             attn_mask_bool = additional_mask if attn_mask_bool is None else (attn_mask_bool | additional_mask)
         
+        use_xops = (_HAS_XFORMERS and self.use_efficient_attention and query.is_cuda and (not torch.backends.mps.is_available()))
         # 在MPS上禁用F.scaled_dot_product_attention以避免NDArray断言错误
         use_fused_sdpa = hasattr(F, 'scaled_dot_product_attention') and not torch.backends.mps.is_available()
         
-        if use_fused_sdpa:
+        if use_xops:
+            Qx = Q.transpose(1, 2)
+            Kx = K.transpose(1, 2)
+            Vx = V.transpose(1, 2)
+            if mask is not None:
+                key_valid = (mask > 0) if mask.dtype != torch.bool else mask
+                kv_mask = key_valid.float().unsqueeze(-1).unsqueeze(-1)
+                Kx = Kx * kv_mask
+                Vx = Vx * kv_mask
+            attn_bias = xops.LowerTriangularMask() if self.causal else None
+            context = xops.memory_efficient_attention(
+                Qx, Kx, Vx,
+                attn_bias=attn_bias,
+                p=self.dropout.p if self.training else 0.0
+            )
+            context = context.reshape(batch_size, q_len, self.d_model)
+        elif use_fused_sdpa:
             context = F.scaled_dot_product_attention(
                 Q, K, V,
                 attn_mask=attn_mask_bool,
@@ -137,18 +161,19 @@ class CausalMultiHeadAttention(nn.Module):
             context = torch.matmul(attn, V)  # (B, H, q_len, d_k)
         
         # 合并头
-        context = context.transpose(1, 2).contiguous().view(batch_size, q_len, self.d_model)
+        if not use_xops:
+            context = context.transpose(1, 2).contiguous().view(batch_size, q_len, self.d_model)
         return self.w_o(context)
 
 
 class TransformerBlock(nn.Module):
     """Transformer块（Pre-LN，移除BatchNorm）"""
     
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1, causal: bool = True):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1, causal: bool = True, use_efficient_attention: bool = False):
         super().__init__()
         
         # 统一使用安全注意力实现（在MPS上禁用SDPA）
-        self.attention = CausalMultiHeadAttention(d_model, n_heads, dropout, causal=causal)
+        self.attention = CausalMultiHeadAttention(d_model, n_heads, dropout, causal=causal, use_efficient_attention=use_efficient_attention)
         
         self.feed_forward = nn.Sequential(
             nn.Linear(d_model, d_ff),
@@ -179,6 +204,7 @@ class TimeEncoder(nn.Module):
         super().__init__()
         
         self.config = config
+        self.use_efficient_attention = bool(getattr(config, 'use_efficient_attention', False))
         d_model = config.d_model
         n_heads = config.n_heads
         num_layers = config.num_layers
@@ -197,7 +223,7 @@ class TimeEncoder(nn.Module):
         
         # Transformer层
         self.transformer_layers = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, d_model * 4, dropout, causal=config.causal_mask)
+            TransformerBlock(d_model, n_heads, d_model * 4, dropout, causal=config.causal_mask, use_efficient_attention=self.use_efficient_attention)
             for _ in range(num_layers)
         ])
         
@@ -257,6 +283,7 @@ class FreqEncoder(nn.Module):
         super().__init__()
         
         self.config = config
+        self.use_efficient_attention = bool(getattr(config, 'use_efficient_attention', False))
         self.proj_dim = config.proj_dim
         self.conv_kernel = getattr(config, 'conv1d_kernel', 3)
         dropout = getattr(config, 'dropout', 0.1)
@@ -277,7 +304,7 @@ class FreqEncoder(nn.Module):
         if self.use_transformer:
             self.pos_encoding = PositionalEncoding(self.proj_dim)
             self.tf_layers = nn.ModuleList([
-                TransformerBlock(self.proj_dim, self.n_heads, self.proj_dim * 4, dropout, causal=False)
+                TransformerBlock(self.proj_dim, self.n_heads, self.proj_dim * 4, dropout, causal=False, use_efficient_attention=self.use_efficient_attention)
                 for _ in range(self.num_layers)
             ])
     
@@ -393,15 +420,15 @@ class AuxEncoder(nn.Module):
 class CrossAttentionFusion(nn.Module):
     """交叉注意力融合（去除门控，简化为残差相加）"""
     
-    def __init__(self, d_model: int, n_heads: int = 8, dropout: float = 0.1, freq_proj_in: Optional[int] = None, bidirectional: bool = False):
+    def __init__(self, d_model: int, n_heads: int = 8, dropout: float = 0.1, freq_proj_in: Optional[int] = None, bidirectional: bool = False, use_efficient_attention: bool = False):
         super().__init__()
         
         self.d_model = d_model
         self.bidirectional = bidirectional
         
-        self.cross_attention = CausalMultiHeadAttention(d_model, n_heads, dropout, causal=False)
+        self.cross_attention = CausalMultiHeadAttention(d_model, n_heads, dropout, causal=False, use_efficient_attention=use_efficient_attention)
         if bidirectional:
-            self.reverse_cross_attention = CausalMultiHeadAttention(d_model, n_heads, dropout, causal=False)
+            self.reverse_cross_attention = CausalMultiHeadAttention(d_model, n_heads, dropout, causal=False, use_efficient_attention=use_efficient_attention)
         
         if freq_proj_in is not None and freq_proj_in != d_model:
             self.freq_proj = nn.Linear(freq_proj_in, d_model)
@@ -439,22 +466,33 @@ class MultiTaskHead(nn.Module):
                  use_seq_ln: bool = True,
                  reg_use_softplus: bool = False,
                  seq_use_softplus: bool = False,
-                 seq_init_bias: float = 0.0):
+                 seq_init_bias: float = 0.0,
+                 use_efficient_attention: bool = False,
+                 gating_strength: float = 0.3,
+                 gate_temperature: float = 2.0,
+                 calib_strength: float = 0.1):
         super().__init__()
         
         self.d_model = d_model
         self.n_devices = n_devices
+        self.gating_strength = float(gating_strength)
+        self.gate_temperature = float(gate_temperature)
+        self.calib_strength = float(calib_strength)
         self.enable_film = False
         self.enable_routing = False
         self.include_unknown = include_unknown
         
         # 使用安全注意力池化（非因果）
-        self.attention_pooling = CausalMultiHeadAttention(d_model, n_heads=8, dropout=0.1, causal=False)
+        self.attention_pooling = CausalMultiHeadAttention(d_model, n_heads=8, dropout=0.1, causal=False, use_efficient_attention=use_efficient_attention)
         
         self.device_embeddings = nn.Embedding(n_devices, d_model)
         
-        self.film_gamma = None
-        self.film_beta = None
+        self.film_gamma = nn.Linear(d_model, d_model, bias=False)
+        self.film_beta = nn.Linear(d_model, d_model, bias=True)
+        nn.init.zeros_(self.film_gamma.weight)
+        nn.init.zeros_(self.film_beta.weight)
+        if self.film_beta.bias is not None:
+            nn.init.zeros_(self.film_beta.bias)
         self.routing_gate = None
         
         self.regression_heads = nn.ModuleList([
@@ -478,7 +516,24 @@ class MultiTaskHead(nn.Module):
         else:
             self.unknown_regression_head = None
         self.classification_heads = None
-        self.seq_regressor = nn.Linear(d_model, n_devices)
+        # 设备条件化的序列头：按设备分组的 1x1 Conv，使每个设备拥有独立映射
+        self.seq_conv = nn.Conv1d(n_devices * d_model, n_devices, kernel_size=1, groups=n_devices)
+        # 设备门控（稀疏激活，分配权重）：竞争式门控不分组以允许跨设备竞争
+        self.alloc_gate = nn.Conv1d(n_devices * d_model, n_devices, kernel_size=1, groups=1)
+        self.seq_use_softplus = bool(seq_use_softplus)
+        self.seq_activation = ZeroSoftplus() if self.seq_use_softplus else nn.Identity()
+        # 输出校准头：按设备生成缩放与偏置，用于微调波形幅度与基线
+        self.calib_scale_head = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, n_devices),
+            nn.Softplus()
+        )
+        self.calib_bias_head = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, n_devices)
+        )
         
         try:
             for head in self.regression_heads:
@@ -527,7 +582,26 @@ class MultiTaskHead(nn.Module):
         Returns:
             seq_regression_pred: (batch_size, seq_len, n_devices)
         """
-        return self.seq_regressor(x)
+        B, T, D = x.shape
+        device_ids = torch.arange(self.n_devices, device=x.device)
+        dev_emb = self.device_embeddings(device_ids)  # (N, D)
+        gamma = self.film_gamma(dev_emb)             # (N, D)
+        beta = self.film_beta(dev_emb)               # (N, D)
+        x_exp = x.unsqueeze(2).expand(-1, -1, self.n_devices, -1)  # (B, T, N, D)
+        x_mod = x_exp * (1.0 + gamma.view(1, 1, self.n_devices, D)) + beta.view(1, 1, self.n_devices, D)  # (B, T, N, D)
+        x_mod_flat = x_mod.reshape(B, T, self.n_devices * D)  # (B, T, N*D)
+        logits = self.alloc_gate(x_mod_flat.transpose(1, 2)).transpose(1, 2)
+        gate = torch.softmax(logits / max(self.gate_temperature, 1e-3), dim=2)
+        y_lin = self.seq_conv(x_mod_flat.transpose(1, 2)).transpose(1, 2)  # (B, T, N)
+        y = y_lin * (1.0 - self.gating_strength) + (y_lin * gate) * self.gating_strength
+        self._last_gate = gate
+        # 基于注意力池化的序列全局表示进行输出校准（逐设备缩放与偏置）
+        pooled = self.attention_pooling(x, x, x).mean(dim=1)  # (B, D)
+        s = self.calib_scale_head(pooled)  # (B, N)
+        b = self.calib_bias_head(pooled)   # (B, N)
+        if self.calib_strength > 0.0:
+            y = y * (1.0 + self.calib_strength * s.view(B, 1, self.n_devices)) + self.calib_strength * b.view(B, 1, self.n_devices)
+        return self.seq_activation(y)
 
     def forward_with_embeddings(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         """
@@ -584,6 +658,7 @@ class FusionTransformer(nn.Module):
         
         self.config = config
         self.n_devices = n_devices
+        eff_att = bool(getattr(config, 'efficient_attention', getattr(config, 'use_efficient_attention', False)))
         
         # 时域编码器
         self.time_encoder = TimeEncoder(config.time_encoder)
@@ -621,7 +696,8 @@ class FusionTransformer(nn.Module):
                 n_heads=8,
                 dropout=0.1,
                 freq_proj_in=config.freq_encoder.proj_dim,
-                bidirectional=bidirectional
+                bidirectional=bidirectional,
+                use_efficient_attention=eff_att
             )
         else:
             self.fusion = None
@@ -637,6 +713,12 @@ class FusionTransformer(nn.Module):
         _seq_act = str(getattr(getattr(config.heads, 'regression', None), 'seq_activation', _reg_act)).lower()
         _reg_sp = bool(getattr(getattr(config.heads, 'regression', None), 'use_softplus', _reg_act == 'softplus'))
         _seq_sp = bool(getattr(getattr(config.heads, 'regression', None), 'seq_use_softplus', _seq_act == 'softplus'))
+        # 输出校准强度：若模型配置启用校准，则使用默认 0.1；否则关闭
+        try:
+            _calib_enabled = bool(getattr(getattr(config, 'calibration', None), 'enable', False))
+        except Exception:
+            _calib_enabled = False
+        _calib_strength = float(getattr(getattr(config.heads, 'regression', None), 'calib_strength', 0.1 if _calib_enabled else 0.0))
 
         self.prediction_head = MultiTaskHead(
             d_model=config.time_encoder.d_model,
@@ -648,7 +730,11 @@ class FusionTransformer(nn.Module):
             use_seq_ln=bool(getattr(getattr(config.heads, 'regression', None), 'use_seq_ln', True)),
             reg_use_softplus=_reg_sp,
             seq_use_softplus=_seq_sp,
-            seq_init_bias=float(getattr(getattr(config.heads, 'regression', None), 'seq_init_bias', getattr(getattr(config.heads, 'regression', None), 'init_bias', 0.0)))
+            seq_init_bias=float(getattr(getattr(config.heads, 'regression', None), 'seq_init_bias', getattr(getattr(config.heads, 'regression', None), 'init_bias', 0.0))),
+            use_efficient_attention=eff_att,
+            gating_strength=float(getattr(getattr(config.heads, 'regression', None), 'gating_strength', 0.3)),
+            gate_temperature=float(getattr(getattr(config.heads, 'regression', None), 'gate_temperature', 2.0)),
+            calib_strength=_calib_strength
         )
         
         # 初始化权重
@@ -741,16 +827,39 @@ class FusionTransformer(nn.Module):
         fused_repr = self.fusion(time_repr, freq_repr) if self.fusion is not None else time_repr
 
         seq_pred = self.prediction_head.forward_seq(fused_repr)
-        class_seq_pred = None
+        class_seq_pred = torch.zeros_like(seq_pred)
 
         # 同步生成窗口级预测
         reg_cls_unknown = self.prediction_head(fused_repr)
         regression_pred = reg_cls_unknown[0]
-        classification_pred = None
+        classification_pred = torch.zeros_like(regression_pred)
         unknown_pred = reg_cls_unknown[2] if self.include_unknown else None
-        # 序列级分类
-        class_seq_pred = class_seq_pred
+        # 序列级分类：使用最近一次门控（若可用）
+        try:
+            if hasattr(self.prediction_head, "_last_gate") and isinstance(self.prediction_head._last_gate, torch.Tensor):
+                class_seq_pred = self.prediction_head._last_gate
+        except Exception:
+            class_seq_pred = class_seq_pred
 
+        # 外部尺度（逐设备缩放）
+        if isinstance(external_scale, torch.Tensor):
+            scale = external_scale.to(seq_pred.device).to(seq_pred.dtype)
+            if scale.dim() == 1:
+                scale = scale.view(1, 1, -1)
+            elif scale.dim() == 2:
+                scale = scale.view(1, 1, -1)
+            # 形状 (B,T,N)
+            n = seq_pred.size(-1)
+            s_last = scale.size(-1)
+            if s_last != n:
+                if s_last > n:
+                    scale = scale[:, :, :n]
+                else:
+                    pad = torch.ones(1, 1, n - s_last, dtype=scale.dtype, device=scale.device)
+                    scale = torch.cat([scale, pad], dim=-1)
+            seq_pred = seq_pred * scale
+            regression_pred = regression_pred * scale.view(1, -1)
+            classification_pred = classification_pred  # 不缩放分类
         return seq_pred, regression_pred, classification_pred, unknown_pred, class_seq_pred
 
     def forward_with_embeddings(self, time_features: torch.Tensor, 

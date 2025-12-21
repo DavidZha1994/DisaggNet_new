@@ -33,7 +33,7 @@ def repair_small_gaps(
         if ser.dtype.kind in 'bif':
             before_nan = ser.isna().to_numpy()
             try:
-                x[c] = ser.interpolate(limit=limit, limit_direction='both')
+                x[c] = ser.ffill(limit=limit)
             except Exception:
                 # 插值失败不影响其他列
                 pass

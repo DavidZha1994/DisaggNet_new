@@ -1,0 +1,36 @@
+search_space:
+  training:
+    optimizer:
+      lr: {type: float_log, low: 1e-5, high: 5e-3}
+      weight_decay: {type: float_log, low: 1e-8, high: 5e-3}
+    gradient_clip_val: {type: float, low: 0.0, high: 1.0}
+    accumulate_grad_batches: {type: choice, values: [1, 2, 4]}
+    max_epochs: {type: int, low: 18, high: 30}
+  data:
+    batch_size: {type: choice, values: [32, 64, 128, 256]}
+  model:
+    time_encoder:
+      d_model: {type: choice, values: [128, 256, 384]}
+      n_heads: {type: choice, values: [8]}
+      num_layers: {type: int, low: 2, high: 5}
+      dropout: {type: float, low: 0.0, high: 0.3}
+    freq_encoder:
+      enable: {type: fixed, value: true}
+      proj_dim: {type: choice, values: [192, 256, 384]}
+    fusion:
+      bidirectional: {type: choice, values: [false, true]}
+    heads:
+      regression:
+        hidden: {type: choice, values: [192, 256, 384]}
+        use_softplus: {type: choice, values: [false, true]}
+        seq_use_softplus: {type: choice, values: [false, true]}
+stability:
+  use_efficient_attention: true
+logging:
+  save_dir: logs/tensorboard/hpo
+  name: hpo
+optuna:
+  pruner: median
+  warmup_steps: 3
+  storage: sqlite:///outputs/hpo/optuna.db
+  study_name: disaggnet_hpo

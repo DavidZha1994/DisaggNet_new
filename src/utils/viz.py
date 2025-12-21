@@ -63,6 +63,15 @@ def save_validation_interactive_plot(
         ln = _get_ln(d)
         p = _to_numpy(d.get('pred'))
         t = _to_numpy(d.get('true'))
+        vmask = d.get('valid')
+        vmask_np = None
+        try:
+            if vmask is not None:
+                vmask_np = _to_numpy(vmask).astype(np.float32)
+                if vmask_np.ndim > 1:
+                    vmask_np = np.squeeze(vmask_np)
+        except Exception:
+            vmask_np = None
         if p.ndim == 1:
             p = p.reshape(-1, 1)
         if t.ndim == 1:
@@ -71,11 +80,19 @@ def save_validation_interactive_plot(
         tk = int(t.shape[1])
         for i in range(K):
             if i < pk:
-                pred_series[i].append(p[:ln, i].astype(np.float32))
+                arr = p[:ln, i].astype(np.float32)
+                if vmask_np is not None and vmask_np.shape[0] >= ln:
+                    vv = vmask_np[:ln]
+                    arr = np.where(vv > 0.5, arr, np.nan)
+                pred_series[i].append(arr)
             else:
                 pred_series[i].append(np.full((ln,), np.nan, dtype=np.float32))
             if i < tk:
-                true_series[i].append(t[:ln, i].astype(np.float32))
+                arrt = t[:ln, i].astype(np.float32)
+                if vmask_np is not None and vmask_np.shape[0] >= ln:
+                    vv = vmask_np[:ln]
+                    arrt = np.where(vv > 0.5, arrt, np.nan)
+                true_series[i].append(arrt)
             else:
                 true_series[i].append(np.full((ln,), np.nan, dtype=np.float32))
 
@@ -99,6 +116,13 @@ def save_validation_interactive_plot(
                 pad_len = ln - mm.shape[0]
                 pad = np.full((pad_len,), np.nan, dtype=np.float32)
                 mm = np.concatenate([mm, pad], axis=0)
+            # 若提供有效掩码，则屏蔽无效位置，避免主表为 0 与分设备不一致
+            try:
+                if vmask_np is not None and vmask_np.shape[0] >= ln:
+                    vv = vmask_np[:ln]
+                    mm = np.where(vv > 0.5, mm, np.nan)
+            except Exception:
+                pass
         start = float(d.get('start', 0.0))
         step = float(d.get('step', 1.0))
         ts = start + np.arange(ln, dtype=np.float64) * step
@@ -133,43 +157,36 @@ def save_validation_interactive_plot(
         axis=1,
     )
 
-    if max_power is not None:
+    x_index = np.arange(int(mains_concat.shape[0]), dtype=np.int64)
+    def _fmt_time(v):
         try:
-            mp = np.asarray(max_power, dtype=np.float32).reshape(1, -1)
-            if np.nanmax(pred_concat) <= 2.0:
-                pred_concat = pred_concat * mp
-            if np.nanmax(true_concat) <= 2.0:
-                true_concat = true_concat * mp
+            if v is None:
+                return ""
+            if isinstance(v, datetime):
+                return v.strftime("%Y-%m-%d %H:%M:%S")
+            if isinstance(v, np.datetime64):
+                try:
+                    s = np.datetime_as_string(v, unit='s')
+                    return s.replace("T", " ")
+                except Exception:
+                    return str(v)
+            if isinstance(v, (int, float)):
+                if np.isfinite(v):
+                    dt = datetime.utcfromtimestamp(float(v))
+                    return dt.strftime("%Y-%m-%d %H:%M:%S")
+                return ""
+            return str(v)
         except Exception:
-            pass
+            try:
+                return str(v) if v is not None else ""
+            except Exception:
+                return ""
+    hover_text = [ _fmt_time(v) for v in timeline_dt ]
 
     try:
         titles = [str(device_names[i]) for i in range(K)]
     except Exception:
         titles = [f'Device_{i}' for i in range(K)]
-    # 覆盖：若存在数据集映射文件，则以映射顺序替换设备名称，并对齐列数
-    try:
-        base_dir = Path('Data') / 'prepared' / str(dataset_name)
-        fmap = base_dir / 'device_name_to_id.json'
-        if fmap.exists():
-            import json as _json
-            with open(fmap, 'r', encoding='utf-8') as f:
-                mp = _json.load(f)
-            if isinstance(mp, dict) and len(mp) > 0:
-                items = list(mp.items())
-                try:
-                    items.sort(key=lambda kv: int(kv[1]))
-                except Exception:
-                    items.sort(key=lambda kv: str(kv[0]))
-                mapped = [str(k) for k, _ in items]
-                if len(mapped) > 0:
-                    if K > len(mapped):
-                        K = len(mapped)
-                        pred_concat = pred_concat[:, :K]
-                        true_concat = true_concat[:, :K]
-                    titles = mapped[:K]
-    except Exception:
-        pass
 
     rows_total = int(K + 1)
     max_vs = (1.0 / max(rows_total - 1, 1)) - 1e-6
@@ -183,13 +200,15 @@ def save_validation_interactive_plot(
     )
     fig.add_trace(
         go.Scatter(
-            x=timeline_dt,
+            x=x_index,
             y=mains_concat,
             name="总功率",
             mode="lines",
             line=dict(color="#7f7f7f"),
             legendgroup="mains",
             showlegend=True,
+            text=hover_text,
+            hovertemplate="时间: %{text}<br>功率=%{y:.2f}W<extra></extra>",
         ),
         row=1,
         col=1,
@@ -198,26 +217,30 @@ def save_validation_interactive_plot(
     for i in range(K):
         fig.add_trace(
             go.Scatter(
-                x=timeline_dt,
+                x=x_index,
                 y=true_concat[:, i],
                 name="目标功率",
                 mode="lines",
                 line=dict(color="#2ca02c"),
                 legendgroup="target",
                 showlegend=True if i == 0 else False,
+                text=hover_text,
+                hovertemplate="时间: %{text}<br>功率=%{y:.2f}W<extra></extra>",
             ),
             row=i + 2,
             col=1,
         )
         fig.add_trace(
             go.Scatter(
-                x=timeline_dt,
+                x=x_index,
                 y=pred_concat[:, i],
                 name="预测功率",
                 mode="lines",
                 line=dict(color="#ff7f0e"),
                 legendgroup="prediction",
                 showlegend=True if i == 0 else False,
+                text=hover_text,
+                hovertemplate="时间: %{text}<br>功率=%{y:.2f}W<extra></extra>",
             ),
             row=i + 2,
             col=1,
@@ -250,7 +273,7 @@ def save_validation_interactive_plot(
     )
     try:
         for r in range(1, rows_total + 1):
-            fig.update_xaxes(type='date', tickformat="%Y-%m-%d %H:%M:%S", row=r, col=1)
+            fig.update_xaxes(type='linear', row=r, col=1)
     except Exception:
         pass
     out_dir = (
@@ -262,8 +285,4 @@ def save_validation_interactive_plot(
     out_dir.mkdir(parents=True, exist_ok=True)
     fp = out_dir / f"epoch_{int(epoch):04d}.html"
     pio.write_html(fig, file=str(fp), include_plotlyjs='cdn', auto_open=False)
-    rank_dir = out_dir / "rank_0"
-    rank_dir.mkdir(parents=True, exist_ok=True)
-    fp_rank = rank_dir / f"epoch_{int(epoch):04d}.html"
-    pio.write_html(fig, file=str(fp_rank), include_plotlyjs='cdn', auto_open=False)
-    return fp_rank
+    return fp
