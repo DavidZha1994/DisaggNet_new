@@ -385,6 +385,7 @@ def create_parser() -> argparse.ArgumentParser:
     # 基础训练
     train_parser = subparsers.add_parser("train", help="基础训练")
     train_parser.add_argument("--config", default="configs/default.yaml", help="配置文件路径或名称")
+    train_parser.add_argument("--task", type=str, choices=["seq2seq", "seq2point"], help="任务类型（seq2seq 或 seq2point）")
     train_parser.add_argument("--epochs", type=int, help="训练轮数")
     train_parser.add_argument("--batch-size", type=int, help="批次大小")
     train_parser.add_argument("--lr", type=float, help="学习率")

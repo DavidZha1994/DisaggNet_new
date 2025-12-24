@@ -27,8 +27,8 @@ frequency:
   win_length: 256
   magnitude: true
 
-hipe:
-  enable: true
+  hipe:
+    enable: true
   timestamp_col: datetime
   mains_file: MainTerminal_PhaseCount_3_geq_2017-10-01_lt_2018-01-01.csv
   device_pattern: '*_PhaseCount_*.csv'
@@ -41,7 +41,7 @@ hipe:
   # 最短运行长度（点数）
   onoff_min_on_points: 24
   onoff_min_off_points: 24
-  step_size: 128
+  step_size: 8
   mains_cols:
     P_kW: P_kW
     Q_kvar: Q_kvar
@@ -70,7 +70,7 @@ labels: {}
 refit_ukdale:
   sampling_rate: 1min
   window_size: 256
-  window_stride: 128
+  window_stride: 8
   list_exo_variables: [minute, hour, dow, month]
   data_root: Data
 

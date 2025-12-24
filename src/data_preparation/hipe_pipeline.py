@@ -210,10 +210,8 @@ class HIPEDataPreparationPipeline:
         except Exception:
             pass
 
-        # 4) 特征与目标
         X_full = self._build_mains_features(df_merged)
         Yp_full = self._build_targets(df_merged, eff_dev_names, kind="P")
-        # 切窗：严格在连续段内滑窗，禁止跨段
         L = self.hipe.window_length
         H = self.hipe.step_size
         segments_meta = self._create_segments_meta(df_merged)
@@ -228,7 +226,16 @@ class HIPEDataPreparationPipeline:
                 if (b - a + 1) >= L_:
                     ss.extend(list(range(a, b - L_ + 2, H_)))
             return np.array(ss, dtype=np.int64)
+
         starts = _compute_segmented_starts(segments_meta, L, H)
+        if starts.size > 0:
+            try:
+                min_ratio = 1.0
+                starts_mask = self._valid_window_mask_by_ratio(Yp_full, starts, L, min_ratio=min_ratio)
+                if isinstance(starts_mask, np.ndarray) and starts_mask.dtype == bool and starts_mask.shape[0] == starts.shape[0]:
+                    starts = starts[starts_mask]
+            except Exception:
+                pass
         X_seq, Yp_seq, _ = self._slide_window(X_full, Yp_full, L=L, H=H, starts_override=starts)
         # 可视化已移除
         # 保持目标序列的 NaN（由下游 mask 处理），仅确保 dtype

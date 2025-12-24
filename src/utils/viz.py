@@ -18,6 +18,57 @@ def _to_numpy(x):
         return np.asarray(x)
 
 
+def reconstruct_dense_curve(
+    predictions_per_offset: Dict[int, np.ndarray],
+    stride: int,
+    total_length: int,
+) -> np.ndarray:
+    if total_length <= 0 or stride <= 0 or not predictions_per_offset:
+        return np.zeros((0,), dtype=np.float32)
+    ks = []
+    for v in predictions_per_offset.values():
+        arr = _to_numpy(v)
+        if arr.ndim == 1:
+            ks.append(1)
+        elif arr.ndim >= 2:
+            ks.append(int(arr.shape[-1]))
+    k_out = max(ks) if ks else 1
+    dense = np.full((total_length, k_out), np.nan, dtype=np.float32)
+    count = np.zeros((total_length, 1), dtype=np.float32)
+    for offset, vals in predictions_per_offset.items():
+        arr = _to_numpy(vals)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        elif arr.ndim > 2:
+            arr = arr.reshape(arr.shape[0], -1)
+        n, k = arr.shape
+        if n == 0:
+            continue
+        if k < k_out:
+            pad = np.zeros((n, k_out - k), dtype=arr.dtype)
+            arr = np.concatenate([arr, pad], axis=1)
+        idx = offset + np.arange(n, dtype=np.int64) * int(stride)
+        mask = (idx >= 0) & (idx < total_length)
+        if not np.any(mask):
+            continue
+        idx = idx[mask]
+        arr_valid = arr[mask]
+        cur = dense[idx]
+        cur = np.nan_to_num(cur, nan=0.0)
+        dense[idx] = cur + arr_valid
+        count[idx, 0] += 1.0
+    valid = count[:, 0] > 0
+    if not np.any(valid):
+        if k_out == 1:
+            return np.full((total_length,), np.nan, dtype=np.float32)
+        return np.full((total_length, k_out), np.nan, dtype=np.float32)
+    dense_valid = dense[valid] / count[valid]
+    dense[valid] = dense_valid.astype(np.float32)
+    if k_out == 1:
+        return dense[:, 0]
+    return dense
+
+
 def save_validation_interactive_plot(
     buffers: List[Dict[str, Any]],
     device_names: List[str],
@@ -53,14 +104,18 @@ def save_validation_interactive_plot(
     for d in bufs:
         K = max(K, _get_k(d))
 
-    times = []
-    mains_list = []
-    pred_series = [[] for _ in range(K)]
-    true_series = [[] for _ in range(K)]
-    last_end_ts = None
-
+    total_points = int(sum(max(0, _get_ln(d)) for d in bufs))
+    if total_points <= 0:
+        return Path()
+    mains_concat = np.full((total_points,), np.nan, dtype=np.float32)
+    pred_concat = np.full((total_points, K), np.nan, dtype=np.float32)
+    true_concat = np.full((total_points, K), np.nan, dtype=np.float32)
+    unknown_concat = np.full((total_points,), np.nan, dtype=np.float32)
+    idx_cur = 0
     for d in bufs:
         ln = _get_ln(d)
+        if ln <= 0:
+            continue
         p = _to_numpy(d.get('pred'))
         t = _to_numpy(d.get('true'))
         vmask = d.get('valid')
@@ -78,24 +133,6 @@ def save_validation_interactive_plot(
             t = t.reshape(-1, 1)
         pk = int(p.shape[1])
         tk = int(t.shape[1])
-        for i in range(K):
-            if i < pk:
-                arr = p[:ln, i].astype(np.float32)
-                if vmask_np is not None and vmask_np.shape[0] >= ln:
-                    vv = vmask_np[:ln]
-                    arr = np.where(vv > 0.5, arr, np.nan)
-                pred_series[i].append(arr)
-            else:
-                pred_series[i].append(np.full((ln,), np.nan, dtype=np.float32))
-            if i < tk:
-                arrt = t[:ln, i].astype(np.float32)
-                if vmask_np is not None and vmask_np.shape[0] >= ln:
-                    vv = vmask_np[:ln]
-                    arrt = np.where(vv > 0.5, arrt, np.nan)
-                true_series[i].append(arrt)
-            else:
-                true_series[i].append(np.full((ln,), np.nan, dtype=np.float32))
-
         m = d.get('mains')
         mm = None
         if m is not None:
@@ -116,87 +153,93 @@ def save_validation_interactive_plot(
                 pad_len = ln - mm.shape[0]
                 pad = np.full((pad_len,), np.nan, dtype=np.float32)
                 mm = np.concatenate([mm, pad], axis=0)
-            # 若提供有效掩码，则屏蔽无效位置，避免主表为 0 与分设备不一致
             try:
                 if vmask_np is not None and vmask_np.shape[0] >= ln:
                     vv = vmask_np[:ln]
                     mm = np.where(vv > 0.5, mm, np.nan)
             except Exception:
                 pass
-        start = float(d.get('start', 0.0))
-        step = float(d.get('step', 1.0))
-        ts = start + np.arange(ln, dtype=np.float64) * step
-        if last_end_ts is not None:
-            cont = np.isclose(start, last_end_ts + step, atol=max(step * 0.01, 1e-6))
-            if not cont:
-                times.append(np.array([np.nan], dtype=np.float64))
-                mains_list.append(np.array([np.nan], dtype=np.float32))
-                for i in range(K):
-                    pred_series[i].append(np.full((1,), np.nan, dtype=np.float32))
-                    true_series[i].append(np.full((1,), np.nan, dtype=np.float32))
-        times.append(ts)
-        mains_list.append(mm)
-        last_end_ts = float(ts[-1]) if ts.size > 0 else start
+        sl = slice(idx_cur, idx_cur + ln)
+        if pk > 0:
+            new_pred = p[:ln, :pk].astype(np.float32)
+            if vmask_np is not None and vmask_np.shape[0] >= ln:
+                vv = vmask_np[:ln]
+                new_pred = np.where(vv[:, None] > 0.5, new_pred, np.nan)
+            pred_concat[sl, :pk] = new_pred
+        if tk > 0:
+            new_true = t[:ln, :tk].astype(np.float32)
+            if vmask_np is not None and vmask_np.shape[0] >= ln:
+                vv = vmask_np[:ln]
+                new_true = np.where(vv[:, None] > 0.5, new_true, np.nan)
+            true_concat[sl, :tk] = new_true
+        mains_concat[sl] = mm[:ln].astype(np.float32)
 
-    timeline = np.concatenate(times, axis=0)
-    try:
-        timeline_dt = [datetime.utcfromtimestamp(float(v)) if np.isfinite(v) else None for v in timeline]
-    except Exception:
-        try:
-            timeline_dt = [None if not np.isfinite(v) else np.datetime64(int(v), 's') for v in timeline]
-        except Exception:
-            timeline_dt = [None if not np.isfinite(v) else float(v) for v in timeline]
-
-    mains_concat = np.concatenate(mains_list, axis=0)
-    pred_concat = np.stack(
-        [np.concatenate(pred_series[i], axis=0) for i in range(K)],
-        axis=1,
-    )
-    true_concat = np.stack(
-        [np.concatenate(true_series[i], axis=0) for i in range(K)],
-        axis=1,
-    )
-
-    x_index = np.arange(int(mains_concat.shape[0]), dtype=np.int64)
-    def _fmt_time(v):
-        try:
-            if v is None:
-                return ""
-            if isinstance(v, datetime):
-                return v.strftime("%Y-%m-%d %H:%M:%S")
-            if isinstance(v, np.datetime64):
-                try:
-                    s = np.datetime_as_string(v, unit='s')
-                    return s.replace("T", " ")
-                except Exception:
-                    return str(v)
-            if isinstance(v, (int, float)):
-                if np.isfinite(v):
-                    dt = datetime.utcfromtimestamp(float(v))
-                    return dt.strftime("%Y-%m-%d %H:%M:%S")
-                return ""
-            return str(v)
-        except Exception:
+        u = d.get('unknown')
+        if u is not None:
             try:
-                return str(v) if v is not None else ""
+                uu = _to_numpy(u).astype(np.float32)
+                if uu.ndim > 1:
+                    uu = uu.reshape(-1)
+                uu = uu[:ln]
+                if uu.shape[0] < ln:
+                    pad_len = ln - uu.shape[0]
+                    pad = np.full((pad_len,), np.nan, dtype=np.float32)
+                    uu = np.concatenate([uu, pad], axis=0)
+                if vmask_np is not None and vmask_np.shape[0] >= ln:
+                    vv = vmask_np[:ln]
+                    uu = np.where(vv > 0.5, uu, np.nan)
+                unknown_concat[sl] = uu
             except Exception:
-                return ""
-    hover_text = [ _fmt_time(v) for v in timeline_dt ]
+                pass
+        idx_cur += ln
+    try:
+        valid_m = np.isfinite(mains_concat)
+        valid_p = np.isfinite(pred_concat).any(axis=1)
+        valid_t = np.isfinite(true_concat).any(axis=1)
+        valid_u = np.isfinite(unknown_concat)
+        global_valid = valid_m | valid_p | valid_t | valid_u
+    except Exception:
+        global_valid = np.ones((total_points,), dtype=bool)
+    if not np.any(global_valid):
+        global_valid = np.ones((total_points,), dtype=bool)
+    idx_all = np.where(global_valid)[0]
+    mains_concat = mains_concat[idx_all]
+    pred_concat = pred_concat[idx_all, :]
+    true_concat = true_concat[idx_all, :]
+    unknown_concat = unknown_concat[idx_all]
+    total_points = int(mains_concat.shape[0])
+    max_points = 200000
+    if total_points > max_points:
+        stride = int(np.ceil(total_points / float(max_points)))
+        idx = np.arange(0, total_points, stride, dtype=np.int64)
+        mains_concat = mains_concat[idx]
+        pred_concat = pred_concat[idx, :]
+        true_concat = true_concat[idx, :]
+        unknown_concat = unknown_concat[idx]
+    else:
+        idx = np.arange(total_points, dtype=np.int64)
+    x_index = np.arange(int(mains_concat.shape[0]), dtype=np.int64)
+    hover_text = [str(int(i)) for i in x_index]
 
     try:
         titles = [str(device_names[i]) for i in range(K)]
     except Exception:
         titles = [f'Device_{i}' for i in range(K)]
 
-    rows_total = int(K + 1)
+    has_unknown = np.isfinite(unknown_concat).any()
+    rows_total = int(K + 1 + (1 if has_unknown else 0))
     max_vs = (1.0 / max(rows_total - 1, 1)) - 1e-6
     vs = min(0.02, max(0.001, max_vs * 0.9))
+    subplot_titles = ["总功率"] + titles
+    if has_unknown:
+        subplot_titles = subplot_titles + ["未知功率"]
+
     fig = make_subplots(
         rows=rows_total,
         cols=1,
         shared_xaxes=True,
         vertical_spacing=vs,
-        subplot_titles=["总功率"] + titles,
+        subplot_titles=subplot_titles,
     )
     fig.add_trace(
         go.Scatter(
@@ -256,6 +299,23 @@ def save_validation_interactive_plot(
         except Exception:
             pass
 
+    if has_unknown:
+        fig.add_trace(
+            go.Scatter(
+                x=x_index,
+                y=unknown_concat,
+                name="未知功率",
+                mode="lines",
+                line=dict(color="#1f77b4"),
+                legendgroup="unknown",
+                showlegend=True,
+                text=hover_text,
+                hovertemplate="时间: %{text}<br>功率=%{y:.2f}W<extra></extra>",
+            ),
+            row=rows_total,
+            col=1,
+        )
+
     try:
         mvals = mains_concat[np.isfinite(mains_concat)]
         if mvals.size > 0:
@@ -265,6 +325,17 @@ def save_validation_interactive_plot(
                 fig.update_yaxes(range=[0.0, u_m * 1.15], row=1, col=1)
     except Exception:
         pass
+
+    if has_unknown:
+        try:
+            uvals = unknown_concat[np.isfinite(unknown_concat)]
+            if uvals.size > 0:
+                q_u = float(np.nanpercentile(uvals, 99.5))
+                u_u = float(max(np.nanmax(uvals), q_u))
+                if np.isfinite(u_u) and u_u > 0:
+                    fig.update_yaxes(range=[0.0, u_u * 1.15], row=rows_total, col=1)
+        except Exception:
+            pass
 
     fig.update_layout(
         template="plotly_white",

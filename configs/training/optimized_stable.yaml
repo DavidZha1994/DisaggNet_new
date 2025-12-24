@@ -2,6 +2,9 @@
 
 project_name: "DisaggNet"
 
+# Task: seq2seq or seq2point
+task: "seq2point"
+
 # 选择数据集（例如：UKDALE 或 REFIT）
 dataset: "UKDALE"
 
@@ -25,7 +28,7 @@ logging:
 
 # 数据设置（稳定版）
 data:
-  batch_size: 32
+  batch_size: 512
   num_workers: 0
   pin_memory: true
   persistent_workers: false
@@ -41,7 +44,6 @@ data:
 
 # 模型设置（融合Transformer）
 model:
-  efficient_attention: true
   time_encoder:
     d_model: 96
     n_heads: 8
@@ -49,7 +51,6 @@ model:
     dropout: 0.2
     input_conv_embed: true
     causal_mask: true
-    use_efficient_attention: true
     multi_scale_inputs:
       enable: false
       windows: [2, 4, 16, 64]
@@ -62,13 +63,13 @@ model:
     num_layers: 1
     n_heads: 4
     return_sequence: false
-    use_efficient_attention: true
   fusion:
-    type: "cross_attention"
+    type: "film"
     bidirectional: true
     gated: false
+    film_hidden: 192
   aux_encoder:
-    enable: false
+    enable: true
     hidden: 128
     dropout: 0.1
   heads:
@@ -83,7 +84,7 @@ model:
       gate_temperature: 0.9
       calib_strength: 0.15
     unknown:
-      enable: false
+      enable: true
 
 # 训练设置（稳定优化）
 training:
@@ -144,15 +145,15 @@ loss:
   type: peak_aware
   regression_weight: 1.0
   classification_weight: 0.0
-  conservation_weight: 0.4
+  conservation_weight: 0.0
   consistency_weight: 0.0
-  nonneg_penalty_weight: 0.3
+  nonneg_penalty_weight: 0.5
   # weights tuning
   #
-  unknown_weight: 0.0
+  unknown_weight: 0.3
   unknown_match_weight: 1.0
-  unknown_l1_penalty: 0.0
-  huber_delta: 0.05
+  unknown_l1_penalty: 0.1
+  huber_delta: 50.0
   normalize_per_device: false
   # 窗口尺度策略：与 overfit 脚本一致
   scale_strategy: window_quantile
@@ -160,21 +161,21 @@ loss:
   peak_focus_top_p: 0.1
   peak_focus_weight: 0.6
   # 关闭其他归一化项权重
-  active_threshold_rel: 0.015
-  off_penalty_weight: 1.2
+  active_threshold_rel: 0.02
+  off_penalty_weight: 0.8
   rel_loss_weight: 0.0
   shape_loss_weight: 0.0
-  derivative_loss_weight: 0.10
-  edge_focus_weight: 0.40
+  derivative_loss_weight: 0.05
+  edge_focus_weight: 0.10
   edge_focus_thr_rel: 0.03
   multiscale_shapes: []
-  exclusive_penalty_weight: 0.15
-  sparsity_weight: 0.02
-  allocation_weight: 0.15
+  exclusive_penalty_weight: 0.0
+  sparsity_weight: 0.0
+  allocation_weight: 0.0
   allocation_blend_alpha: 0.0
-  event_count_weight: 0.20
-  active_amplitude_weight: 0.45
-  shape_variance_weight: 0.15
+  event_count_weight: 0.0
+  active_amplitude_weight: 0.0
+  shape_variance_weight: 0.0
   # 移除分类相关设置
   off_penalty_rel_threshold: 0.02
   # 课程式权重（翻转）：先回归，后分类
@@ -233,8 +234,8 @@ walk_forward:
 # 窗口设置（数据准备参考）
 windowing:
   window_size: 256
-  stride: 128
-  overlap: 0.5
+  stride: 64
+  overlap: 0.75
 
 # 共形预测（默认关闭）
 conformal_prediction:

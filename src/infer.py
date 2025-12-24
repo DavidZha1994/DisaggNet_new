@@ -590,12 +590,18 @@ class RealTimeInferenceEngine:
         else:
             pred_power, pred_states = predictions
             unknown_pred = None
-        power_preds = pred_power.cpu().numpy().flatten()
-        # 温度缩放 + Sigmoid 生成状态概率
-        logits = pred_states
+        power_preds = pred_power.detach().cpu().view(-1)
+        # 温度缩放 + Sigmoid 生成状态概率；Seq2Point 下 pred_states 可能为 None
+        if pred_states is None:
+            logits = torch.zeros_like(pred_power.detach())
+        else:
+            logits = pred_states
         if hasattr(self.model, 'temperature_scaling') and self.model.temperature_scaling is not None:
-            logits = self.model.temperature_scaling(logits)
-        state_probs_np = torch.sigmoid(logits).cpu().numpy().flatten()
+            try:
+                logits = self.model.temperature_scaling(logits)
+            except Exception:
+                pass
+        state_probs_np = torch.sigmoid(logits).detach().cpu().numpy().flatten()
 
         # 异常距离门控：根据训练期原型的 Mahalanobis 距离与 Unknown 能量协同调整
         anomaly_scores = self._last_anomaly_distances if hasattr(self, '_last_anomaly_distances') else None

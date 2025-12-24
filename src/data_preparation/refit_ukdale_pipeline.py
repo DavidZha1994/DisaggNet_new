@@ -17,6 +17,7 @@ from src.helpers.preprocessing import (
 # reuse HIPE features and CV for frequency and splitting
 from src.data_preparation.features import (
     window_stft_frames as _features_window_stft_frames,
+    valid_window_mask_by_ratio as _features_valid_window_mask_by_ratio,
 )
 from src.data_preparation.cross_validation import WalkForwardCV
 
@@ -245,7 +246,6 @@ class REFITUKDALEPipeline:
         S = np.zeros((N, L, K), dtype=np.float32)
         for k, _ in enumerate(device_names):
             S[:, :, k] = X[:, 1 + k, 1, :].astype(np.float32)
-        # 规范化为 {0,1}
         S = np.where(S > 0.5, 1.0, 0.0).astype(np.float32)
         return S
 
@@ -257,41 +257,88 @@ class REFITUKDALEPipeline:
         return labels
 
     def _build_exogene_features(self, raw_seq: np.ndarray, st_date: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
-        """生成窗口级手工特征：时间外生变量 embedding（对每窗按时间序列生成并在窗内均值池化）。
-        返回 (aux_feats[N,F], feature_names)
-        """
         N, L, C = raw_seq.shape
-        feats: List[np.ndarray] = []
-        # 构建每窗 exogene 时序，再做均值池化 -> 向量
+        feats = np.zeros((N, 11), dtype=np.float32)
+        pw = raw_seq[:, :, 0].astype(np.float32)
+        t = np.arange(L, dtype=np.float32)
+        t_mean = np.mean(t)
+        t_centered = t - t_mean
+        denom = np.sum(t_centered ** 2)
+        if denom <= 0:
+            denom = 1.0
         for i in range(N):
-            try:
-                start_dt = st_date.iloc[i]["start_date"]
-            except Exception:
-                # 兜底：若 st_date 匹配不上，回退为第一行
-                start_dt = st_date.iloc[0]["start_date"] if "start_date" in st_date.columns else None
-            # 以聚合通道的长度作为时间序列长度
-            x_win = raw_seq[i, :, 0]
-            exo = _helpers_create_exogene(x_win, start_dt, self.ru.list_exo_variables, self.ru.sampling_rate, cosinbase=True, new_range=(-1, 1))
-            # exo shape: (1, n_var, L)
-            exo_mean = np.nanmean(exo[0], axis=1).astype(np.float32)  # [n_var]
-            feats.append(exo_mean)
-        aux = np.stack(feats, axis=0).astype(np.float32)
-        # feature names（按 list_exo_variables 的正弦/余弦展开）
-        fn: List[str] = []
-        for v in (self.ru.list_exo_variables or []):
-            fn.append(f"{v}_sin")
-            fn.append(f"{v}_cos")
+            x = pw[i]
+            mask = np.isfinite(x)
+            if not np.any(mask):
+                continue
+            xi = x[mask].astype(np.float32)
+            if xi.size == 0:
+                continue
+            mean = float(np.mean(xi))
+            std = float(np.std(xi))
+            rms = float(np.sqrt(np.mean(xi ** 2)))
+            xmin = float(np.min(xi))
+            xmax = float(np.max(xi))
+            q10 = float(np.percentile(xi, 10))
+            q50 = float(np.percentile(xi, 50))
+            q90 = float(np.percentile(xi, 90))
+            if xi.size > 1:
+                d = np.diff(xi)
+                mad = float(np.mean(np.abs(d)))
+                dstd = float(np.std(d))
+            else:
+                mad = 0.0
+                dstd = 0.0
+            ti = t[mask]
+            tc = ti - float(np.mean(ti))
+            xc = xi - float(mean)
+            num = float(np.sum(tc * xc))
+            slope = num / denom
+            feats[i] = np.array([mean, std, rms, xmin, xmax, q10, q50, q90, mad, dstd, slope], dtype=np.float32)
+        aux = feats.astype(np.float32)
+        fn = [
+            "mean",
+            "std",
+            "rms",
+            "min",
+            "max",
+            "q10",
+            "q50",
+            "q90",
+            "mean_abs_diff",
+            "std_diff",
+            "slope",
+        ]
         return aux, fn
 
     def _build_freq_frames(self, raw_seq: np.ndarray, valid_ratio_threshold: float = 0.85) -> Tuple[np.ndarray, np.ndarray]:
-        return _features_window_stft_frames(
-            raw_seq,  # expects shape [N,L,C]
-            n_fft=int(self.ru.stft_n_fft),
-            hop=int(self.ru.stft_hop),
-            win_length=int(self.ru.stft_win_length),
-            window_type=str(self.ru.stft_window),
-            valid_ratio_threshold=float(valid_ratio_threshold),
-        )
+        if raw_seq.size == 0:
+            return np.empty((0, 1, 0), dtype=np.float32), np.empty((0, 1), dtype=np.uint8)
+        N, L, C = raw_seq.shape
+        pw = raw_seq[:, :, 0].astype(np.float32)
+        mask = np.isfinite(pw)
+        valid_ratio = mask.sum(axis=1).astype(np.float32) / float(L if L > 0 else 1)
+        win_valid = valid_ratio >= float(valid_ratio_threshold)
+        x = np.where(mask, pw, 0.0)
+        x_mean = np.mean(x, axis=1, keepdims=True)
+        x0 = x - x_mean
+        X = np.fft.rfft(x0, n=L, axis=1)
+        mag = np.abs(X).astype(np.float32)
+        logmag = np.log1p(mag).astype(np.float32)
+        F = logmag.shape[1]
+        B = 16
+        edges = np.linspace(0, F, num=B + 1, dtype=int)
+        bands = np.zeros((N, B), dtype=np.float32)
+        for b in range(B):
+            s = int(edges[b])
+            e = int(edges[b + 1])
+            if e <= s:
+                continue
+            seg = logmag[:, s:e]
+            bands[:, b] = np.mean(seg, axis=1).astype(np.float32)
+        bands = bands.reshape(N, 1, B).astype(np.float32)
+        mask_frames = win_valid.astype(np.uint8).reshape(N, 1)
+        return bands, mask_frames
 
     def run_full_pipeline(self) -> Dict:
         """运行完整管线并保存到 output_dir/fold_0/"""
@@ -344,8 +391,21 @@ class REFITUKDALEPipeline:
         step_s = _step_seconds(self.ru.sampling_rate)
         X_all, st_date_all, selected_idx = _sequence_non_overlapping(X_all, st_date_all, int(self.ru.window_size), int(step_s))
 
-        raw_all = self._build_time_domain(X_all)
         Y_seq_all = self._build_targets_seq(X_all, device_names)
+        ru_cfg = (self.prep_cfg.get("refit_ukdale", {}) or {})
+        min_ratio = float(ru_cfg.get("min_valid_ratio", 1.0))
+        if Y_seq_all.size > 0:
+            n, l, k = Y_seq_all.shape
+            Y_full = Y_seq_all.reshape(n * l, k)
+            starts = np.arange(0, n * l, l, dtype=np.int64)
+            mask = _features_valid_window_mask_by_ratio(Y_full, starts, int(l), float(min_ratio))
+            if isinstance(mask, np.ndarray) and mask.dtype == bool and mask.shape[0] == n:
+                if not np.all(mask):
+                    X_all = X_all[mask]
+                    st_date_all = st_date_all.iloc[mask].reset_index(drop=True)
+                    Y_seq_all = Y_seq_all[mask]
+
+        raw_all = self._build_time_domain(X_all)
         S_seq_all = self._build_status_seq(X_all, device_names)
         labels_all = self._build_labels(Y_seq_all)
 
@@ -500,6 +560,13 @@ class REFITUKDALEPipeline:
             # 频域帧（含置信度）
             fr_train = freq_frames_all[train_idx].astype(np.float32)
             fr_val = freq_frames_all[val_idx].astype(np.float32)
+            if fr_train.size > 0:
+                with np.errstate(invalid="ignore"):
+                    mu_f = np.nanmean(fr_train, axis=0).astype(np.float32)
+                    std_f = np.nanstd(fr_train, axis=0).astype(np.float32)
+                std_f = np.where(std_f < 1e-6, 1.0, std_f).astype(np.float32)
+                fr_train = (fr_train - mu_f) / std_f
+                fr_val = (fr_val - mu_f) / std_f
             conf_train = _valid_ratio(raw_all[train_idx])
             conf_val = _valid_ratio(raw_all[val_idx])
             torch.save({
@@ -512,8 +579,17 @@ class REFITUKDALEPipeline:
             }, os.path.join(fold_dir, "val_freq.pt"))
 
             # 手工特征
-            torch.save(torch.from_numpy(aux_all[train_idx]).float(), os.path.join(fold_dir, "train_features.pt"))
-            torch.save(torch.from_numpy(aux_all[val_idx]).float(), os.path.join(fold_dir, "val_features.pt"))
+            aux_train = aux_all[train_idx].astype(np.float32)
+            aux_val = aux_all[val_idx].astype(np.float32)
+            if aux_train.size > 0:
+                with np.errstate(invalid="ignore"):
+                    mu_a = np.nanmean(aux_train, axis=0).astype(np.float32)
+                    std_a = np.nanstd(aux_train, axis=0).astype(np.float32)
+                std_a = np.where(std_a < 1e-6, 1.0, std_a).astype(np.float32)
+                aux_train = (aux_train - mu_a) / std_a
+                aux_val = (aux_val - mu_a) / std_a
+            torch.save(torch.from_numpy(aux_train).float(), os.path.join(fold_dir, "train_features.pt"))
+            torch.save(torch.from_numpy(aux_val).float(), os.path.join(fold_dir, "val_features.pt"))
 
             # 目标序列 + 开关掩码（合并到同一文件，字典形式）
             torch.save({

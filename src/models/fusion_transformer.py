@@ -6,12 +6,6 @@ import torch.nn.functional as F
 from typing import Tuple, Optional
 from omegaconf import DictConfig
 import math
-try:
-    import xformers.ops as xops
-    _HAS_XFORMERS = True
-except Exception:
-    xops = None
-    _HAS_XFORMERS = False
 
 
 class PositionalEncoding(nn.Module):
@@ -122,27 +116,10 @@ class CausalMultiHeadAttention(nn.Module):
             additional_mask = key_invalid.unsqueeze(1).unsqueeze(1).expand(-1, self.n_heads, q_len, -1)
             attn_mask_bool = additional_mask if attn_mask_bool is None else (attn_mask_bool | additional_mask)
         
-        use_xops = (_HAS_XFORMERS and self.use_efficient_attention and query.is_cuda and (not torch.backends.mps.is_available()))
         # 在MPS上禁用F.scaled_dot_product_attention以避免NDArray断言错误
         use_fused_sdpa = hasattr(F, 'scaled_dot_product_attention') and not torch.backends.mps.is_available()
         
-        if use_xops:
-            Qx = Q.transpose(1, 2)
-            Kx = K.transpose(1, 2)
-            Vx = V.transpose(1, 2)
-            if mask is not None:
-                key_valid = (mask > 0) if mask.dtype != torch.bool else mask
-                kv_mask = key_valid.float().unsqueeze(-1).unsqueeze(-1)
-                Kx = Kx * kv_mask
-                Vx = Vx * kv_mask
-            attn_bias = xops.LowerTriangularMask() if self.causal else None
-            context = xops.memory_efficient_attention(
-                Qx, Kx, Vx,
-                attn_bias=attn_bias,
-                p=self.dropout.p if self.training else 0.0
-            )
-            context = context.reshape(batch_size, q_len, self.d_model)
-        elif use_fused_sdpa:
+        if use_fused_sdpa:
             context = F.scaled_dot_product_attention(
                 Q, K, V,
                 attn_mask=attn_mask_bool,
@@ -161,8 +138,7 @@ class CausalMultiHeadAttention(nn.Module):
             context = torch.matmul(attn, V)  # (B, H, q_len, d_k)
         
         # 合并头
-        if not use_xops:
-            context = context.transpose(1, 2).contiguous().view(batch_size, q_len, self.d_model)
+        context = context.transpose(1, 2).contiguous().view(batch_size, q_len, self.d_model)
         return self.w_o(context)
 
 
@@ -574,6 +550,51 @@ class MultiTaskHead(nn.Module):
         
         return regression_pred, classification_pred, unknown_pred
 
+    def forward_point(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Point-wise regression (Seq2Point).
+        Args:
+            x: (B, D) - Center token representation or Pooled representation
+        Returns:
+            point_pred: (B, N)
+        """
+        batch_size = x.size(0)
+        
+        # Device embeddings
+        device_ids = torch.arange(self.n_devices, device=x.device)
+        device_embeds = self.device_embeddings(device_ids) # (N, D)
+        
+        global_repr_expanded = x.unsqueeze(1).expand(-1, self.n_devices, -1) # (B, N, D)
+        device_embeds_expanded = device_embeds.unsqueeze(0).expand(batch_size, -1, -1) # (B, N, D)
+        
+        combined_repr = global_repr_expanded + device_embeds_expanded
+        
+        regression_preds = []
+        for i in range(self.n_devices):
+            device_features = combined_repr[:, i, :]
+            reg_pred = self.regression_heads[i](device_features)
+            regression_preds.append(reg_pred)
+        return torch.cat(regression_preds, dim=1)
+
+    def forward_point_with_unknown(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        batch_size = x.size(0)
+        device_ids = torch.arange(self.n_devices, device=x.device)
+        device_embeds = self.device_embeddings(device_ids)
+        global_repr_expanded = x.unsqueeze(1).expand(-1, self.n_devices, -1)
+        device_embeds_expanded = device_embeds.unsqueeze(0).expand(batch_size, -1, -1)
+        combined_repr = global_repr_expanded + device_embeds_expanded
+        regression_preds = []
+        for i in range(self.n_devices):
+            device_features = combined_repr[:, i, :]
+            reg_pred = self.regression_heads[i](device_features)
+            regression_preds.append(reg_pred)
+        point_pred = torch.cat(regression_preds, dim=1)
+        if self.unknown_regression_head is not None:
+            unknown_pred = self.unknown_regression_head(x)
+        else:
+            unknown_pred = None
+        return point_pred, unknown_pred
+
     def forward_seq(self, x: torch.Tensor) -> torch.Tensor:
         """
         基于时序特征的序列→序列回归预测。
@@ -687,9 +708,11 @@ class FusionTransformer(nn.Module):
             self.aux_encoder = None
             self.aux_weight = None
         
+        fusion_cfg = getattr(config, 'fusion', None)
+        fusion_type = str(getattr(fusion_cfg, 'type', 'cross_attention')) if fusion_cfg is not None else 'cross_attention'
+
         # 融合模块
-        if config.fusion.type == 'cross_attention' and self.freq_encoder is not None:
-            # 支持双向交叉注意力
+        if fusion_type == 'cross_attention' and self.freq_encoder is not None:
             bidirectional = getattr(config.fusion, 'bidirectional', False)
             self.fusion = CrossAttentionFusion(
                 d_model=config.time_encoder.d_model,
@@ -701,6 +724,13 @@ class FusionTransformer(nn.Module):
             )
         else:
             self.fusion = None
+
+        self.use_film_fusion = fusion_type == 'film'
+        if fusion_cfg is not None:
+            self.film_hidden_dim = int(getattr(fusion_cfg, 'film_hidden', config.time_encoder.d_model))
+        else:
+            self.film_hidden_dim = config.time_encoder.d_model
+        self.film_point_mlp: Optional[nn.Module] = None
         
         # 多任务预测头
         # Unknown/Residual 头开关（默认关闭，保持兼容）
@@ -790,6 +820,143 @@ class FusionTransformer(nn.Module):
             return regression_pred, None, None
         else:
             return regression_pred, None, reg_cls_unknown[2]
+
+    def forward_point(self, time_features: torch.Tensor,
+                      freq_features: Optional[torch.Tensor] = None,
+                      time_positional: Optional[torch.Tensor] = None,
+                      aux_features: Optional[torch.Tensor] = None,
+                      time_valid_mask: Optional[torch.Tensor] = None,
+                      freq_valid_mask: Optional[torch.Tensor] = None,
+                      aux_valid_mask: Optional[torch.Tensor] = None,
+                      external_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+        time_repr = self.time_encoder(time_features, time_positional, mask=time_valid_mask)
+        
+        aux_repr: Optional[torch.Tensor] = None
+        if self.aux_encoder is not None and aux_features is not None:
+            aux_repr = self.aux_encoder(aux_features, aux_valid_mask)
+            seq_len = time_repr.size(1)
+            aux_seq = aux_repr.unsqueeze(1).expand(-1, seq_len, -1)
+            time_repr = time_repr + self.aux_weight * aux_seq
+             
+        freq_repr: Optional[torch.Tensor] = None
+        if self.freq_encoder is not None and freq_features is not None:
+            freq_repr = self.freq_encoder(freq_features, freq_valid_mask)
+
+        if self.use_film_fusion:
+            fused_repr = time_repr
+            L = fused_repr.size(1)
+            center_idx = L // 2
+            center_repr = fused_repr[:, center_idx, :]
+            cond_list = []
+            if freq_repr is not None and freq_repr.dim() == 2:
+                cond_list.append(freq_repr)
+            if aux_repr is not None and aux_repr.dim() == 2:
+                cond_list.append(aux_repr)
+            if cond_list:
+                cond = torch.cat(cond_list, dim=-1)
+                if self.film_point_mlp is None:
+                    in_dim = int(cond.size(-1))
+                    hidden = int(self.film_hidden_dim)
+                    self.film_point_mlp = nn.Sequential(
+                        nn.Linear(in_dim, hidden),
+                        nn.ReLU(),
+                        nn.Linear(hidden, 2 * center_repr.size(-1)),
+                    )
+                    self.film_point_mlp.to(center_repr.device)
+                gamma_beta = self.film_point_mlp(cond)
+                gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
+                center_repr = center_repr * (1.0 + gamma) + beta
+        else:
+            if self.fusion is not None:
+                fused_repr = self.fusion(time_repr, freq_repr)
+            else:
+                fused_repr = time_repr
+            L = fused_repr.size(1)
+            center_idx = L // 2
+            center_repr = fused_repr[:, center_idx, :]
+
+        point_pred = self.prediction_head.forward_point(center_repr)
+
+        if isinstance(external_scale, torch.Tensor):
+            scale = external_scale.to(point_pred.device).to(point_pred.dtype)
+            if scale.dim() == 1:
+                scale = scale.view(1, -1)
+            elif scale.dim() == 3:
+                scale = scale.view(scale.size(0), -1)
+            if scale.size(-1) != point_pred.size(-1):
+                if scale.size(-1) > point_pred.size(-1):
+                    scale = scale[:, : point_pred.size(-1)]
+                else:
+                    pad = torch.ones(scale.size(0), point_pred.size(-1) - scale.size(-1), device=scale.device)
+                    scale = torch.cat([scale, pad], dim=1)
+            point_pred = point_pred * scale
+        return point_pred
+
+    def forward_point_with_unknown(self, time_features: torch.Tensor,
+                                   freq_features: Optional[torch.Tensor] = None,
+                                   time_positional: Optional[torch.Tensor] = None,
+                                   aux_features: Optional[torch.Tensor] = None,
+                                   time_valid_mask: Optional[torch.Tensor] = None,
+                                   freq_valid_mask: Optional[torch.Tensor] = None,
+                                   aux_valid_mask: Optional[torch.Tensor] = None,
+                                   external_scale: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        time_repr = self.time_encoder(time_features, time_positional, mask=time_valid_mask)
+        aux_repr: Optional[torch.Tensor] = None
+        if self.aux_encoder is not None and aux_features is not None:
+            aux_repr = self.aux_encoder(aux_features, aux_valid_mask)
+            seq_len = time_repr.size(1)
+            aux_seq = aux_repr.unsqueeze(1).expand(-1, seq_len, -1)
+            time_repr = time_repr + self.aux_weight * aux_seq
+        freq_repr: Optional[torch.Tensor] = None
+        if self.freq_encoder is not None and freq_features is not None:
+            freq_repr = self.freq_encoder(freq_features, freq_valid_mask)
+        if self.use_film_fusion:
+            fused_repr = time_repr
+            L = fused_repr.size(1)
+            center_idx = L // 2
+            center_repr = fused_repr[:, center_idx, :]
+            cond_list = []
+            if freq_repr is not None and freq_repr.dim() == 2:
+                cond_list.append(freq_repr)
+            if aux_repr is not None and aux_repr.dim() == 2:
+                cond_list.append(aux_repr)
+            if cond_list:
+                cond = torch.cat(cond_list, dim=-1)
+                if self.film_point_mlp is None:
+                    in_dim = int(cond.size(-1))
+                    hidden = int(self.film_hidden_dim)
+                    self.film_point_mlp = nn.Sequential(
+                        nn.Linear(in_dim, hidden),
+                        nn.ReLU(),
+                        nn.Linear(hidden, 2 * center_repr.size(-1)),
+                    )
+                    self.film_point_mlp.to(center_repr.device)
+                gamma_beta = self.film_point_mlp(cond)
+                gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
+                center_repr = center_repr * (1.0 + gamma) + beta
+        else:
+            if self.fusion is not None:
+                fused_repr = self.fusion(time_repr, freq_repr)
+            else:
+                fused_repr = time_repr
+            L = fused_repr.size(1)
+            center_idx = L // 2
+            center_repr = fused_repr[:, center_idx, :]
+        point_pred, unknown_pred = self.prediction_head.forward_point_with_unknown(center_repr)
+        if isinstance(external_scale, torch.Tensor):
+            scale = external_scale.to(point_pred.device).to(point_pred.dtype)
+            if scale.dim() == 1:
+                scale = scale.view(1, -1)
+            elif scale.dim() == 3:
+                scale = scale.view(scale.size(0), -1)
+            if scale.size(-1) != point_pred.size(-1):
+                if scale.size(-1) > point_pred.size(-1):
+                    scale = scale[:, : point_pred.size(-1)]
+                else:
+                    pad = torch.ones(scale.size(0), point_pred.size(-1) - scale.size(-1), device=scale.device)
+                    scale = torch.cat([scale, pad], dim=1)
+            point_pred = point_pred * scale
+        return point_pred, unknown_pred
 
     def forward_seq(self, time_features: torch.Tensor,
                     freq_features: Optional[torch.Tensor] = None,

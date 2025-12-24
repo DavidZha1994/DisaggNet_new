@@ -58,6 +58,10 @@ class NILMLightningModule(pl.LightningModule):
         self.device_info = device_info
         self.device_names = device_names
         self.n_devices = len(device_names)
+        
+        # Task Mode: seq2seq vs seq2point
+        self.task = str(getattr(config, 'task', 'seq2seq')).lower()
+        print(f"[Info] Task Mode: {self.task}")
 
         # 保存超参数
         self.save_hyperparameters({
@@ -168,21 +172,11 @@ class NILMLightningModule(pl.LightningModule):
                 pass
             try:
                 K = int(self.n_devices)
-                dev_names = list(self.device_names)
                 amp = torch.ones(K, dtype=torch.float32)
                 evt = torch.ones(K, dtype=torch.float32)
                 var = torch.ones(K, dtype=torch.float32)
                 off_w = torch.ones(K, dtype=torch.float32)
                 excl_w = torch.ones(K, dtype=torch.float32)
-                dw_idx = next((i for i, n in enumerate(dev_names) if str(n).lower().strip() == "dishwasher"), None)
-                fr_idx = next((i for i, n in enumerate(dev_names) if "fridge" in str(n).lower()), None)
-                if dw_idx is not None:
-                    amp[dw_idx] = 1.5
-                    evt[dw_idx] = 1.4
-                    var[dw_idx] = 1.4
-                if fr_idx is not None:
-                    excl_w[fr_idx] = 0.5
-                    off_w[fr_idx] = 2.5
                 self.loss_fn.per_device_amplitude_scale = amp
                 self.loss_fn.per_device_event_scale = evt
                 self.loss_fn.per_device_variance_scale = var
@@ -263,8 +257,42 @@ class NILMLightningModule(pl.LightningModule):
         except Exception:
             pass
 
-    def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, None]:
+    def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """前向传播 (Inference)"""
+        if self.task == 'seq2point':
+            time_features = batch['time_features']
+            if hasattr(self.model, 'forward_point_with_unknown'):
+                pred_point, _ = self.model.forward_point_with_unknown(
+                    time_features,
+                    freq_features=batch.get('freq_features'),
+                    time_positional=batch.get('time_positional'),
+                    aux_features=batch.get('aux_features'),
+                    time_valid_mask=batch.get('time_valid_mask'),
+                    freq_valid_mask=batch.get('freq_valid_mask'),
+                    aux_valid_mask=batch.get('aux_valid_mask'),
+                    external_scale=None
+                )
+            else:
+                pred_point = self.model.forward_point(
+                    time_features,
+                    freq_features=batch.get('freq_features'),
+                    time_positional=batch.get('time_positional'),
+                    aux_features=batch.get('aux_features'),
+                    time_valid_mask=batch.get('time_valid_mask'),
+                    freq_valid_mask=batch.get('freq_valid_mask'),
+                    aux_valid_mask=batch.get('aux_valid_mask'),
+                    external_scale=None
+                )
+            device = pred_point.device
+            mp = self._ensure_max_power(device, self.n_devices).view(1, -1)
+            k_common = min(pred_point.size(1), mp.size(1))
+            pred_point = pred_point[:, :k_common]
+            mp = mp[:, :k_common]
+            pred_norm = torch.clamp(pred_point / mp, 0.0, 1.0)
+            pred_power_watts = pred_norm * mp
+            pred_states = torch.zeros_like(pred_power_watts)
+            return pred_power_watts, pred_states
+
         time_features = batch['time_features']
         out = self.model.forward_seq(
             time_features,
@@ -278,11 +306,9 @@ class NILMLightningModule(pl.LightningModule):
         )
 
         pred_seq = out[0] if isinstance(out, tuple) else out
-        # 优先使用联合有效掩码：设备目标有效 & 时间有效
         per_dev_mask = batch.get('target_seq_per_device_valid_mask', None)
-        time_mask = batch.get('time_valid_mask', None)
-        if isinstance(per_dev_mask, torch.Tensor) and isinstance(time_mask, torch.Tensor):
-            m = (per_dev_mask > 0) & time_mask.unsqueeze(-1)
+        if isinstance(per_dev_mask, torch.Tensor):
+            m = per_dev_mask > 0
         else:
             m = batch.get('target_seq_valid_mask', None)
         device = pred_seq.device
@@ -299,8 +325,97 @@ class NILMLightningModule(pl.LightningModule):
         pred_states = torch.zeros_like(pred_power_watts)
         return pred_power_watts, pred_states
 
+    def _forward_seq2point(self, batch: Dict[str, torch.Tensor], stage: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Seq2Point 模式的前向与损失计算"""
+        tf = batch.get('time_features')
+        device = tf.device
+        if hasattr(self.model, 'forward_point_with_unknown'):
+            pred_point, unknown_point = self.model.forward_point_with_unknown(
+                tf,
+                freq_features=batch.get('freq_features'),
+                time_positional=batch.get('time_positional'),
+                aux_features=batch.get('aux_features'),
+                time_valid_mask=batch.get('time_valid_mask'),
+                freq_valid_mask=batch.get('freq_valid_mask'),
+                aux_valid_mask=batch.get('aux_valid_mask'),
+                external_scale=None
+            )
+        else:
+            pred_point = self.model.forward_point(
+                tf,
+                freq_features=batch.get('freq_features'),
+                time_positional=batch.get('time_positional'),
+                aux_features=batch.get('aux_features'),
+                time_valid_mask=batch.get('time_valid_mask'),
+                freq_valid_mask=batch.get('freq_valid_mask'),
+                aux_valid_mask=batch.get('aux_valid_mask'),
+                external_scale=None
+            )
+            unknown_point = None
+        
+        target_point = batch.get('target_point')
+        if target_point is None:
+            # Fallback (e.g. inference without labels)
+            return pred_point, torch.tensor(0.0, device=device)
+            
+        K = min(pred_point.size(1), target_point.size(1), self.n_devices)
+        pred_point = pred_point[:, :K]
+        target_point = target_point[:, :K]
+        pred_center_seq = pred_point.unsqueeze(1)
+        target_center_seq = target_point.unsqueeze(1)
+
+        status_seq = batch.get('status_seq')
+        center_status = None
+        if isinstance(status_seq, torch.Tensor) and status_seq.dim() == 3:
+            Ls = int(status_seq.size(1))
+            c_idx = Ls // 2
+            center_status = status_seq[:, c_idx:c_idx + 1, :K]
+
+        per_dev_mask = batch.get('target_seq_per_device_valid_mask')
+        center_valid = None
+        if isinstance(per_dev_mask, torch.Tensor) and per_dev_mask.dim() == 3:
+            Lm = int(per_dev_mask.size(1))
+            c_idx_m = Lm // 2
+            center_valid = per_dev_mask[:, c_idx_m:c_idx_m + 1, :K]
+
+        pscale = self._ensure_power_scale(device, self.n_devices)
+        pscale_c = pscale[:, :, :K]
+
+        loss_k = self.loss_fn.regression_seq_loss_per_device(
+            pred_center_seq,
+            target_center_seq,
+            center_status,
+            center_valid,
+            pscale_c
+        )
+        loss_point = loss_k.mean()
+        loss_unknown = torch.tensor(0.0, device=device)
+        if isinstance(unknown_point, torch.Tensor) and getattr(self.loss_fn, 'unknown_weight', 0.0) > 0.0:
+            mains_seq = batch.get('mains_seq')
+            target_seq = batch.get('target_seq')
+            if isinstance(mains_seq, torch.Tensor) and isinstance(target_seq, torch.Tensor) and target_seq.dim() == 3:
+                Ls = int(target_seq.size(1))
+                c_idx = Ls // 2
+                mains_center = mains_seq[:, c_idx:c_idx + 1]
+                pred_seq_win = pred_point[:, :K].unsqueeze(1)
+                loss_unknown = self.loss_fn.unknown_residual_loss(
+                    mains_seq=mains_center,
+                    pred_seq=pred_seq_win,
+                    unknown_win=unknown_point,
+                    status_seq=None
+                )
+        total_loss = self.loss_fn.regression_weight * loss_point + self.loss_fn.unknown_weight * loss_unknown
+        
+        self._safe_log(f'{stage}/loss/total', total_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self._safe_log(f'{stage}/loss/point_regression', loss_point, on_step=False, on_epoch=True)
+        
+        return pred_point, total_loss
+
     def _forward_and_compute_loss(self, batch: Dict[str, torch.Tensor], stage: str) -> Tuple[torch.Tensor, torch.Tensor]:
         """计算联合损失"""
+        if self.task == 'seq2point':
+            return self._forward_seq2point(batch, stage)
+            
         tf = batch.get('time_features')
         device = tf.device
         mp = self._ensure_max_power(device, self.n_devices)
@@ -320,10 +435,12 @@ class NILMLightningModule(pl.LightningModule):
             pred_seq = out[0]
             reg_win_pred = out[1]
             cls_seq_pred = out[4] if len(out) >= 5 else None
+            unknown_win_pred = out[3] if len(out) >= 4 else None
         else:
             pred_seq = out
             reg_win_pred = None
             cls_seq_pred = None
+            unknown_win_pred = None
 
         target_seq = batch.get('target_seq')
         if target_seq is None:
@@ -349,11 +466,9 @@ class NILMLightningModule(pl.LightningModule):
         except Exception:
             pass
 
-        # 联合有效掩码：设备目标有效 & 时间有效
         per_dev_mask = batch.get('target_seq_per_device_valid_mask')
-        time_mask = batch.get('time_valid_mask')
-        if isinstance(per_dev_mask, torch.Tensor) and isinstance(time_mask, torch.Tensor):
-            valid = (per_dev_mask > 0) & time_mask.unsqueeze(-1)
+        if isinstance(per_dev_mask, torch.Tensor):
+            valid = per_dev_mask > 0
         else:
             fallback = batch.get('target_seq_valid_mask')
             if isinstance(fallback, torch.Tensor) and fallback.dim() + 1 == pred_seq.dim():
@@ -399,7 +514,7 @@ class NILMLightningModule(pl.LightningModule):
         pred_seq_watts = pred_seq_norm * mp_c
         loss_cons = self.loss_fn.conservation_loss(
             batch.get('mains_seq'), pred_seq_watts,
-            valid_mask=(time_mask if isinstance(time_mask, torch.Tensor) else None)
+            valid_mask=None
         )
         excl_pen = self.loss_fn.device_exclusive_penalty(pred_seq_norm, valid)
         sparse_pen = self.loss_fn.sparsity_gate_penalty(cls_seq_pred, valid)
@@ -407,8 +522,15 @@ class NILMLightningModule(pl.LightningModule):
         ev_pen = self.loss_fn.event_count_penalty(pred_seq_norm, batch.get('status_seq'), valid)
         amp_pen = self.loss_fn.active_amplitude_loss(pred_seq_norm, target_seq_norm, batch.get('status_seq'), valid)
         var_pen = self.loss_fn.shape_variance_loss(pred_seq_norm, target_seq_norm, valid)
-
-        total_loss = self.loss_fn.regression_weight * (loss_reg + loss_win) + loss_cons + excl_pen + sparse_pen + alloc_dist + ev_pen + amp_pen + var_pen
+        loss_unknown = torch.tensor(0.0, device=device)
+        if isinstance(unknown_win_pred, torch.Tensor) and getattr(self.loss_fn, 'unknown_weight', 0.0) > 0.0:
+            loss_unknown = self.loss_fn.unknown_residual_loss(
+                mains_seq=batch.get('mains_seq'),
+                pred_seq=pred_seq_watts,
+                unknown_win=unknown_win_pred,
+                status_seq=batch.get('status_seq')
+            )
+        total_loss = self.loss_fn.regression_weight * (loss_reg + loss_win) + loss_cons + excl_pen + sparse_pen + alloc_dist + ev_pen + amp_pen + var_pen + self.loss_fn.unknown_weight * loss_unknown
 
         self._safe_log(f'{stage}/loss/total', total_loss, on_step=True, on_epoch=True, prog_bar=True)
         self._safe_log(f'{stage}/loss/regression', loss_reg, on_step=False, on_epoch=True)
@@ -436,47 +558,168 @@ class NILMLightningModule(pl.LightningModule):
             try:
                 ts_mat = batch.get('timestamps')
                 target_seq = batch.get('target_seq')
+                target_point = batch.get('target_point')
                 mains_seq = batch.get('mains_seq')
                 time_valid_mask = batch.get('time_valid_mask')
-                if isinstance(pred_seq, torch.Tensor) and isinstance(target_seq, torch.Tensor):
-                    b = int(pred_seq.size(0))
-                    for i in range(b):
-                        device = pred_seq.device
-                        mp3 = self._ensure_max_power(device, self.n_devices)  # (1,1,K)
-                        mp2 = mp3.view(1, -1)  # (1,K)
-                        # 归一化到 [0,1] 后再按最大功率反归一化为瓦特
-                        p_norm = torch.clamp(pred_seq[i] / mp2, 0.0, 1.0)
+                if self.task == 'seq2point':
+                    unknown_point = None
+                    if hasattr(self.model, 'forward_point_with_unknown'):
                         try:
-                            tn = target_seq[i] / mp2
-                            t_w = (torch.clamp(tn, 0.0, 1.0) * mp2).detach().cpu().numpy().astype('float32')
+                            tf_viz = batch.get('time_features')
+                            if tf_viz is not None:
+                                _, unknown_point = self.model.forward_point_with_unknown(
+                                    tf_viz,
+                                    freq_features=batch.get('freq_features'),
+                                    time_positional=batch.get('time_positional'),
+                                    aux_features=batch.get('aux_features'),
+                                    time_valid_mask=batch.get('time_valid_mask'),
+                                    freq_valid_mask=batch.get('freq_valid_mask'),
+                                    aux_valid_mask=batch.get('aux_valid_mask'),
+                                    external_scale=None
+                                )
                         except Exception:
-                            t_w = (torch.clamp(target_seq[i], 0.0, 1.0) * mp2).detach().cpu().numpy().astype('float32')
-                        p_w = (p_norm * mp2).detach().cpu().numpy().astype('float32')  # (L,K)
-                        m = None
-                        try:
-                            if isinstance(mains_seq, torch.Tensor):
-                                mm = mains_seq[i].detach().cpu()
-                                if mm.dim() > 1:
-                                    mm = mm.squeeze()
-                                m = mm
-                        except Exception:
+                            unknown_point = None
+                    if isinstance(pred_seq, torch.Tensor) and isinstance(target_point, torch.Tensor):
+                        b = int(pred_seq.size(0))
+                        for i in range(b):
+                            device = pred_seq.device
+                            mp3 = self._ensure_max_power(device, self.n_devices)
+                            mp2 = mp3.view(1, -1)
+                            p_point = pred_seq[i].view(1, -1)
+                            p_norm = torch.clamp(p_point / mp2, 0.0, 1.0)
+                            if isinstance(target_seq, torch.Tensor) and target_seq.dim() == 3:
+                                L = int(target_seq.size(1))
+                            elif isinstance(mains_seq, torch.Tensor) and mains_seq.dim() >= 1:
+                                L = int(mains_seq.size(1))
+                            else:
+                                L = 1
+                            p_seq = p_norm.expand(L, -1)
+                            p_w = (p_seq * mp2).detach().cpu().numpy().astype('float32')
+                            if isinstance(target_seq, torch.Tensor) and target_seq.dim() == 3:
+                                try:
+                                    tn = target_seq[i] / mp2
+                                    t_w = (torch.clamp(tn, 0.0, 1.0) * mp2).detach().cpu().numpy().astype('float32')
+                                except Exception:
+                                    t_w = (torch.clamp(target_seq[i], 0.0, 1.0) * mp2).detach().cpu().numpy().astype('float32')
+                            else:
+                                t_point = target_point[i].view(1, -1)
+                                t_norm = torch.clamp(t_point / mp2, 0.0, 1.0)
+                                t_seq = t_norm.expand(L, -1)
+                                t_w = (t_seq * mp2).detach().cpu().numpy().astype('float32')
                             m = None
-                        if isinstance(ts_mat, torch.Tensor) and ts_mat.dim() == 2:
-                            start_ts = float(ts_mat[i, 0].detach().cpu().item())
-                            step = float(getattr(getattr(self.trainer, 'datamodule', None), 'resample_seconds', 5.0))
-                        else:
-                            start_ts = float(torch.tensor(0.0).item())
-                            step = float(getattr(getattr(self.trainer, 'datamodule', None), 'resample_seconds', 5.0))
-                        # 传递时间有效掩码（用于可视化时屏蔽无效主表数据）
-                        vmask = None
-                        try:
-                            if isinstance(time_valid_mask, torch.Tensor):
-                                vmask = time_valid_mask[i].detach().cpu()
-                                if vmask.dim() > 1:
-                                    vmask = vmask.squeeze()
-                        except Exception:
+                            try:
+                                if isinstance(mains_seq, torch.Tensor):
+                                    mm = mains_seq[i].detach().cpu()
+                                    if mm.dim() > 1:
+                                        mm = mm.squeeze()
+                                    m = mm
+                            except Exception:
+                                m = None
+                            if isinstance(ts_mat, torch.Tensor) and ts_mat.dim() == 2:
+                                start_ts = float(ts_mat[i, 0].detach().cpu().item())
+                                step = float(getattr(getattr(self.trainer, 'datamodule', None), 'resample_seconds', 5.0))
+                            else:
+                                start_ts = float(torch.tensor(0.0).item())
+                                step = float(getattr(getattr(self.trainer, 'datamodule', None), 'resample_seconds', 5.0))
                             vmask = None
-                        self._val_buffers.append({'pred': torch.tensor(p_w), 'true': torch.tensor(t_w), 'mains': m, 'valid': vmask, 'start': start_ts, 'step': step})
+                            try:
+                                if isinstance(time_valid_mask, torch.Tensor):
+                                    vmask = time_valid_mask[i].detach().cpu()
+                                    if vmask.dim() > 1:
+                                        vmask = vmask.squeeze()
+                            except Exception:
+                                vmask = None
+                            buf = {
+                                'pred': torch.tensor(p_w),
+                                'true': torch.tensor(t_w),
+                                'mains': m,
+                                'valid': vmask,
+                                'start': start_ts,
+                                'step': step,
+                            }
+                            if isinstance(unknown_point, torch.Tensor) and unknown_point.dim() >= 1 and i < int(unknown_point.size(0)):
+                                try:
+                                    u_scalar = float(unknown_point[i].view(-1)[0].detach().cpu().item())
+                                    if L > 0:
+                                        u_seq = torch.full((L,), u_scalar, dtype=torch.float32)
+                                        buf['unknown'] = u_seq
+                                except Exception:
+                                    pass
+                            self._val_buffers.append(buf)
+                else:
+                    unknown_win_pred = None
+                    if getattr(self.model, 'include_unknown', False) and hasattr(self.model, 'forward_seq'):
+                        try:
+                            tf_viz = batch.get('time_features')
+                            if tf_viz is not None:
+                                out_viz = self.model.forward_seq(
+                                    tf_viz,
+                                    freq_features=batch.get('freq_features'),
+                                    time_positional=batch.get('time_positional'),
+                                    aux_features=batch.get('aux_features'),
+                                    time_valid_mask=batch.get('time_valid_mask'),
+                                    freq_valid_mask=batch.get('freq_valid_mask'),
+                                    aux_valid_mask=batch.get('aux_valid_mask'),
+                                    external_scale=None
+                                )
+                                if isinstance(out_viz, tuple) and len(out_viz) >= 4:
+                                    unknown_win_pred = out_viz[3]
+                        except Exception:
+                            unknown_win_pred = None
+                    if isinstance(pred_seq, torch.Tensor) and isinstance(target_seq, torch.Tensor):
+                        b = int(pred_seq.size(0))
+                        for i in range(b):
+                            device = pred_seq.device
+                            mp3 = self._ensure_max_power(device, self.n_devices)
+                            mp2 = mp3.view(1, -1)
+                            p_norm = torch.clamp(pred_seq[i] / mp2, 0.0, 1.0)
+                            try:
+                                tn = target_seq[i] / mp2
+                                t_w = (torch.clamp(tn, 0.0, 1.0) * mp2).detach().cpu().numpy().astype('float32')
+                            except Exception:
+                                t_w = (torch.clamp(target_seq[i], 0.0, 1.0) * mp2).detach().cpu().numpy().astype('float32')
+                            p_w = (p_norm * mp2).detach().cpu().numpy().astype('float32')
+                            m = None
+                            try:
+                                if isinstance(mains_seq, torch.Tensor):
+                                    mm = mains_seq[i].detach().cpu()
+                                    if mm.dim() > 1:
+                                        mm = mm.squeeze()
+                                    m = mm
+                            except Exception:
+                                m = None
+                            if isinstance(ts_mat, torch.Tensor) and ts_mat.dim() == 2:
+                                start_ts = float(ts_mat[i, 0].detach().cpu().item())
+                                step = float(getattr(getattr(self.trainer, 'datamodule', None), 'resample_seconds', 5.0))
+                            else:
+                                start_ts = float(torch.tensor(0.0).item())
+                                step = float(getattr(getattr(self.trainer, 'datamodule', None), 'resample_seconds', 5.0))
+                            vmask = None
+                            try:
+                                if isinstance(time_valid_mask, torch.Tensor):
+                                    vmask = time_valid_mask[i].detach().cpu()
+                                    if vmask.dim() > 1:
+                                        vmask = vmask.squeeze()
+                            except Exception:
+                                vmask = None
+                            buf = {
+                                'pred': torch.tensor(p_w),
+                                'true': torch.tensor(t_w),
+                                'mains': m,
+                                'valid': vmask,
+                                'start': start_ts,
+                                'step': step,
+                            }
+                            if isinstance(unknown_win_pred, torch.Tensor) and unknown_win_pred.dim() >= 1 and i < int(unknown_win_pred.size(0)):
+                                try:
+                                    u_scalar = float(unknown_win_pred[i].view(-1)[0].detach().cpu().item())
+                                    L = int(p_w.shape[0])
+                                    if L > 0:
+                                        u_seq = torch.full((L,), u_scalar, dtype=torch.float32)
+                                        buf['unknown'] = u_seq
+                                except Exception:
+                                    pass
+                            self._val_buffers.append(buf)
             except Exception:
                 pass
         return {'val_loss': loss}
@@ -529,34 +772,44 @@ class NILMLightningModule(pl.LightningModule):
             device = pred0.device
             mp = self._ensure_max_power(device, self.n_devices)
 
-            if pred0.dim() == 3:
-                per_dev_mask = batch.get('target_seq_per_device_valid_mask')
-                time_mask = batch.get('time_valid_mask')
-                if isinstance(per_dev_mask, torch.Tensor) and isinstance(time_mask, torch.Tensor):
-                    valid = (per_dev_mask > 0) & time_mask.unsqueeze(-1)
-                else:
-                    valid = batch.get('target_seq_valid_mask')
-                    if isinstance(valid, torch.Tensor) and valid.dim() + 1 == pred0.dim():
-                        valid = valid.unsqueeze(-1)
-                valid_f = (valid > 0).float() if isinstance(valid, torch.Tensor) else None
-                pred_seq_norm = torch.clamp(pred0 / mp, 0.0, 1.0)
-                if isinstance(valid_f, torch.Tensor):
-                    num = (pred_seq_norm * valid_f).sum(dim=1)
-                    den = valid_f.sum(dim=1).clamp_min(1.0)
-                    pred_power_norm = num / den
-                else:
-                    pred_power_norm = pred_seq_norm.mean(dim=1)
-                pred_power_watts = pred_power_norm * mp.view(1, -1)
+            if self.task == 'seq2point':
+                y_true_point = batch.get('target_point')
+                if y_true_point is None:
+                    return {}
+                if pred0.dim() == 1:
+                    pred0 = pred0.view(1, -1)
+                if y_true_point.dim() == 1:
+                    y_true_point = y_true_point.view(1, -1)
+                K_common = min(pred0.size(1), y_true_point.size(1))
+                pred_power_watts = pred0[:, :K_common]
+                y_true = y_true_point[:, :K_common]
             else:
-                # 已是 (B, K) 的窗口级功率（应为瓦特）
-                pred_power_watts = pred0
-            y_true = batch.get('target_power')
-            if y_true is None:
-                return {}
+                if pred0.dim() == 3:
+                    per_dev_mask = batch.get('target_seq_per_device_valid_mask')
+                    if isinstance(per_dev_mask, torch.Tensor):
+                        valid = per_dev_mask > 0
+                    else:
+                        valid = batch.get('target_seq_valid_mask')
+                        if isinstance(valid, torch.Tensor) and valid.dim() + 1 == pred0.dim():
+                            valid = valid.unsqueeze(-1)
+                    valid_f = (valid > 0).float() if isinstance(valid, torch.Tensor) else None
+                    pred_seq_norm = torch.clamp(pred0 / mp, 0.0, 1.0)
+                    if isinstance(valid_f, torch.Tensor):
+                        num = (pred_seq_norm * valid_f).sum(dim=1)
+                        den = valid_f.sum(dim=1).clamp_min(1.0)
+                        pred_power_norm = num / den
+                    else:
+                        pred_power_norm = pred_seq_norm.mean(dim=1)
+                    pred_power_watts = pred_power_norm * mp.view(1, -1)
+                else:
+                    pred_power_watts = pred0
+                y_true = batch.get('target_power')
+                if y_true is None:
+                    return {}
 
-            K_common = min(pred_power_watts.size(1), y_true.size(1))
-            pred_power_watts = pred_power_watts[:, :K_common]
-            y_true = y_true[:, :K_common]
+                K_common = min(pred_power_watts.size(1), y_true.size(1))
+                pred_power_watts = pred_power_watts[:, :K_common]
+                y_true = y_true[:, :K_common]
 
             # 仅回归指标
             dummy_cls_pred = torch.zeros_like(y_true)
@@ -679,7 +932,8 @@ def main(config: DictConfig) -> None:
         _info, device_names = load_device_info(config)
     device_info, _ = load_device_info(config)
 
-    logger = TensorBoardLogger("outputs", name="nilm_experiment")
+    task_name = str(getattr(config, 'task', 'seq2seq'))
+    logger = TensorBoardLogger("outputs", name=f"nilm_experiment_{task_name}")
 
     model = NILMLightningModule(config, device_info, device_names)
 

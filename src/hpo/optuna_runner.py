@@ -172,9 +172,7 @@ def _apply_trial(cfg: DictConfig, trial: optuna.Trial, space: Optional[DictConfi
         if ("bf16" in prec) or ("16" in prec):
             cfg.training.precision = "32-true"
     if hasattr(space, "stability") and bool(getattr(space.stability, "use_efficient_attention", True)):
-        setattr(cfg.model, "efficient_attention", True)
-        setattr(cfg.model.time_encoder, "use_efficient_attention", True)
-        setattr(cfg.model.freq_encoder, "use_efficient_attention", True)
+        pass
     try:
         study = "hpo"
         if hasattr(space, "optuna") and hasattr(space.optuna, "study_name"):

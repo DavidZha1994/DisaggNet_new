@@ -24,8 +24,6 @@ search_space:
         hidden: {type: choice, values: [192, 256, 384]}
         use_softplus: {type: choice, values: [false, true]}
         seq_use_softplus: {type: choice, values: [false, true]}
-stability:
-  use_efficient_attention: true
 logging:
   save_dir: logs/tensorboard/hpo
   name: hpo
