@@ -8,7 +8,8 @@ import pandas as pd
 # Avoid OpenMP runtime duplication aborts on macOS with mixed Python wheels
 # (e.g., PyTorch, NumPy, and other libraries linking different libomp).
 # This setting is an unsafe workaround but acceptable for unit tests.
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+if sys.platform == "darwin":
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 # Keep thread count small to reduce contention during tests.
 os.environ.setdefault("OMP_NUM_THREADS", "1")

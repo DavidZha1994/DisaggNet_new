@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from omegaconf import OmegaConf
 
-from src.data.datamodule import NILMDataModule
+from src.datamodule.datamodule import NILMDataModule
 
 
 def build_fake_item(W=8, C=3, Fm=5, has_pkw_mean=True):

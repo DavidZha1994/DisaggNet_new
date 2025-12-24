@@ -4,7 +4,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from src.data.datamodule import NILMDataModule
+from src.datamodule.datamodule import NILMDataModule
 from src.models.fusion_transformer import FusionTransformer
 from src.train import NILMLightningModule, load_device_info
 

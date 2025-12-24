@@ -2,8 +2,6 @@
 
 import os
 import sys
-if sys.platform == 'darwin':
-    os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl

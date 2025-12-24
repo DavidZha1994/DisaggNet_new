@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 from omegaconf import OmegaConf
 
-from src.data.datamodule import NILMDataModule
+from src.datamodule.datamodule import NILMDataModule
 from src.train import NILMLightningModule, load_device_info
 
 

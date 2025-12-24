@@ -72,20 +72,20 @@ python validate_prepared_data.py
 
 ### 模型训练
 ```bash
-# 基础训练
-python main.py --mode train
+# 基础训练（使用默认配置）
+python main.py train --config default
 
 # 使用稳定性优化配置（统一训练配置目录）
-python main.py --mode train --config configs/training/optimized_stable.yaml
+python main.py train --config optimized_stable --epochs 100
 
 # 超参数优化
-python main.py --mode hpo --trials 100
+python main.py hpo --config optimized_stable --n-trials 100
 ```
 
 ### Walk-Forward验证
 ```bash
 # 时间序列交叉验证
-python main.py --mode walk_forward --n_splits 5
+python main.py walk-forward --config optimized_stable --n-folds 5
 ```
 
 ### 数据模块用法
@@ -120,19 +120,13 @@ class_weights = dm.get_class_weights()
 ### 模型评估
 ```bash
 # 评估训练好的模型
-python main.py --mode eval --checkpoint outputs/checkpoints/best_model.pth
-
-# 包含共形预测的评估
-python main.py --mode eval --checkpoint outputs/checkpoints/best_model.pth --conformal
+python main.py eval --checkpoint outputs/checkpoints/best_model.pth --config optimized_stable
 ```
 
 ### 实时推理
 ```bash
 # 单次推理
-python main.py --mode infer --input data/test_sample.csv
-
-# 批量推理
-python main.py --mode batch_infer --input_dir data/test_batch/
+python main.py infer --checkpoint outputs/checkpoints/best_model.pth --data data/test_sample.csv --config optimized_stable
 ```
 
 ## ⚙️ 配置文件
@@ -325,19 +319,19 @@ src/data/
 
 ```bash
 # 使用优化稳定配置训练
-python main.py --mode train --config configs/training/optimized_stable.yaml
+python main.py train --config optimized_stable --epochs 100
 
 # 超参数优化
-python main.py --mode hpo --config configs/training/optimized_stable.yaml --trials 50
+python main.py hpo --config optimized_stable --n-trials 50
 
 # Walk-Forward验证
-python main.py --mode walk_forward --config configs/training/optimized_stable.yaml --n_splits 5
+python main.py walk-forward --config optimized_stable --n-folds 5
 
 # 模型评估
-python main.py --mode eval --checkpoint outputs/checkpoints/best_model.pth
+python main.py eval --checkpoint outputs/checkpoints/best_model.pth --config optimized_stable
 
 # 稳定性检查
-python main.py --mode stability_check --config configs/training/optimized_stable.yaml
+python main.py stability-check --config optimized_stable
 ```
 
 #### 配置文件说明

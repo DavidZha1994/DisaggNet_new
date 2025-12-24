@@ -10,7 +10,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from src.train import NILMLightningModule, load_device_info
-from src.data.datamodule import NILMDataModule
+from src.datamodulemodule.datamodule import NILMDataModule
 from src.train import DeferredEarlyStopping
 
 try:
@@ -253,8 +253,6 @@ def _objective_factory(base_config: DictConfig, space: Optional[DictConfig]):
 
 
 def run_optimization(config: DictConfig, n_trials: int = 20, timeout: Optional[int] = None, study_name: Optional[str] = None, storage: Optional[str] = None, space_config: Optional[str] = None) -> Dict[str, Any]:
-    if sys.platform == "darwin":
-        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     space = _load_space(space_config)
     direction = "minimize"
     warm = 2

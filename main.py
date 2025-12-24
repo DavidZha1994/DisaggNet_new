@@ -30,10 +30,6 @@ import torch
 import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
 
-# macOS: 统一 OpenMP 运行时，避免重复初始化错误
-if sys.platform == 'darwin':
-    os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
-
 os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
 os.environ.setdefault('PYTHONUTF8', '1')
 try:
@@ -80,24 +76,11 @@ class UnifiedTrainingSystem:
         self.checkpoints_dir.mkdir(exist_ok=True)
         self.logs_dir.mkdir(exist_ok=True)
     
-    def setup_environment(self, config_ref: str = "configs/default.yaml") -> DictConfig:
-        """设置训练环境（仅加载单一配置文件；支持路径或名称）"""
-        # 解析配置引用：支持绝对/相对路径或简短名称
+    def setup_environment(self, config_ref: str = "default") -> DictConfig:
+        """设置训练环境（仅加载单一配置文件；使用配置名称解析）"""
         candidates = []
-        try:
-            is_path_like = (config_ref.endswith('.yaml') or os.sep in config_ref or '/' in config_ref)
-        except Exception:
-            is_path_like = False
-
-        if is_path_like:
-            cfg_path = Path(config_ref)
-            if not cfg_path.is_absolute():
-                cfg_path = self.project_root / cfg_path
-            candidates.append(cfg_path)
-        else:
-            # 优先在 configs/training 下查找，再回退到 configs 根目录
-            candidates.append(self.configs_dir / "training" / f"{config_ref}.yaml")
-            candidates.append(self.configs_dir / f"{config_ref}.yaml")
+        candidates.append(self.configs_dir / "training" / f"{config_ref}.yaml")
+        candidates.append(self.configs_dir / f"{config_ref}.yaml")
 
         # 回退候选：默认配置（优先 training/default.yaml）
         candidates.append(self.configs_dir / "training" / "default.yaml")
@@ -145,7 +128,7 @@ class UnifiedTrainingSystem:
         
         return config
     
-    def train_basic(self, config_ref: str = "configs/default.yaml", **kwargs) -> None:
+    def train_basic(self, config_ref: str = "default", **kwargs) -> None:
         """训练"""
         logger.info(f"开始训练，配置: {config_ref}")
         
@@ -361,22 +344,22 @@ def create_parser() -> argparse.ArgumentParser:
         epilog="""
 使用示例:
   # 基础训练
-  python main.py --mode train --config configs/optimized_stable.yaml
+  python main.py train --config optimized_stable --epochs 1
   
   # 超参数优化
-  python main.py --mode hpo --config configs/optimized_stable.yaml --trials 50
+  python main.py hpo --config optimized_stable --n-trials 50
   
   # Walk-Forward验证
-  python main.py --mode walk_forward --config configs/optimized_stable.yaml --n_splits 5
+  python main.py walk-forward --config optimized_stable --n-folds 5
   
   # 模型评估
-  python main.py --mode eval --checkpoint outputs/checkpoints/best_model.pth
+  python main.py eval --checkpoint outputs/checkpoints/best_model.pth --config optimized_stable
   
   # 模型推理
-  python main.py --mode infer --checkpoint outputs/checkpoints/best_model.pth --input data/test.csv
+  python main.py infer --checkpoint outputs/checkpoints/best_model.pth --data data/test.csv --config optimized_stable
   
   # 稳定性检查
-  python main.py --mode stability_check --config configs/optimized_stable.yaml
+  python main.py stability-check --config optimized_stable
         """
     )
     
@@ -384,7 +367,7 @@ def create_parser() -> argparse.ArgumentParser:
     
     # 基础训练
     train_parser = subparsers.add_parser("train", help="基础训练")
-    train_parser.add_argument("--config", default="configs/default.yaml", help="配置文件路径或名称")
+    train_parser.add_argument("--config", default="default", help="配置名称（如 optimized_stable）")
     train_parser.add_argument("--task", type=str, choices=["seq2seq", "seq2point"], help="任务类型（seq2seq 或 seq2point）")
     train_parser.add_argument("--epochs", type=int, help="训练轮数")
     train_parser.add_argument("--batch-size", type=int, help="批次大小")
