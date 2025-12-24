@@ -77,7 +77,7 @@ class HIPEDataPreparationPipeline:
     - 仅用主端时序作为输入 X（可叠加导数与频域能量带）。
     - 用分设备功率序列作为监督 Y（多输出序列回归）。
     - 不输入设备名，设备索引通过 label_map 固定。
-    输出文件与现有 datamodule 兼容：train_raw.npy、train_freq.npy、train_features.npy、indices/metadata、feature_names.json、raw_channel_names.json、device_name_to_id.json、cv_splits.pkl、labels.pkl。
+    输出文件与现有 datamodule 兼容：train_raw.pt、train_freq.pt、train_features.pt、indices/metadata、feature_names.json、raw_channel_names.json。
     """
 
     def __init__(self, config_path: Optional[str] = None):
@@ -153,9 +153,6 @@ class HIPEDataPreparationPipeline:
         for name in os.listdir(self.output_dir):
             if name.startswith("fold_"):
                 shutil.rmtree(os.path.join(self.output_dir, name), ignore_errors=True)
-        cv_plan_path = os.path.join(self.output_dir, "cv_splits.pkl")
-        if os.path.exists(cv_plan_path):
-            os.remove(cv_plan_path)
 
         # 2) 读取并对齐
         mains_fp = self._find_mains_file(data_path)
@@ -431,104 +428,19 @@ class HIPEDataPreparationPipeline:
         freq_mask: Optional[np.ndarray] = None,
         gap_mask_seq: Optional[np.ndarray] = None,
     ) -> None:
-        # 顶层元数据与 CV 计划（文件名支持配置覆盖）
+        # 顶层不再输出 cv_splits.pkl 与 labels.pkl，仅按折写入 .pt 特征。
         files_cfg = (self.config.get("data_storage", {}).get("files") or {})
 
         def out_fp(name: str, default: str) -> str:
             return os.path.join(self.output_dir, files_cfg.get(name, default))
-        # 恢复保存：cv_splits、label_map、labels 与设备映射
+
+        # 顶层仅保留设备与标签映射，便于可视化与工具使用
         try:
-            import pickle
-            # cv_splits.pkl
-            with open(out_fp("cv_splits", "cv_splits.pkl"), "wb") as f:
-                pickle.dump(splits, f)
-            # 设备映射与标签映射
             import json
             with open(out_fp("device_name_to_id", "device_name_to_id.json"), "w", encoding="utf-8") as f:
                 json.dump(device_name_to_id, f, ensure_ascii=False, indent=2)
             with open(out_fp("label_map", "label_map.json"), "w", encoding="utf-8") as f:
                 json.dump({int(k): str(v) for k, v in label_map.items()}, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-        # labels.pkl：按照配置生成分类或回归标签，并附带窗口元数据
-        # 构建标签元数据（按样本列表组织，包含 timestamp 与 segment_id）
-        if "start_ts" in windows_meta.columns:
-            start_ts_all = windows_meta["start_ts"].astype('int64').to_numpy()
-        else:
-            ts_col = self.hipe.timestamp_col
-            # 回退为 df_merged 中的时间列（转换为整数秒）
-            start_ts_all = (pd.to_datetime(df_merged[ts_col].iloc[starts]).astype('int64') // 1_000_000_000).to_numpy()
-        seg_ids_all = (
-            windows_meta["segment_id"].astype(int).to_numpy()
-            if "segment_id" in windows_meta.columns
-            else np.zeros_like(start_ts_all, dtype=int)
-        )
-        window_idx_all = (
-            windows_meta["window_idx"].astype(int).to_numpy()
-            if "window_idx" in windows_meta.columns
-            else np.arange(len(start_ts_all), dtype=int)
-        )
-        # 改为 ISO 时间元数据，不再使用秒整数
-        try:
-            ts_col = self.hipe.timestamp_col
-            dt_series = pd.to_datetime(df_merged[ts_col]).dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-            start_dt_iso = dt_series.iloc[starts].to_numpy()
-        except Exception:
-            # 兜底：仍使用格式化字符串
-            start_dt_iso = pd.to_datetime(start_ts_all, unit="s").strftime('%Y-%m-%dT%H:%M:%S.%fZ').to_numpy()
-        label_meta_list = [
-            {"datetime_iso": dt, "segment_id": int(seg_id), "window_idx": int(wi)}
-            for dt, seg_id, wi in zip(start_dt_iso, seg_ids_all, window_idx_all)
-        ]
-
-        # 根据配置生成标签矩阵
-        if getattr(self.hipe, "label_mode", "regression") == "classification":
-            # 使用 HMM 类方法生成每窗每设备的 on/off 状态序列，再按 on 比例阈值决定标签
-            ratio_thr = float(getattr(self.hipe, "on_ratio_threshold", 0.5))
-            try:
-                from src.tools.advanced_onoff_methods import AdvancedOnOffDetector
-                det = AdvancedOnOffDetector()
-                N, L, K = Yp_seq.shape
-                on_ratio = np.zeros((N, K), dtype=np.float32)
-                for i in range(N):
-                    for k in range(K):
-                        seq = Yp_seq[i, :, k]
-                        # 对 NaN 做安全处理：填0，不影响有效比率统计（有效比率由 isfinite 控制）
-                        x = np.nan_to_num(seq, nan=0.0)
-                        st, _info = det.hmm_like_method(x)
-                        st = np.asarray(st, dtype=np.float32)
-                        # 对无效点（NaN）置0，避免误判
-                        valid = np.isfinite(seq).astype(np.float32)
-                        st = st * valid
-                        denom = float(valid.sum()) if valid.sum() > 0 else 1.0
-                        on_ratio[i, k] = float(st.sum() / denom)
-                labels_mat = (on_ratio >= ratio_thr).astype(np.float32)
-                label_type = "classification"
-            except Exception:
-                # 回退：使用窗内均值回归标签再二值化（不推荐，仅兜底）
-                with np.errstate(invalid='ignore', divide='ignore'):
-                    m = np.nanmean(Yp_seq, axis=1).astype(np.float32)
-                m = np.where(np.isnan(m), 0.0, m)
-                thr = float(np.nanmedian(m))
-                labels_mat = (m >= thr).astype(np.float32)
-                label_type = "classification"
-        else:
-            with np.errstate(invalid='ignore', divide='ignore'):
-                labels_mat = np.nanmean(Yp_seq, axis=1).astype(np.float32)
-            # 对全 NaN 的窗回退为 0，避免警告与 NaN 外泄
-            labels_mat = np.where(np.isnan(labels_mat), 0.0, labels_mat)
-            label_type = "regression"
-
-        # 顶层 labels.pkl（恢复兼容）
-        try:
-            import pickle
-            with open(out_fp("labels", "labels.pkl"), "wb") as f:
-                pickle.dump({
-                    "labels": labels_mat.astype(np.float32),
-                    "label_type": label_type,
-                    "label_metadata": label_meta_list,
-                }, f)
         except Exception:
             pass
 

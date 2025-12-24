@@ -1,6 +1,5 @@
 import os
 import json
-import pickle
 from pathlib import Path
 
 import torch
@@ -10,10 +9,8 @@ def test_pipeline_outputs_structure(prepared_dir):
     root = Path(prepared_dir)
     assert root.exists(), f"prepared_dir 不存在: {root}"
 
-    # 顶层文件
+    # 顶层文件（精简后仍保留的）
     top_files = [
-        "cv_splits.pkl",
-        "labels.pkl",
         "device_name_to_id.json",
         "label_map.json",
         "segments_meta.csv",
@@ -80,10 +77,10 @@ def test_loaded_shapes_match_indices(prepared_dir):
     assert torch.isfinite(train_freq).all()
     assert torch.isfinite(val_freq).all()
 
-    # labels.pkl 内容校验
-    with open(root / "labels.pkl", "rb") as f:
-        labels_data = pickle.load(f)
-    assert "labels" in labels_data and "label_type" in labels_data
-    assert labels_data["label_type"] in ("regression", "classification")
-    # labels 行数应不少于任一折的总样本数（因折分按窗口索引构建）
-    assert labels_data["labels"].shape[0] >= max(train_idx.numel(), val_idx.numel())
+    # 每折 labels.pt 内容校验
+    train_labels = torch.load(fold0 / "train_labels.pt")
+    val_labels = torch.load(fold0 / "val_labels.pt")
+    assert isinstance(train_labels, dict) and "labels" in train_labels
+    assert isinstance(val_labels, dict) and "labels" in val_labels
+    assert train_labels["labels"].shape[0] == train_idx.numel()
+    assert val_labels["labels"].shape[0] == val_idx.numel()

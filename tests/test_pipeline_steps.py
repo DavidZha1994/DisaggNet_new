@@ -102,8 +102,8 @@ def test_full_pipeline_outputs_and_final_trainset(hipe_raw_setup):
     pipe = HIPEDataPreparationPipeline(config_path=cfg_path)
     _ = pipe.run_full_pipeline(data_path=raw_dir)
 
-    # 顶层文件存在
-    top_files = ["cv_splits.pkl", "labels.pkl", "device_name_to_id.json", "pipeline_results.json"]
+    # 顶层文件存在（精简后不再要求 cv_splits.pkl 与 labels.pkl）
+    top_files = ["device_name_to_id.json", "pipeline_results.json"]
     for name in top_files:
         assert os.path.exists(os.path.join(prepared_dir, name))
 

@@ -130,9 +130,13 @@ def main():
             prep = os.path.join("configs", "pipeline", "prep_config.yaml")
             pipeline = REFITUKDALEPipeline(expes, datasets, prep, dataset_override=args.dataset.upper())
             if args.output:
-                pipeline.output_dir = args.output
-                os.makedirs(args.output, exist_ok=True)
-                logger.info(f"输出目录设置为: {args.output}")
+                out_root = args.output.rstrip(os.sep)
+                base_name = os.path.basename(out_root)
+                if base_name.lower() in ("ukdale", "refit"):
+                    out_root = os.path.dirname(out_root) or "."
+                pipeline.output_dir = out_root
+                os.makedirs(out_root, exist_ok=True)
+                logger.info(f"输出目录设置为: {out_root}")
             logger.info(f"开始运行 {args.dataset.upper()} 数据准备流程")
             start_time = datetime.now()
             summary = pipeline.run_full_pipeline()

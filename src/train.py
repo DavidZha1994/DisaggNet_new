@@ -899,12 +899,62 @@ class NILMLightningModule(pl.LightningModule):
 # Main Helper Functions (Keep largely same but clean)
 # ------------------------------------------------------------------------
 
-def load_device_info(config: DictConfig) -> Tuple[Dict, List[str]]:
-    """加载设备信息"""
+def _load_device_names_from_mapping_for_config(config: DictConfig) -> Optional[List[str]]:
     try:
-        names = list(config.data.device_names)
+        cfg_paths = getattr(config, "paths", None)
+        prepared = getattr(cfg_paths, "prepared_dir", None) if cfg_paths is not None else None
+        dataset_name = str(getattr(config, "dataset", "") or "").strip().lower()
+        if prepared:
+            base = Path(prepared)
+        else:
+            base = Path("Data/prepared")
+        if dataset_name:
+            parts_lower = [p.lower() for p in base.parts]
+            if dataset_name not in parts_lower:
+                base = base / dataset_name
+        candidates = [base, base.parent, base.parent.parent]
+        mapping = None
+        for d in candidates:
+            if d is None:
+                continue
+            fp = Path(d) / "device_name_to_id.json"
+            if fp.exists():
+                with open(fp, "r", encoding="utf-8") as f:
+                    mapping = json.load(f)
+                break
+        if not mapping:
+            return None
+        def _to_int(x):
+            try:
+                return int(x)
+            except Exception:
+                return None
+        sample_key = next(iter(mapping.keys()))
+        sample_val = mapping[sample_key]
+        key_is_int_like = _to_int(sample_key) is not None
+        val_is_int_like = _to_int(sample_val) is not None
+        if key_is_int_like and not val_is_int_like:
+            pairs = sorted(((int(k), v) for k, v in mapping.items()), key=lambda kv: kv[0])
+            names = [name for _, name in pairs]
+        elif not key_is_int_like and val_is_int_like:
+            pairs = sorted(((v, k) for k, v in mapping.items()), key=lambda kv: kv[0])
+            names = [name for _, name in pairs]
+        else:
+            names = sorted(list(mapping.keys()))
+        return [str(n) for n in names]
     except Exception:
-        names = ['device_1']
+        return None
+
+
+def load_device_info(config: DictConfig) -> Tuple[Dict, List[str]]:
+    names_from_mapping = _load_device_names_from_mapping_for_config(config)
+    if isinstance(names_from_mapping, list) and len(names_from_mapping) > 0:
+        names = names_from_mapping
+    else:
+        try:
+            names = list(config.data.device_names)
+        except Exception:
+            names = ["device_1"]
 
     info = {}
     for i, n in enumerate(names):

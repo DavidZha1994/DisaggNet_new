@@ -123,16 +123,12 @@ class REFITUKDALEPipeline:
 
         self.ru.dataset = ds_name
         self.ru.data_path = data_path
-        # 输出目录：优先 prep_config.data_storage.output_directory，其次 RUConfig.result_path，最后默认
-        try:
-            ds_cfg = (self.prep_cfg.get("data_storage", {}) or {})
-            out_dir_cfg = str(ds_cfg.get("output_directory", "") or "").strip()
-        except Exception:
-            out_dir_cfg = ""
-        if out_dir_cfg:
-            self.output_dir = out_dir_cfg
-        else:
-            self.output_dir = self.ru.result_path or self.output_dir or "Data/prepared"
+        root_prepared = self.ru.result_path or "Data/prepared"
+        root_prepared = root_prepared.rstrip(os.sep)
+        base_name = os.path.basename(root_prepared)
+        if base_name.lower() in ("ukdale", "refit"):
+            root_prepared = os.path.dirname(root_prepared) or "."
+        self.output_dir = root_prepared or "Data/prepared"
         os.makedirs(self.output_dir, exist_ok=True)
 
         # 合并数据集定义（来自 prep_config.yaml 的 datasets 节点）
@@ -499,8 +495,6 @@ class REFITUKDALEPipeline:
             dev_map = {name: i for i, name in enumerate(device_names)}
             with open(os.path.join(dataset_dir, "device_name_to_id.json"), "w", encoding="utf-8") as f:
                 json.dump(dev_map, f, ensure_ascii=False, indent=2)
-            with open(os.path.join(dataset_dir, "device_names.json"), "w", encoding="utf-8") as f:
-                json.dump(device_names, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
 
@@ -626,12 +620,7 @@ class REFITUKDALEPipeline:
                 json.dump(aux_names, f, ensure_ascii=False, indent=2)
             with open(os.path.join(fold_dir, "raw_channel_names.json"), "w", encoding="utf-8") as f:
                 json.dump(["P_W", "dP_W", "missing_mask"], f, ensure_ascii=False, indent=2)
-            # 设备顺序文件（列表形式，与 device_name_to_id.json 相互补充）
-            try:
-                with open(os.path.join(fold_dir, "device_names.json"), "w", encoding="utf-8") as f:
-                    json.dump(device_names, f, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
+            # 不再输出每折 device_names.json，设备顺序可由 device_name_to_id.json 或目标序列推断
 
         # 总结
         self.summary_ = {
