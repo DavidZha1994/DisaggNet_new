@@ -16,7 +16,7 @@ from typing import Dict, List, Tuple, Optional, Any
 from pathlib import Path
 
 
-from .data.datamodule import NILMDataModule
+from .datamodule.datamodule import NILMDataModule
 from .models.fusion_transformer import FusionTransformer
 from .losses.losses import create_loss_function, RECOMMENDED_LOSS_CONFIGS
 from .utils.metrics import NILMMetrics

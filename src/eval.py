@@ -10,7 +10,7 @@ import json
 from datetime import datetime
 import warnings
 from .train import NILMLightningModule, load_device_info
-from .data.datamodule import NILMDataModule
+from .datamodule.datamodule import NILMDataModule
 from .utils.metrics import NILMMetrics, ConsistencyMetrics, DelayMetrics
 
 warnings.filterwarnings('ignore')

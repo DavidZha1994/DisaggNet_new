@@ -92,7 +92,7 @@ python main.py --mode walk_forward --n_splits 5
 ```python
 # 使用 Data/prepared 生成的折数据
 from omegaconf import OmegaConf
-from src.data.datamodule import NILMDataModule
+from src.datamodule.datamodule import NILMDataModule
 
 config = OmegaConf.create({
   'data': {'batch_size': 256, 'num_workers': 4},

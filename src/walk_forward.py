@@ -12,7 +12,7 @@ import pandas as pd
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
-from .data.datamodule import NILMDataModule  # 使用新的工业级数据模块
+from .datamodule.datamodule import NILMDataModule  # 使用新的工业级数据模块
 from .train import NILMLightningModule, create_trainer, setup_logging
 
 logger = logging.getLogger(__name__)
