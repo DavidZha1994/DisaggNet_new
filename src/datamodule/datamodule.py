@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import pytorch_lightning as pl
+import platform
 
 
 class NILMDataset(Dataset):
@@ -189,15 +190,31 @@ class NILMDataModule(pl.LightningDataModule):
         # 新增：采样间隔（秒），用于展开时间戳序列；固定为 5.0s
         self.resample_seconds: float = 5.0
 
-        # 读取 batch_size 等配置
         data_cfg = getattr(config, "data", None) or {}
         self.batch_size = int(getattr(data_cfg, "batch_size", 256))
-        self.num_workers = int(getattr(data_cfg, "num_workers", 4))
+        raw_num_workers = getattr(data_cfg, "num_workers", None)
+        try:
+            raw_num_workers = int(raw_num_workers) if raw_num_workers is not None else -1
+        except Exception:
+            raw_num_workers = -1
+        try:
+            sys_name = platform.system()
+        except Exception:
+            sys_name = ""
+        if raw_num_workers is not None and raw_num_workers > 0:
+            self.num_workers = raw_num_workers
+        else:
+            try:
+                cpu_count = os.cpu_count() or 4
+            except Exception:
+                cpu_count = 4
+            if sys_name in ("Windows", "Linux"):
+                base = max(1, cpu_count // 2)
+                self.num_workers = min(8, base)
+            else:
+                self.num_workers = 0
         self.pin_memory = bool(getattr(data_cfg, "pin_memory", True))
-        # 是否将 total_power 统一到瓦特（默认 False，保持兼容）
         self.normalize_total_power_to_watts = bool(getattr(data_cfg, "normalize_total_power_to_watts", False))
-
-        # 在 macOS + MPS 下禁用多进程与 pin_memory，避免 DataLoader 共享内存错误
         try:
             is_mac = (sys.platform == 'darwin')
         except Exception:
@@ -207,6 +224,8 @@ class NILMDataModule(pl.LightningDataModule):
             self.num_workers = 0
             self.pin_memory = False
             print("[信息] 检测到 macOS + MPS，已将 num_workers=0 且禁用 pin_memory 以确保稳定运行。")
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            self.num_workers = 0
 
         # 是否使用加权采样
         if use_weighted_sampler is None:
@@ -763,7 +782,7 @@ class NILMDataModule(pl.LightningDataModule):
             self.val_ds,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=self.num_workers,
+            num_workers=0,
             pin_memory=self.pin_memory,
             collate_fn=self._collate_and_map,
         )
@@ -775,7 +794,7 @@ class NILMDataModule(pl.LightningDataModule):
             self.test_ds,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=self.num_workers,
+            num_workers=0,
             pin_memory=self.pin_memory,
             collate_fn=self._collate_and_map,
         )
@@ -788,7 +807,7 @@ class NILMDataModule(pl.LightningDataModule):
             self.val_ds,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=self.num_workers,
+            num_workers=0,
             pin_memory=self.pin_memory,
             collate_fn=self._collate_and_map,
         )

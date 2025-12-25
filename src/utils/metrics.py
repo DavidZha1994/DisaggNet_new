@@ -83,24 +83,24 @@ class NILMMetrics:
         """归一化分解误差 (NDE)"""
         y_pred = self._to_numpy(y_pred)
         y_true = self._to_numpy(y_true)
-        
-        # 计算每个设备的NDE
         nde_values = []
+        eps = 1e-3
+        w = None
+        if sample_weights is not None:
+            w = self._to_numpy(sample_weights).reshape(-1)
         for i in range(self.n_devices):
-            err_i = np.abs(y_pred[:, i] - y_true[:, i])
+            pred_i = y_pred[:, i]
             true_i = y_true[:, i]
-            if sample_weights is not None:
-                w = self._to_numpy(sample_weights).reshape(-1)
-                numerator = np.sum(err_i * w)
-                denominator = np.sum(true_i * w)
+            denom_per_sample = np.maximum(np.abs(true_i), eps)
+            rel_err = np.abs(pred_i - true_i) / denom_per_sample
+            if w is not None and w.shape[0] == rel_err.shape[0]:
+                numerator = float(np.sum(rel_err * w))
+                denominator = float(np.sum(w))
+                nde_i = self._safe_divide(numerator, denominator, 1.0)
             else:
-                numerator = np.sum(err_i)
-                denominator = np.sum(true_i)
-            nde = self._safe_divide(numerator, denominator, 1.0)
-            nde_values.append(nde)
-        
-        nde_values = np.array(nde_values)
-        
+                nde_i = float(np.mean(rel_err))
+            nde_values.append(nde_i)
+        nde_values = np.array(nde_values, dtype=np.float64)
         if per_device:
             return {self.device_names[i]: float(nde_values[i]) for i in range(self.n_devices)}
         else:

@@ -9,9 +9,8 @@ from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
 
-from src.train import NILMLightningModule, load_device_info
-from src.datamodulemodule.datamodule import NILMDataModule
-from src.train import DeferredEarlyStopping
+from src.train import NILMLightningModule, load_device_info, DeferredEarlyStopping
+from src.datamodule.datamodule import NILMDataModule
 
 try:
     from optuna.integration.pytorch_lightning import PyTorchLightningPruningCallback as _PLPrunerBase
@@ -64,6 +63,8 @@ def _apply_trial(cfg: DictConfig, trial: optuna.Trial, space: Optional[DictConfi
         cfg.evaluation = OmegaConf.create({})
     if not hasattr(cfg.training, "visualization"):
         cfg.training.visualization = OmegaConf.create({})
+    if not hasattr(cfg, "loss"):
+        cfg.loss = OmegaConf.create({})
 
     if space and hasattr(space, "search_space") and hasattr(space.search_space, "training") and hasattr(space.search_space.training, "max_epochs"):
         me = space.search_space.training.max_epochs
@@ -103,6 +104,11 @@ def _apply_trial(cfg: DictConfig, trial: optuna.Trial, space: Optional[DictConfi
         reg_sp_def = getattr(getattr(getattr(getattr(ss, "model", None), "heads", None), "regression", None), "use_softplus", None)
         seq_sp_def = getattr(getattr(getattr(getattr(ss, "model", None), "heads", None), "regression", None), "seq_use_softplus", None)
         freq_proj_def = getattr(getattr(getattr(ss, "model", None), "freq_encoder", None), "proj_dim", None)
+        loss_nonneg_def = getattr(getattr(ss, "loss", None), "nonneg_penalty_weight", None)
+        loss_unknown_def = getattr(getattr(ss, "loss", None), "unknown_weight", None)
+        loss_peak_def = getattr(getattr(ss, "loss", None), "peak_focus_weight", None)
+        loss_deriv_def = getattr(getattr(ss, "loss", None), "derivative_loss_weight", None)
+        loss_edge_def = getattr(getattr(ss, "loss", None), "edge_focus_weight", None)
     else:
         lr_def = {"type": "float_log", "low": 1e-5, "high": 3e-3}
         wd_def = {"type": "float_log", "low": 1e-8, "high": 5e-3}
@@ -118,6 +124,11 @@ def _apply_trial(cfg: DictConfig, trial: optuna.Trial, space: Optional[DictConfi
         reg_sp_def = {"type": "choice", "values": [False, True]}
         seq_sp_def = {"type": "choice", "values": [False, True]}
         freq_proj_def = {"type": "choice", "values": [192, 256, 384]}
+        loss_nonneg_def = None
+        loss_unknown_def = None
+        loss_peak_def = None
+        loss_deriv_def = None
+        loss_edge_def = None
 
     def _suggest(name, spec):
         t = spec.get("type")
@@ -147,6 +158,11 @@ def _apply_trial(cfg: DictConfig, trial: optuna.Trial, space: Optional[DictConfi
     freq_proj = _suggest("freq_proj_dim", freq_proj_def)
     reg_softplus = _suggest("reg_use_softplus", reg_sp_def)
     seq_softplus = _suggest("seq_use_softplus", seq_sp_def)
+    loss_nonneg = _suggest("loss_nonneg_penalty_weight", loss_nonneg_def) if loss_nonneg_def is not None else None
+    loss_unknown = _suggest("loss_unknown_weight", loss_unknown_def) if loss_unknown_def is not None else None
+    loss_peak = _suggest("loss_peak_focus_weight", loss_peak_def) if loss_peak_def is not None else None
+    loss_deriv = _suggest("loss_derivative_loss_weight", loss_deriv_def) if loss_deriv_def is not None else None
+    loss_edge = _suggest("loss_edge_focus_weight", loss_edge_def) if loss_edge_def is not None else None
 
     cfg.training.optimizer.name = "adamw"
     cfg.training.optimizer.lr = float(lr)
@@ -167,10 +183,22 @@ def _apply_trial(cfg: DictConfig, trial: optuna.Trial, space: Optional[DictConfi
     cfg.model.heads.regression.hidden = int(head_hidden)
     cfg.model.heads.regression.use_softplus = bool(reg_softplus)
     cfg.model.heads.regression.seq_use_softplus = bool(seq_softplus)
+    if loss_nonneg is not None:
+        cfg.loss.nonneg_penalty_weight = float(loss_nonneg)
+    if loss_unknown is not None:
+        cfg.loss.unknown_weight = float(loss_unknown)
+    if loss_peak is not None:
+        cfg.loss.peak_focus_weight = float(loss_peak)
+    if loss_deriv is not None:
+        cfg.loss.derivative_loss_weight = float(loss_deriv)
+    if loss_edge is not None:
+        cfg.loss.edge_focus_weight = float(loss_edge)
     if sys.platform == "darwin":
         prec = str(getattr(cfg.training, "precision", "32-true"))
         if ("bf16" in prec) or ("16" in prec):
             cfg.training.precision = "32-true"
+    else:
+        cfg.training.precision = "16-mixed"
     if hasattr(space, "stability") and bool(getattr(space.stability, "use_efficient_attention", True)):
         pass
     try:
@@ -198,10 +226,26 @@ def _build_trainer(cfg: DictConfig, logger: TensorBoardLogger, trial: Optional[o
         callbacks.append(DeferredEarlyStopping(monitor=monitor, patience=patience, mode=mode, min_delta=min_delta, start_epoch=start_epoch))
     if trial is not None:
         callbacks.append(OptunaPruningCallback(trial, monitor))
+    import sys as _sys_mod
+    trainer_precision = str(getattr(cfg.training, "precision", "") or "")
+    if _sys_mod.platform == "darwin":
+        if ("bf16" in trainer_precision) or ("16" in trainer_precision):
+            trainer_precision = "32-true"
+            try:
+                cfg.training.precision = trainer_precision
+            except Exception:
+                pass
+    else:
+        if (not trainer_precision) or trainer_precision in ("32", "32-true"):
+            trainer_precision = "16-mixed"
+            try:
+                cfg.training.precision = trainer_precision
+            except Exception:
+                pass
     trainer = pl.Trainer(
         accelerator=getattr(cfg.training, "accelerator", "auto"),
         devices=getattr(cfg.training, "devices", 1),
-        precision=getattr(cfg.training, "precision", 32),
+        precision=trainer_precision,
         min_epochs=int(getattr(cfg.training, "min_epochs", 1)),
         max_epochs=int(getattr(cfg.training, "max_epochs", 10)),
         logger=logger,
@@ -217,6 +261,12 @@ def _objective_factory(base_config: DictConfig, space: Optional[DictConfig]):
     def objective(trial: optuna.Trial) -> float:
         cfg = _clone_config(base_config)
         cfg = _apply_trial(cfg, trial, space)
+        try:
+            base_task = str(getattr(base_config, "task", "") or "")
+            if base_task:
+                cfg.task = base_task
+        except Exception:
+            pass
         pl.seed_everything(int(getattr(cfg, "seed", getattr(getattr(cfg, "reproducibility", None), "seed", 42))))
         dm = NILMDataModule(cfg)
         try:
@@ -236,23 +286,42 @@ def _objective_factory(base_config: DictConfig, space: Optional[DictConfig]):
         trainer = _build_trainer(cfg, logger, trial)
         trainer.fit(module, dm)
         metrics = getattr(trainer, "callback_metrics", {}) or {}
-        monitor = str(getattr(getattr(cfg.training, "early_stopping", None), "monitor", "val/loss/total"))
+        monitor_default = str(getattr(getattr(cfg.training, "early_stopping", None), "monitor", "val/loss/total"))
+        monitor = monitor_default
+        if space is not None and hasattr(space, "objective"):
+            obj = getattr(space, "objective")
+            name = str(getattr(obj, "metric", "") or "")
+            if name:
+                monitor = name
         val = None
         if monitor in metrics:
             val = metrics[monitor]
+        elif monitor_default in metrics:
+            val = metrics[monitor_default]
         elif "val/loss/total" in metrics:
             val = metrics["val/loss/total"]
+        elif "val/metrics/nde" in metrics:
+            val = metrics["val/metrics/nde"]
         elif "val_loss" in metrics:
             val = metrics["val_loss"]
         if isinstance(val, torch.Tensor):
-            return float(val.detach().cpu().item())
-        if isinstance(val, (int, float)):
-            return float(val)
-        return float("inf")
+            out = float(val.detach().cpu().item())
+        elif isinstance(val, (int, float)):
+            out = float(val)
+        else:
+            out = float("inf")
+        if space is not None and hasattr(space, "objective"):
+            obj = getattr(space, "objective")
+            mode = str(getattr(obj, "mode", "minimize") or "").lower()
+            if mode == "maximize":
+                return -out
+        return out
     return objective
 
 
 def run_optimization(config: DictConfig, n_trials: int = 20, timeout: Optional[int] = None, study_name: Optional[str] = None, storage: Optional[str] = None, space_config: Optional[str] = None) -> Dict[str, Any]:
+    if sys.platform == "darwin":
+        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     space = _load_space(space_config)
     direction = "minimize"
     warm = 2

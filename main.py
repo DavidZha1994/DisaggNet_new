@@ -26,6 +26,19 @@ import argparse
 import logging
 from pathlib import Path
 from typing import Optional, Dict, Any
+
+os.environ.setdefault("NUMEXPR_MAX_THREADS", str(max(1, min(8, (os.cpu_count() or 4)))))
+os.environ.setdefault("NUMEXPR_NUM_THREADS", os.environ.get("NUMEXPR_MAX_THREADS", "4"))
+try:
+    import numexpr as _numexpr
+    _thr = int(os.environ.get("NUMEXPR_NUM_THREADS", "4"))
+    try:
+        _numexpr.set_num_threads(_thr)
+    except Exception:
+        pass
+except Exception:
+    pass
+
 import torch
 import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
@@ -60,6 +73,11 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     encoding='utf-8'
 )
+try:
+    logging.getLogger("numexpr").setLevel(logging.WARNING)
+    logging.getLogger("numexpr.utils").setLevel(logging.WARNING)
+except Exception:
+    pass
 logger = logging.getLogger(__name__)
 
 
@@ -186,20 +204,12 @@ class UnifiedTrainingSystem:
         """超参数优化"""
         logger.info(f"开始超参数优化，试验次数: {n_trials}")
         config = self.setup_environment(config_name)
-        
-        # 构建参数
-        args = [
-            "--config", str(self.configs_dir / f"{config_name}.yaml"),
-            "--n-trials", str(n_trials)
-        ]
-        
-        if timeout:
-            args.extend(["--timeout", str(timeout)])
-        
-        # 添加额外参数
-        for key, value in kwargs.items():
-            if value is not None:
-                args.extend([f"--{key}", str(value)])
+        task_override = kwargs.get("task")
+        if task_override:
+            try:
+                config.task = str(task_override)
+            except Exception:
+                pass
         
         # 调用HPO（在此处进行局部导入，避免全局 None 覆盖）
         try:
@@ -376,7 +386,8 @@ def create_parser() -> argparse.ArgumentParser:
     
     # 超参数优化
     hpo_parser = subparsers.add_parser("hpo", help="超参数优化")
-    hpo_parser.add_argument("--config", default="optimized_stable", help="配置文件名")
+    hpo_parser.add_argument("--config", default="optimized_stable", help="配置文件名或配置名称")
+    hpo_parser.add_argument("--task", type=str, choices=["seq2seq", "seq2point"], help="任务类型（覆盖配置中的 task）")
     hpo_parser.add_argument("--n-trials", type=int, default=50, help="试验次数")
     hpo_parser.add_argument("--timeout", type=int, help="超时时间(秒)")
     hpo_parser.add_argument("--study-name", help="研究名称")
